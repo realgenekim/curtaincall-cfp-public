@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# bin/q — the operator's microscope: one-line store/domain queries against the
+# running nREPL, common namespaces preloaded (Gene, 2026-08-11: "make a clj -x
+# thing"). READ-ONLY by convention — the database interface rule applies: any
+# mutation goes through a domain verb, deliberately, never through a one-liner.
+#
+#   bin/q '(events/event-by-slug "ai-engineer-code-summit")'
+#   bin/q '(count (submissions/for-event (:id (events/event-by-slug "ai-engineer-code-summit"))))'
+#   bin/q '(:name (people/by-email "swyx@ai.engineer"))'
+#
+# Distinct from bridge/api-cli (Buster's HTTP bearer-token CLI, pending merge):
+# bin/q talks to the LOCAL JVM's store; api-cli talks to a deployed service.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+PORT=$(cat .nrepl-port 2>/dev/null) || { echo "no .nrepl-port — run: make nrepl" >&2; exit 1; }
+PRELUDE="(require '[cfp-scheduler-killer.store :as store]
+                  '[cfp-scheduler-killer.events :as events]
+                  '[cfp-scheduler-killer.submissions :as submissions]
+                  '[cfp-scheduler-killer.reviews :as reviews]
+                  '[cfp-scheduler-killer.people :as people]
+                  '[cfp-scheduler-killer.committees :as committees]
+                  '[cfp-scheduler-killer.forms :as forms])"
+exec clj-nrepl-eval -p "$PORT" "$PRELUDE $*" 2>&1 | grep -v "^\*========" | grep -v "^=> nil$" | sed 's/^=> //'

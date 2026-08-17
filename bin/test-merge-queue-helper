@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+files=(
+  bin/merge_queue_helper.clj
+  bin/merge_queue_helper_test.clj
+  bin/test-merge-queue-helper
+)
+
+source_digest() {
+  (cd -- "$repo_root" && sha256sum "${files[@]}")
+}
+
+before=$(source_digest)
+bb_bin=$(command -v bb) || {
+  printf 'merge-queue-helper-test.v1 state=refused reason=babashka-missing\n' >&2
+  exit 1
+}
+"$bb_bin" --classpath "$repo_root/bin" "$repo_root/bin/merge_queue_helper_test.clj"
+after=$(source_digest)
+[[ $before == "$after" ]] || {
+  printf 'merge-queue-helper-test.v1 state=refused reason=source-mutated\n' >&2
+  exit 1
+}
+
+printf 'merge-queue-helper-test.v1 state=complete source-sha256=%s files=%s\n' \
+  "$(printf '%s' "$after" | sha256sum | awk '{print $1}')" "${#files[@]}"

@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(mktemp -d)
+trap 'rm -rf "$root"' EXIT
+repo="$root/repo"
+inbox="$root/inbox"
+tool="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/dev-lane"
+
+git init -q "$repo"
+git -C "$repo" config user.name fixture
+git -C "$repo" config user.email fixture@example.com
+mkdir -p "$repo/src"
+printf 'one\n' >"$repo/src/allowed.txt"
+printf 'keep\n' >"$repo/src/other.txt"
+git -C "$repo" add .
+git -C "$repo" commit -qm base
+base=$(git -C "$repo" rev-parse HEAD)
+
+"$tool" prepare "$repo" "$root/good" "$base" >"$root/prepare.json"
+printf 'two\n' >>"$root/good/src/allowed.txt"
+printf 'src/allowed.txt\n' >"$root/allow-good"
+"$tool" publish "$root/good" "$root/allow-good" "$inbox" good P1 sessionize-sched-killer-test gpt-5.6-sol high >"$root/publish.json"
+
+test -s "$inbox/good.patch"
+test -s "$inbox/good.job"
+test "$(stat -f %Lp "$inbox/good.patch" 2>/dev/null || stat -c %a "$inbox/good.patch")" = 644
+test "$(stat -f %Lp "$inbox/good.job" 2>/dev/null || stat -c %a "$inbox/good.job")" = 644
+declared=$(awk -F': ' '$1 == "patch_sha256" {print $2}' "$inbox/good.job")
+actual=$(shasum -a 256 "$inbox/good.patch" | awk '{print $1}')
+test "$declared" = "$actual"
+grep -q '^job_schema: dev-lane-job.v1$' "$inbox/good.job"
+grep -q '^bead: sessionize-sched-killer-test$' "$inbox/good.job"
+grep -q '^producer_model: gpt-5.6-sol$' "$inbox/good.job"
+grep -q '^producer_reasoning_effort: high$' "$inbox/good.job"
+grep -q '^changed_path: src/allowed.txt$' "$inbox/good.job"
+test -d "$inbox/.claim-good"
+test ! -d "$inbox/claims"
+git -C "$repo" apply --check "$inbox/good.patch"
+
+"$tool" prepare "$repo" "$root/missing-metadata" "$base" >/dev/null
+printf 'metadata\n' >>"$root/missing-metadata/src/allowed.txt"
+if "$tool" publish "$root/missing-metadata" "$root/allow-good" "$inbox" missing-metadata \
+  P1 sessionize-sched-killer-test gpt-5.6-sol >"$root/missing.out" 2>"$root/missing.err"; then
+  printf 'expected missing producer metadata to fail\n' >&2
+  exit 1
+fi
+test ! -e "$inbox/missing-metadata.patch"
+test ! -e "$inbox/missing-metadata.job"
+grep -q '^usage:' "$root/missing.err"
+
+"$tool" prepare "$repo" "$root/bad" "$base" >/dev/null
+printf 'escape\n' >>"$root/bad/src/other.txt"
+printf 'src/allowed.txt\n' >"$root/allow-bad"
+if "$tool" publish "$root/bad" "$root/allow-bad" "$inbox" bad P1 sessionize-sched-killer-test gpt-5.6-sol high >"$root/bad.out" 2>"$root/bad.err"; then
+  printf 'expected disallowed path to fail\n' >&2
+  exit 1
+fi
+test ! -e "$inbox/bad.patch"
+test ! -e "$inbox/bad.job"
+grep -q 'changed paths escape the lane: src/other.txt' "$root/bad.err"
+
+"$tool" prepare "$repo" "$root/rename" "$base" >/dev/null
+git -C "$root/rename" mv src/allowed.txt src/renamed.txt
+printf 'src/allowed.txt\nsrc/renamed.txt\n' >"$root/allow-rename"
+"$tool" publish "$root/rename" "$root/allow-rename" "$inbox" rename P2 sessionize-sched-killer-test gpt-5.6-sol high >/dev/null
+grep -q 'src/allowed.txt' "$inbox/rename.job"
+grep -q 'src/renamed.txt' "$inbox/rename.job"
+
+"$tool" prepare "$repo" "$root/committed" "$base" >/dev/null
+printf 'committed\n' >>"$root/committed/src/allowed.txt"
+git -C "$root/committed" add src/allowed.txt
+git -C "$root/committed" -c user.name=fixture -c user.email=fixture@example.com commit -qm forbidden
+printf 'src/allowed.txt\n' >"$root/allow-committed"
+if "$tool" publish "$root/committed" "$root/allow-committed" "$inbox" committed P1 sessionize-sched-killer-test gpt-5.6-sol high >/dev/null 2>"$root/committed.err"; then
+  printf 'expected moved HEAD to fail\n' >&2
+  exit 1
+fi
+grep -q 'HEAD moved from prepared base' "$root/committed.err"
+
+"$tool" prepare "$repo" "$root/crash" "$base" >/dev/null
+printf 'crash\n' >>"$root/crash/src/allowed.txt"
+printf 'src/allowed.txt\n' >"$root/allow-crash"
+if DEV_LANE_FAIL_AFTER_PATCH=yes "$tool" publish "$root/crash" "$root/allow-crash" "$inbox" crash P1 sessionize-sched-killer-test gpt-5.6-sol high >/dev/null 2>"$root/crash.err"; then
+  printf 'expected injected failure to fail\n' >&2
+  exit 1
+fi
+test ! -e "$inbox/crash.patch"
+test ! -e "$inbox/crash.job"
+test ! -e "$inbox/.claim-crash"
+
+"$tool" prepare "$repo" "$root/comma" "$base" >/dev/null
+printf 'comma\n' >"$root/comma/src/a,b.txt"
+printf 'src/a,b.txt\n' >"$root/allow-comma"
+"$tool" publish "$root/comma" "$root/allow-comma" "$inbox" comma P2 sessionize-sched-killer-test gpt-5.6-sol high >"$root/comma.json"
+grep -q '^changed_path: src/a,b.txt$' "$inbox/comma.job"
+test "$(jq -r '.changed_paths | length' "$root/comma.json")" = 1
+test "$(jq -r '.changed_paths[0]' "$root/comma.json")" = 'src/a,b.txt'
+
+"$tool" prepare "$repo" "$root/race-a" "$base" >/dev/null
+"$tool" prepare "$repo" "$root/race-b" "$base" >/dev/null
+printf 'a\n' >>"$root/race-a/src/allowed.txt"
+printf 'b\n' >>"$root/race-b/src/allowed.txt"
+printf 'src/allowed.txt\n' >"$root/allow-race"
+set +e
+"$tool" publish "$root/race-a" "$root/allow-race" "$inbox" race P1 sessionize-sched-killer-test gpt-5.6-sol high >"$root/race-a.out" 2>"$root/race-a.err" &
+pid_a=$!
+"$tool" publish "$root/race-b" "$root/allow-race" "$inbox" race P1 sessionize-sched-killer-test gpt-5.6-sol high >"$root/race-b.out" 2>"$root/race-b.err" &
+pid_b=$!
+wait "$pid_a"; rc_a=$?
+wait "$pid_b"; rc_b=$?
+set -e
+test $((rc_a + rc_b)) -ne 0
+declared=$(awk -F': ' '$1 == "patch_sha256" {print $2}' "$inbox/race.job")
+actual=$(shasum -a 256 "$inbox/race.patch" | awk '{print $1}')
+test "$declared" = "$actual"
+
+printf 'dev-lane tests passed\n'

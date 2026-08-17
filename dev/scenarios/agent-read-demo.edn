@@ -1,0 +1,5 @@
+{:event "enterprise-ai-summit-charlotte-2026"
+ :commands
+ [{:command :get_event :args {}}
+  {:command :list_sessions :args {}}
+  {:command :get_schedule :args {}}]}

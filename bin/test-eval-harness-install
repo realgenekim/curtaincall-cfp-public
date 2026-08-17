@@ -1,0 +1,762 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+leaf="$repo_root/resources/bash/eval-harness-install-remote"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/test-eval-harness-install.XXXXXX")"
+stage=""
+required_stage=""
+replay_stage=""
+cleanup() {
+  chmod -R u+w "$tmp" 2>/dev/null || true
+  rm -rf -- "$tmp"
+  [[ -z "$stage" ]] || { chmod 0700 "$stage" 2>/dev/null || true; rm -rf -- "$stage"; }
+  [[ -z "$required_stage" ]] || { chmod 0700 "$required_stage" 2>/dev/null || true; rm -rf -- "$required_stage"; }
+  [[ -z "$replay_stage" ]] || { chmod 0700 "$replay_stage" 2>/dev/null || true; rm -rf -- "$replay_stage"; }
+}
+trap cleanup EXIT HUP INT TERM
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+harness_sha=1111111111111111111111111111111111111111
+installer_sha=2222222222222222222222222222222222222222
+preimage_commit=3333333333333333333333333333333333333333
+test_home="$tmp/home"
+target_user="$(id -un)"
+authority_root="$tmp/authority"
+mkdir -p "$test_home/bin"
+printf '%s\n' old-runner >"$test_home/bin/hill-climb-fleet"
+cp "$repo_root/bin/hill-climb-fleet" "$tmp/new-runner"
+cp "$repo_root/bin/capture-lineage" "$tmp/new-lineage"
+old_script_hash="$(sha256_file "$test_home/bin/hill-climb-fleet")"
+new_script_hash="$(sha256_file "$tmp/new-runner")"
+new_lineage_hash="$(sha256_file "$tmp/new-lineage")"
+leaf_hash="$(sha256_file "$leaf")"
+operation="$tmp/install-operation.txt"
+printf '%s\n' \
+  'schema=eval-harness-install-operation.v1' \
+  "harness_sha=$harness_sha" \
+  "installer_sha=$installer_sha" \
+  "new_script_sha=$new_script_hash" \
+  "new_lineage_sha=$new_lineage_hash" \
+  "leaf_sha=$leaf_hash" \
+  'target_script=runtime/hill-climb-fleet' \
+  'target_lineage=runtime/capture-lineage' \
+  'target_mode=0555' >"$operation"
+operation_hash="$(sha256_file "$operation")"
+manifest="$tmp/install-manifest.txt"
+printf '%s\n' \
+  'schema=eval-harness-install-manifest.v2' \
+  "operation_sha=$operation_hash" \
+  "preimage_commit=$preimage_commit" \
+  "harness_sha=$harness_sha" \
+  "installer_sha=$installer_sha" \
+  "old_script_sha=$old_script_hash" \
+  'old_lineage_sha=absent' \
+  "new_script_sha=$new_script_hash" \
+  "new_lineage_sha=$new_lineage_hash" \
+  "leaf_sha=$leaf_hash" \
+  'target_script=runtime/hill-climb-fleet' \
+  'target_lineage=runtime/capture-lineage' \
+  'target_mode=0555' >"$manifest"
+manifest_hash="$(sha256_file "$manifest")"
+stage="$(mktemp -d "/tmp/eval-harness-upload.$manifest_hash.XXXXXX")"
+cp "$tmp/new-runner" "$stage/hill-climb-fleet"
+cp "$tmp/new-lineage" "$stage/capture-lineage"
+cp "$leaf" "$stage/eval-harness-install-remote"
+cp "$manifest" "$stage/install-manifest.txt"
+chmod 0444 "$stage/"*
+chmod 0555 "$stage"
+
+run_leaf() {
+  bash "$stage/eval-harness-install-remote" "$stage" \
+    "$manifest_hash" "$operation_hash" "$preimage_commit" "$harness_sha" "$installer_sha" "$old_script_hash" absent \
+    "$new_script_hash" "$new_lineage_hash" "$leaf_hash" "$target_user" "$test_home" "$authority_root"
+}
+
+# The installer uses the same pre-execution gate as the runner. Prove a
+# primary-holder SIGKILL at that exact boundary runs no install code, while
+# the backup retains the lock until the blocked group is gone.
+leaf_pregate="$tmp/leaf-pregate"
+EVAL_HARNESS_INSTALL_TEST_PRE_GATE_DIR="$leaf_pregate" \
+  bash "$stage/eval-harness-install-remote" "$stage" \
+    "$manifest_hash" "$operation_hash" "$preimage_commit" "$harness_sha" "$installer_sha" \
+    "$old_script_hash" absent "$new_script_hash" "$new_lineage_hash" "$leaf_hash" \
+    "$target_user" "$test_home" "$authority_root" \
+    >"$tmp/leaf-pregate.out" 2>"$tmp/leaf-pregate.err" &
+leaf_pregate_process=$!
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  [[ -f "$leaf_pregate/ready" && -s "$leaf_pregate/holder.pid" && -s "$leaf_pregate/child.pid" ]] && break
+  sleep 0.1
+done
+[[ -f "$leaf_pregate/ready" && -s "$leaf_pregate/holder.pid" && -s "$leaf_pregate/child.pid" ]] \
+  || { cat "$tmp/leaf-pregate.err" >&2; echo "FAIL installer pre-gate fixture did not start" >&2; exit 1; }
+leaf_pregate_holder="$(cat "$leaf_pregate/holder.pid")"
+leaf_pregate_child="$(cat "$leaf_pregate/child.pid")"
+[[ "$leaf_pregate_process" = "$leaf_pregate_holder" ]] \
+  || { echo "FAIL installer pre-gate fixture named the wrong holder" >&2; exit 1; }
+kill -9 "$leaf_pregate_holder"
+wait "$leaf_pregate_process" 2>/dev/null || true
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60; do
+  kill -0 "$leaf_pregate_child" 2>/dev/null || break
+  sleep 0.1
+done
+kill -0 "$leaf_pregate_child" 2>/dev/null \
+  && { echo "FAIL installer backup did not terminate the blocked operation" >&2; exit 1; }
+[[ ! -e "$authority_root/current" && ! -e "$authority_root/pending/$operation_hash.json" ]] \
+  || { echo "FAIL installer executed before backup acknowledgement" >&2; exit 1; }
+
+receipt="$(run_leaf)"
+[[ "$receipt" == *'"state":"installed"'* ]] || { echo "FAIL missing installed receipt" >&2; exit 1; }
+runtime_dir="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$authority_root/runtime/$operation_hash")"
+[[ "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$authority_root/current")" == "$runtime_dir" ]] \
+  || { echo "FAIL root-owned current pointer does not select the approved runtime" >&2; exit 1; }
+[[ "$(sha256_file "$runtime_dir/hill-climb-fleet")" == "$new_script_hash" ]] || exit 1
+[[ "$(sha256_file "$runtime_dir/capture-lineage")" == "$new_lineage_hash" ]] || exit 1
+[[ "$(sha256_file "$test_home/bin/hill-climb-fleet")" == "$old_script_hash" ]] \
+  || { echo "FAIL immutable install rewrote the tester-owned legacy runtime" >&2; exit 1; }
+replay_manifest="$tmp/replay-install-manifest.txt"
+printf '%s\n' \
+  'schema=eval-harness-install-manifest.v2' \
+  "operation_sha=$operation_hash" \
+  "preimage_commit=$harness_sha" \
+  "harness_sha=$harness_sha" \
+  "installer_sha=$installer_sha" \
+  "old_script_sha=$new_script_hash" \
+  "old_lineage_sha=$new_lineage_hash" \
+  "new_script_sha=$new_script_hash" \
+  "new_lineage_sha=$new_lineage_hash" \
+  "leaf_sha=$leaf_hash" \
+  'target_script=runtime/hill-climb-fleet' \
+  'target_lineage=runtime/capture-lineage' \
+  'target_mode=0555' >"$replay_manifest"
+replay_manifest_hash="$(sha256_file "$replay_manifest")"
+replay_stage="$(mktemp -d "/tmp/eval-harness-upload.$replay_manifest_hash.XXXXXX")"
+cp "$tmp/new-runner" "$replay_stage/hill-climb-fleet"
+cp "$tmp/new-lineage" "$replay_stage/capture-lineage"
+cp "$leaf" "$replay_stage/eval-harness-install-remote"
+cp "$replay_manifest" "$replay_stage/install-manifest.txt"
+chmod 0444 "$replay_stage/"*
+chmod 0555 "$replay_stage"
+replayed_receipt="$(HOME="$test_home" bash "$replay_stage/eval-harness-install-remote" "$replay_stage" \
+  "$replay_manifest_hash" "$operation_hash" "$harness_sha" "$harness_sha" "$installer_sha" \
+  "$new_script_hash" "$new_lineage_hash" "$new_script_hash" "$new_lineage_hash" "$leaf_hash" \
+  "$target_user" "$test_home" "$authority_root")"
+[[ "$replayed_receipt" == "$receipt" ]] || { echo "FAIL replay did not return the original receipt" >&2; exit 1; }
+
+crash_home="$tmp/crash-home"
+crash_authority="$tmp/crash-authority"
+mkdir -p "$crash_home/bin"
+printf '%s\n' old-runner >"$crash_home/bin/hill-climb-fleet"
+if EVAL_HARNESS_INSTALL_TEST_STOP_AFTER_LINEAGE=true \
+    bash "$stage/eval-harness-install-remote" "$stage" \
+    "$manifest_hash" "$operation_hash" "$preimage_commit" "$harness_sha" "$installer_sha" \
+    "$old_script_hash" absent "$new_script_hash" "$new_lineage_hash" "$leaf_hash" \
+    "$target_user" "$crash_home" "$crash_authority" >"$tmp/crash.out" 2>"$tmp/crash.err"; then
+  echo "FAIL dependency-first interruption unexpectedly completed" >&2
+  exit 1
+fi
+[[ "$(sha256_file "$crash_home/bin/hill-climb-fleet")" == "$old_script_hash" ]] \
+  || { echo "FAIL interrupted install advanced the runner" >&2; exit 1; }
+[[ ! -e "$crash_home/bin/capture-lineage" \
+    && ! -e "$crash_authority/runtime/$operation_hash" ]] \
+  || { echo "FAIL interrupted immutable build exposed a partial runtime" >&2; exit 1; }
+[[ -f "$crash_authority/pending/$operation_hash.json" ]] \
+  || { echo "FAIL interrupted install lacks an authoritative pending intent" >&2; exit 1; }
+fake_bin="$tmp/fake-bin"
+mkdir -p "$fake_bin"
+printf '%s\n' '#!/usr/bin/env bash' 'shift' 'exec "$@"' >"$fake_bin/ssh"
+chmod 0755 "$fake_bin/ssh"
+pending_recovery="$(PATH="$fake_bin:$PATH" "$repo_root/bin/reset-anvil-fleet" \
+  _test-recover-pending "$crash_authority" "$operation_hash" "$old_script_hash" \
+  absent "$harness_sha" "$installer_sha" "$new_script_hash" \
+  "$new_lineage_hash" "$leaf_hash")"
+[[ "$pending_recovery" == "$(printf '%s\t%s\tabsent\t%s' "$preimage_commit" "$old_script_hash" "$manifest_hash")" ]] \
+  || { echo "FAIL wrapper did not recover the exact pending install preimage" >&2; exit 1; }
+crash_receipt="$(bash "$stage/eval-harness-install-remote" "$stage" \
+  "$manifest_hash" "$operation_hash" "$preimage_commit" "$harness_sha" "$installer_sha" \
+  "$old_script_hash" absent "$new_script_hash" "$new_lineage_hash" "$leaf_hash" \
+  "$target_user" "$crash_home" "$crash_authority")"
+[[ "$crash_receipt" == *'"state":"installed"'* ]] \
+  || { echo "FAIL pending dependency-first install did not recover" >&2; exit 1; }
+[[ ! -e "$crash_authority/pending/$operation_hash.json" ]] \
+  || { echo "FAIL completed install left a pending obligation" >&2; exit 1; }
+
+publish_crash_home="$tmp/publish-crash-home"
+publish_crash_authority="$tmp/publish-crash-authority"
+mkdir -p "$publish_crash_home/bin"
+printf '%s\n' old-runner >"$publish_crash_home/bin/hill-climb-fleet"
+if EVAL_HARNESS_INSTALL_TEST_STOP_AFTER_PUBLISH=true \
+    bash "$stage/eval-harness-install-remote" "$stage" \
+    "$manifest_hash" "$operation_hash" "$preimage_commit" "$harness_sha" "$installer_sha" \
+    "$old_script_hash" absent "$new_script_hash" "$new_lineage_hash" "$leaf_hash" \
+    "$target_user" "$publish_crash_home" "$publish_crash_authority" \
+    >"$tmp/publish-crash.out" 2>"$tmp/publish-crash.err"; then
+  echo "FAIL post-publication interruption unexpectedly completed" >&2
+  exit 1
+fi
+publish_crash_runtime="$publish_crash_authority/runtime/$operation_hash"
+[[ ! -e "$publish_crash_authority/current" \
+   && "$(sha256_file "$publish_crash_runtime/hill-climb-fleet")" == "$new_script_hash" \
+   && "$(sha256_file "$publish_crash_runtime/capture-lineage")" == "$new_lineage_hash" ]] \
+  || { echo "FAIL post-publication interruption exposed a selector or incomplete runtime" >&2; exit 1; }
+publish_recovery="$(bash "$stage/eval-harness-install-remote" "$stage" \
+  "$manifest_hash" "$operation_hash" "$preimage_commit" "$harness_sha" "$installer_sha" \
+  "$old_script_hash" absent "$new_script_hash" "$new_lineage_hash" "$leaf_hash" \
+  "$target_user" "$publish_crash_home" "$publish_crash_authority")"
+[[ "$publish_recovery" == *'"state":"adopted"'* \
+   && -L "$publish_crash_authority/current" \
+   && ! -e "$publish_crash_authority/pending/$operation_hash.json" ]] \
+  || { echo "FAIL durable published runtime did not recover and activate" >&2; exit 1; }
+
+runner_crash_home="$tmp/runner-crash-home"
+runner_crash_authority="$tmp/runner-crash-authority"
+mkdir -p "$runner_crash_home/bin"
+printf '%s\n' old-runner >"$runner_crash_home/bin/hill-climb-fleet"
+if EVAL_HARNESS_INSTALL_TEST_STOP_AFTER_RUNNER=true \
+    bash "$stage/eval-harness-install-remote" "$stage" \
+    "$manifest_hash" "$operation_hash" "$preimage_commit" "$harness_sha" "$installer_sha" \
+    "$old_script_hash" absent "$new_script_hash" "$new_lineage_hash" "$leaf_hash" \
+    "$target_user" "$runner_crash_home" "$runner_crash_authority" \
+    >"$tmp/runner-crash.out" 2>"$tmp/runner-crash.err"; then
+  echo "FAIL post-runner interruption unexpectedly completed" >&2
+  exit 1
+fi
+runner_crash_runtime="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$runner_crash_authority/runtime/$operation_hash")"
+[[ "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$runner_crash_authority/current")" == "$runner_crash_runtime" \
+   && "$(sha256_file "$runner_crash_runtime/hill-climb-fleet")" == "$new_script_hash" \
+   && "$(sha256_file "$runner_crash_runtime/capture-lineage")" == "$new_lineage_hash" ]] \
+  || { echo "FAIL post-activation interruption did not leave the complete immutable runtime active" >&2; exit 1; }
+runner_recovery="$(PATH="$fake_bin:$PATH" "$repo_root/bin/reset-anvil-fleet" \
+  _test-recover-pending "$runner_crash_authority" "$operation_hash" "$new_script_hash" \
+  "$new_lineage_hash" "$harness_sha" "$installer_sha" "$new_script_hash" \
+  "$new_lineage_hash" "$leaf_hash")"
+[[ "$runner_recovery" == "$(printf '%s\t%s\tabsent\t%s' "$preimage_commit" "$old_script_hash" "$manifest_hash")" ]] \
+  || { echo "FAIL wrapper ignored the pending intent after runner publication" >&2; exit 1; }
+if EVAL_HARNESS_INSTALL_TEST_STOP_AFTER_RECEIPT=true \
+    bash "$stage/eval-harness-install-remote" "$stage" \
+    "$manifest_hash" "$operation_hash" "$preimage_commit" "$harness_sha" "$installer_sha" \
+    "$old_script_hash" absent "$new_script_hash" "$new_lineage_hash" "$leaf_hash" \
+    "$target_user" "$runner_crash_home" "$runner_crash_authority" \
+    >"$tmp/receipt-crash.out" 2>"$tmp/receipt-crash.err"; then
+  echo "FAIL post-receipt interruption unexpectedly terminalized" >&2
+  exit 1
+fi
+runner_receipt="$runner_crash_authority/receipts/$operation_hash.json"
+[[ -f "$runner_receipt" ]] \
+  || { cat "$tmp/receipt-crash.err" >&2; echo "FAIL receipt boundary did not publish a receipt" >&2; exit 1; }
+[[ "$(stat -f '%Lp' "$runner_receipt" 2>/dev/null || stat -c '%a' "$runner_receipt")" == 444 ]] \
+  || { echo "FAIL published receipt was not final-mode before linking" >&2; exit 1; }
+[[ -e "$runner_crash_authority/pending/$operation_hash.json" ]] \
+  || { echo "FAIL receipt-boundary crash lost its pending obligation" >&2; exit 1; }
+linked_receipt="$(cat "$runner_receipt")"
+recovered_receipt="$(bash "$stage/eval-harness-install-remote" "$stage" \
+  "$manifest_hash" "$operation_hash" "$preimage_commit" "$harness_sha" "$installer_sha" \
+  "$old_script_hash" absent "$new_script_hash" "$new_lineage_hash" "$leaf_hash" \
+  "$target_user" "$runner_crash_home" "$runner_crash_authority")"
+[[ "$recovered_receipt" == "$linked_receipt" \
+   && ! -e "$runner_crash_authority/pending/$operation_hash.json" ]] \
+  || { echo "FAIL receipt replay did not terminalize the pending obligation" >&2; exit 1; }
+
+mkdir -p "$test_home/fleet-runs"
+ln -s "$test_home/fleet-runs/run-1" "$test_home/fleet-runs/current"
+mkdir -p "$test_home/fleet-runs/run-1"
+for bad_state in running consolidating unknown; do
+  printf '{"status":"%s"}\n' "$bad_state" >"$test_home/fleet-runs/run-1/state.json"
+  if run_leaf >"$tmp/state.out" 2>"$tmp/state.err"; then
+    echo "FAIL active/unknown state was accepted: $bad_state" >&2
+    exit 1
+  fi
+  grep -q 'current run is not terminal' "$tmp/state.err" \
+    || { cat "$tmp/state.err" >&2; echo "FAIL state refusal was not named: $bad_state" >&2; exit 1; }
+done
+printf '{}\n' >"$test_home/fleet-runs/run-1/state.json"
+if run_leaf >"$tmp/malformed.out" 2>"$tmp/malformed.err"; then
+  echo "FAIL malformed state was accepted" >&2
+  exit 1
+fi
+grep -q 'current run state is malformed' "$tmp/malformed.err" \
+  || { echo "FAIL malformed-state refusal was not named" >&2; exit 1; }
+rm "$test_home/fleet-runs/current"
+
+lock_ready="$tmp/runtime-lock.ready"
+python3 - "$authority_root/runtime.lock" "$lock_ready" <<'PY' &
+import fcntl
+import pathlib
+import sys
+import time
+lock, ready = sys.argv[1:]
+with open(lock, 'w') as stream:
+    fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+    pathlib.Path(ready).write_text('ready\n', encoding='utf-8')
+    time.sleep(30)
+PY
+lock_pid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [[ -f "$lock_ready" ]] && break
+  sleep 0.1
+done
+[[ -f "$lock_ready" ]] || { echo "FAIL lock holder did not start" >&2; exit 1; }
+if run_leaf >"$tmp/lease.out" 2>"$tmp/lease.err"; then
+  echo "FAIL concurrent runtime lock was accepted" >&2
+  exit 1
+fi
+grep -q 'Resource temporarily unavailable\|owns the runtime lock' "$tmp/lease.err" \
+  || { echo "FAIL lock refusal was not named" >&2; exit 1; }
+kill -9 "$lock_pid"
+wait "$lock_pid" 2>/dev/null || true
+run_leaf >"$tmp/post-sigkill-lock.out"
+grep -q '"ok":true' "$tmp/post-sigkill-lock.out" \
+  || { echo "FAIL SIGKILL did not release the kernel runtime lock" >&2; exit 1; }
+
+missing_home="$tmp/missing-home"
+mkdir -p "$missing_home/bin"
+printf '%s\n' old-runner >"$missing_home/bin/hill-climb-fleet"
+required_old_lineage=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+required_manifest="$tmp/required-install-manifest.txt"
+printf '%s\n' \
+  'schema=eval-harness-install-manifest.v2' \
+  "operation_sha=$operation_hash" \
+  "preimage_commit=$preimage_commit" \
+  "harness_sha=$harness_sha" \
+  "installer_sha=$installer_sha" \
+  "old_script_sha=$old_script_hash" \
+  "old_lineage_sha=$required_old_lineage" \
+  "new_script_sha=$new_script_hash" \
+  "new_lineage_sha=$new_lineage_hash" \
+  "leaf_sha=$leaf_hash" \
+  'target_script=runtime/hill-climb-fleet' \
+  'target_lineage=runtime/capture-lineage' \
+  'target_mode=0555' >"$required_manifest"
+required_manifest_hash="$(sha256_file "$required_manifest")"
+required_stage="$(mktemp -d "/tmp/eval-harness-upload.$required_manifest_hash.XXXXXX")"
+cp "$tmp/new-runner" "$required_stage/hill-climb-fleet"
+cp "$tmp/new-lineage" "$required_stage/capture-lineage"
+cp "$leaf" "$required_stage/eval-harness-install-remote"
+cp "$required_manifest" "$required_stage/install-manifest.txt"
+chmod 0444 "$required_stage/"*
+chmod 0555 "$required_stage"
+if bash "$required_stage/eval-harness-install-remote" "$required_stage" \
+  "$required_manifest_hash" "$operation_hash" "$preimage_commit" "$harness_sha" "$installer_sha" "$old_script_hash" "$required_old_lineage" \
+  "$new_script_hash" "$new_lineage_hash" "$leaf_hash" "$target_user" "$missing_home" "$tmp/missing-authority" \
+  >"$tmp/missing.out" 2>"$tmp/missing.err"; then
+  echo "FAIL missing required lineage preimage was accepted" >&2
+  exit 1
+fi
+grep -q 'runtime pair preimage mismatch:.*lineage=absent' "$tmp/missing.err" \
+  || { echo "FAIL missing-lineage refusal was not named" >&2; exit 1; }
+
+unexpected_home="$tmp/unexpected-home"
+unexpected_authority="$tmp/unexpected-authority"
+mkdir -p "$unexpected_home/bin"
+printf '%s\n' unexpected >"$unexpected_home/bin/hill-climb-fleet"
+if bash "$stage/eval-harness-install-remote" "$stage" \
+    "$manifest_hash" "$operation_hash" "$preimage_commit" "$harness_sha" "$installer_sha" \
+    "$old_script_hash" absent "$new_script_hash" "$new_lineage_hash" "$leaf_hash" \
+    "$target_user" "$unexpected_home" "$unexpected_authority" \
+    >"$tmp/refusal.out" 2>"$tmp/refusal.err"; then
+  echo "FAIL unexpected preimage was accepted" >&2
+  exit 1
+fi
+grep -q 'runtime pair preimage mismatch' "$tmp/refusal.err" \
+  || { echo "FAIL preimage refusal was not named" >&2; exit 1; }
+
+verify_home="$tmp/verify-home"
+verify_authority="$tmp/verify-authority"
+verify_runtime="$verify_authority/runtime/$operation_hash"
+mkdir -p "$verify_home" "$verify_runtime" "$verify_authority/receipts"
+cp "$tmp/new-runner" "$verify_runtime/hill-climb-fleet"
+cp "$tmp/new-lineage" "$verify_runtime/capture-lineage"
+cp "$authority_root/receipts/$operation_hash.json" "$verify_authority/receipts/$operation_hash.json"
+chmod 0555 "$verify_runtime/hill-climb-fleet" "$verify_runtime/capture-lineage" "$verify_runtime"
+chmod 0444 "$verify_authority/receipts/$operation_hash.json"
+ln -s "runtime/$operation_hash" "$verify_authority/current"
+umask 000
+: >"$verify_authority/runtime.lock"
+umask 022
+chmod 0660 "$verify_authority/runtime.lock"
+verify_script_hash="$(sha256_file "$verify_runtime/hill-climb-fleet")"
+verify_lineage_hash="$(sha256_file "$verify_runtime/capture-lineage")"
+HOME="$verify_home" \
+  FLEET_INSTALL_AUTHORITY_ROOT="$verify_authority" \
+  FLEET_EXPECTED_HARNESS_SHA="$harness_sha" \
+  FLEET_EXPECTED_SCRIPT_SHA256="$verify_script_hash" \
+  FLEET_EXPECTED_LINEAGE_SHA256="$verify_lineage_hash" \
+  "$verify_authority/current/hill-climb-fleet" verify-install >"$tmp/verify.out"
+grep -q 'HARNESS INSTALL VERIFIED' "$tmp/verify.out" \
+  || { echo "FAIL installed runtime did not verify its receipt" >&2; exit 1; }
+
+# The operation is unable to execute until the independently-forked backup
+# holder acknowledges. Killing the primary at that boundary must leave no
+# executed command and must keep the lock until the blocked group is gone.
+pregate_ready="$tmp/pregate.ready"
+pregate_holder_path="$tmp/pregate.holder"
+pregate_child_path="$tmp/pregate.child"
+pregate_executed="$tmp/pregate.executed"
+HOME="$verify_home" FLEET_INSTALL_AUTHORITY_ROOT="$verify_authority" \
+  "$verify_authority/current/hill-climb-fleet" _test-runtime-lock-pregate \
+  "$pregate_ready" "$pregate_holder_path" "$pregate_child_path" "$pregate_executed" \
+  >"$tmp/pregate.out" 2>"$tmp/pregate.err" &
+pregate_process=$!
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  [[ -f "$pregate_ready" && -s "$pregate_holder_path" && -s "$pregate_child_path" ]] && break
+  sleep 0.1
+done
+[[ -f "$pregate_ready" && -s "$pregate_holder_path" && -s "$pregate_child_path" ]] \
+  || { cat "$tmp/pregate.err" >&2; echo "FAIL pre-gate fixture did not reach the held boundary" >&2; exit 1; }
+pregate_holder_pid="$(cat "$pregate_holder_path")"
+pregate_child_pid="$(cat "$pregate_child_path")"
+[[ "$pregate_process" = "$pregate_holder_pid" ]] \
+  || { echo "FAIL pre-gate fixture named the wrong primary holder" >&2; exit 1; }
+kill -0 "$pregate_child_pid" 2>/dev/null \
+  || { echo "FAIL pre-gate operation process was not alive behind the gate" >&2; exit 1; }
+if HOME="$verify_home" FLEET_INSTALL_AUTHORITY_ROOT="$verify_authority" \
+    "$verify_authority/current/hill-climb-fleet" _test-runtime-lock-contender \
+    >"$tmp/pregate-contender.out" 2>"$tmp/pregate-contender.err"; then
+  echo "FAIL contender acquired before pre-gate holder death" >&2
+  exit 1
+fi
+kill -9 "$pregate_holder_pid"
+wait "$pregate_process" 2>/dev/null || true
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60; do
+  kill -0 "$pregate_child_pid" 2>/dev/null || break
+  sleep 0.1
+done
+kill -0 "$pregate_child_pid" 2>/dev/null \
+  && { echo "FAIL backup did not terminate the blocked pre-gate process" >&2; exit 1; }
+[[ ! -e "$pregate_executed" ]] \
+  || { echo "FAIL operation code executed before watchdog acknowledgement" >&2; exit 1; }
+HOME="$verify_home" FLEET_INSTALL_AUTHORITY_ROOT="$verify_authority" \
+  "$verify_authority/current/hill-climb-fleet" _test-runtime-lock-contender \
+  >"$tmp/pregate-recovered.out"
+grep -q 'RUNTIME LOCK ACQUIRED' "$tmp/pregate-recovered.out" \
+  || { echo "FAIL pre-gate cleanup did not release the runtime lock" >&2; exit 1; }
+
+# The registered-subtree deadline supervisor stays inside the operation group,
+# while its test command deliberately calls setsid. Outer runner death must
+# wait for coordinated inner cleanup of that escaped registered descendant.
+timeout_ready="$tmp/timeout-tree.ready"
+timeout_runner_path="$tmp/timeout-tree.runner"
+timeout_process_path="$tmp/timeout-tree.timeout"
+timeout_child_path="$tmp/timeout-tree.child"
+HOME="$verify_home" FLEET_INSTALL_AUTHORITY_ROOT="$verify_authority" \
+  "$verify_authority/current/hill-climb-fleet" _test-runtime-lock-timeout-tree \
+  "$timeout_ready" "$timeout_runner_path" "$timeout_process_path" "$timeout_child_path" \
+  >"$tmp/timeout-tree.out" 2>"$tmp/timeout-tree.err" &
+timeout_holder=$!
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  [[ -f "$timeout_ready" && -s "$timeout_runner_path" && -s "$timeout_process_path" && -s "$timeout_child_path" ]] && break
+  sleep 0.1
+done
+[[ -f "$timeout_ready" && -s "$timeout_runner_path" && -s "$timeout_process_path" && -s "$timeout_child_path" ]] \
+  || { cat "$tmp/timeout-tree.err" >&2; echo "FAIL deadline tree fixture did not start" >&2; exit 1; }
+timeout_runner_pid="$(cat "$timeout_runner_path")"
+timeout_process_pid="$(cat "$timeout_process_path")"
+timeout_child_pid="$(cat "$timeout_child_path")"
+runner_pgid="$(ps -o pgid= -p "$timeout_runner_pid" | tr -d ' ')"
+timeout_pgid="$(ps -o pgid= -p "$timeout_process_pid" | tr -d ' ')"
+child_pgid="$(ps -o pgid= -p "$timeout_child_pid" | tr -d ' ')"
+[[ "$runner_pgid" = "$timeout_pgid" && "$runner_pgid" != "$child_pgid" ]] \
+  || { echo "FAIL composed deadline fixture did not create the intended escaped descendant" >&2; exit 1; }
+kill -9 "$timeout_runner_pid"
+wait "$timeout_holder" 2>/dev/null || true
+for pid in "$timeout_process_pid" "$timeout_child_pid"; do
+  kill -0 "$pid" 2>/dev/null \
+    && { echo "FAIL deadline tree survived operation-group cleanup pid=$pid" >&2; exit 1; }
+done
+HOME="$verify_home" FLEET_INSTALL_AUTHORITY_ROOT="$verify_authority" \
+  "$verify_authority/current/hill-climb-fleet" _test-runtime-lock-contender \
+  >"$tmp/timeout-tree-recovered.out"
+grep -q 'RUNTIME LOCK ACQUIRED' "$tmp/timeout-tree-recovered.out" \
+  || { echo "FAIL deadline tree cleanup did not release the runtime lock" >&2; exit 1; }
+
+# Cross-product: kill the primary lock holder (not merely the immediate
+# runner) while the escaped registered descendant is live. The backup holder
+# must honor the active marker and retain the lease through inner cleanup.
+marker_ready="$tmp/marker-backup.ready"
+marker_runner_path="$tmp/marker-backup.runner"
+marker_supervisor_path="$tmp/marker-backup.supervisor"
+marker_child_path="$tmp/marker-backup.child"
+HOME="$verify_home" FLEET_INSTALL_AUTHORITY_ROOT="$verify_authority" \
+  "$verify_authority/current/hill-climb-fleet" _test-runtime-lock-timeout-tree \
+  "$marker_ready" "$marker_runner_path" "$marker_supervisor_path" "$marker_child_path" \
+  >"$tmp/marker-backup.out" 2>"$tmp/marker-backup.err" &
+marker_holder=$!
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  [[ -f "$marker_ready" && -s "$marker_supervisor_path" && -s "$marker_child_path" ]] && break
+  sleep 0.1
+done
+[[ -f "$marker_ready" && -s "$marker_supervisor_path" && -s "$marker_child_path" ]] \
+  || { cat "$tmp/marker-backup.err" >&2; echo "FAIL marker-backup fixture did not start" >&2; exit 1; }
+marker_supervisor_pid="$(cat "$marker_supervisor_path")"
+marker_child_pid="$(cat "$marker_child_path")"
+kill -9 "$marker_holder"
+wait "$marker_holder" 2>/dev/null || true
+if HOME="$verify_home" FLEET_INSTALL_AUTHORITY_ROOT="$verify_authority" \
+    "$verify_authority/current/hill-climb-fleet" _test-runtime-lock-contender \
+    >"$tmp/marker-backup-contender.out" 2>"$tmp/marker-backup-contender.err"; then
+  echo "FAIL backup released the lease before escaped subtree cleanup" >&2
+  exit 1
+fi
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60; do
+  if ! kill -0 "$marker_supervisor_pid" 2>/dev/null \
+      && ! kill -0 "$marker_child_pid" 2>/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
+for pid in "$marker_supervisor_pid" "$marker_child_pid"; do
+  kill -0 "$pid" 2>/dev/null \
+    && { echo "FAIL backup marker cleanup left process alive pid=$pid" >&2; exit 1; }
+done
+HOME="$verify_home" FLEET_INSTALL_AUTHORITY_ROOT="$verify_authority" \
+  "$verify_authority/current/hill-climb-fleet" _test-runtime-lock-contender \
+  >"$tmp/marker-backup-recovered.out"
+grep -q 'RUNTIME LOCK ACQUIRED' "$tmp/marker-backup-recovered.out" \
+  || { echo "FAIL backup marker cleanup did not release the lease" >&2; exit 1; }
+
+# Deadline expiry itself must be terminal for the complete registered subtree,
+# not merely for the direct command. The fixture grandchild ignores TERM.
+deadline_ready="$tmp/deadline-expiry.ready"
+deadline_child="$tmp/deadline-expiry.child"
+HOME="$verify_home" FLEET_INSTALL_AUTHORITY_ROOT="$verify_authority" \
+  "$verify_authority/current/hill-climb-fleet" _test-runtime-deadline-expiry \
+  "$deadline_ready" "$deadline_child" >"$tmp/deadline-expiry.out"
+[[ -f "$deadline_ready" && -s "$deadline_child" ]] \
+  || { echo "FAIL deadline-expiry fixture never executed" >&2; exit 1; }
+grep -q 'DEADLINE SUBTREE TERMINATED' "$tmp/deadline-expiry.out" \
+  || { echo "FAIL deadline supervisor did not prove subtree termination" >&2; exit 1; }
+kill -0 "$(cat "$deadline_child")" 2>/dev/null \
+  && { echo "FAIL resistant deadline grandchild survived the supervisor return" >&2; exit 1; }
+HOME="$verify_home" FLEET_INSTALL_AUTHORITY_ROOT="$verify_authority" \
+  "$verify_authority/current/hill-climb-fleet" _test-runtime-deadline-identity-swap \
+  >"$tmp/deadline-identity-swap.out"
+grep -q 'PIDFD IDENTITY SWAP REFUSED' "$tmp/deadline-identity-swap.out" \
+  || { echo "FAIL deterministic pidfd identity-swap seam did not refuse" >&2; exit 1; }
+[[ "$(grep -Ec '^[[:space:]]*(exec[[:space:]]+)?timeout[[:space:]]+' "$tmp/new-runner" || true)" = 0 ]] \
+  || { echo "FAIL runner still invokes GNU timeout" >&2; exit 1; }
+[[ "$(grep -c 'run_with_deadline .*npx\|run_with_deadline .*codex\|run_with_deadline .*claude' "$tmp/new-runner")" = 4 ]] \
+  || { echo "FAIL production deadline calls do not all use the approved subtree supervisor" >&2; exit 1; }
+if ! grep -q 'fresh_table = fresh_snapshot()' "$tmp/new-runner" \
+    || ! grep -q 'fresh\[1\] != observed_started or pid not in fresh_frontier' "$tmp/new-runner"; then
+  echo "FAIL pidfd identity is not freshly revalidated before publication" >&2
+  exit 1
+fi
+
+# The fleet SUT must remain inside the managed operation group. Standalone
+# reset may detach, but the fleet call binds the explicit inherited policy.
+grep -q 'JSONL_INHERIT_PROCESS_GROUP=true' "$tmp/new-runner" \
+  || { echo "FAIL fleet reset does not bind inherited process-group policy" >&2; exit 1; }
+grep -q 'start_new_session=inherit_group != "true"' "$PWD/bin/reset-jsonl-server" \
+  || { echo "FAIL reset-jsonl-server does not derive detachment from the explicit policy" >&2; exit 1; }
+[[ "$(grep -c 'start_new_session=True' "$PWD/bin/reset-jsonl-server" || true)" = 0 ]] \
+  || { echo "FAIL reset-jsonl-server still contains an unconditional detached SUT launch" >&2; exit 1; }
+
+orphan_ready="$tmp/runner-foreground.ready"
+orphan_runner_path="$tmp/runner-foreground.runner"
+orphan_child_path="$tmp/runner-foreground.child"
+HOME="$verify_home" FLEET_INSTALL_AUTHORITY_ROOT="$verify_authority" \
+  "$verify_authority/current/hill-climb-fleet" _test-runtime-lock-foreground \
+  "$orphan_ready" "$orphan_runner_path" "$orphan_child_path" \
+  >"$tmp/runner-orphan.out" 2>"$tmp/runner-orphan.err" &
+orphan_lock_holder_pid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  [[ -f "$orphan_ready" && -s "$orphan_runner_path" && -s "$orphan_child_path" ]] && break
+  sleep 0.1
+done
+[[ -f "$orphan_ready" && -s "$orphan_runner_path" && -s "$orphan_child_path" ]] \
+  || { cat "$tmp/runner-orphan.err" >&2; echo "FAIL foreground lock-boundary fixture did not start" >&2; exit 1; }
+orphan_runner_pid="$(cat "$orphan_runner_path")"
+orphan_child_pid="$(cat "$orphan_child_path")"
+kill -9 "$orphan_runner_pid"
+kill -0 "$orphan_child_pid" 2>/dev/null \
+  || { echo "FAIL foreground child did not survive runner SIGKILL" >&2; exit 1; }
+if HOME="$verify_home" FLEET_INSTALL_AUTHORITY_ROOT="$verify_authority" \
+    "$verify_authority/current/hill-climb-fleet" _test-runtime-lock-contender \
+    >"$tmp/runner-live-tree-contender.out" 2>"$tmp/runner-live-tree-contender.err"; then
+  echo "FAIL contender acquired while the old operation tree was alive" >&2
+  exit 1
+fi
+grep -q 'owns the runtime lock' "$tmp/runner-live-tree-contender.err" \
+  || { echo "FAIL live-tree lock refusal was not named" >&2; exit 1; }
+wait "$orphan_lock_holder_pid" 2>/dev/null || true
+if kill -0 "$orphan_child_pid" 2>/dev/null; then
+  echo "FAIL lock holder released before the old foreground child terminated" >&2
+  exit 1
+fi
+HOME="$verify_home" FLEET_INSTALL_AUTHORITY_ROOT="$verify_authority" \
+  "$verify_authority/current/hill-climb-fleet" _test-runtime-lock-contender \
+  >"$tmp/runner-orphan-contender.out"
+grep -q 'RUNTIME LOCK ACQUIRED' "$tmp/runner-orphan-contender.out" \
+  || { echo "FAIL quiescent operation did not release the runtime lock" >&2; exit 1; }
+
+holder_death_ready="$tmp/holder-death.ready"
+holder_death_runner="$tmp/holder-death.runner"
+holder_death_child="$tmp/holder-death.child"
+HOME="$verify_home" FLEET_INSTALL_AUTHORITY_ROOT="$verify_authority" \
+  "$verify_authority/current/hill-climb-fleet" _test-runtime-lock-foreground \
+  "$holder_death_ready" "$holder_death_runner" "$holder_death_child" \
+  >"$tmp/holder-death.out" 2>"$tmp/holder-death.err" &
+holder_death_pid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  [[ -f "$holder_death_ready" && -s "$holder_death_child" ]] && break
+  sleep 0.1
+done
+[[ -f "$holder_death_ready" && -s "$holder_death_child" ]] \
+  || { cat "$tmp/holder-death.err" >&2; echo "FAIL holder-death fixture did not start" >&2; exit 1; }
+holder_death_child_pid="$(cat "$holder_death_child")"
+kill -9 "$holder_death_pid"
+wait "$holder_death_pid" 2>/dev/null || true
+if HOME="$verify_home" FLEET_INSTALL_AUTHORITY_ROOT="$verify_authority" \
+    "$verify_authority/current/hill-climb-fleet" _test-runtime-lock-contender \
+    >"$tmp/holder-death-contender.out" 2>"$tmp/holder-death-contender.err"; then
+  echo "FAIL backup watchdog released the lease before tree cleanup" >&2
+  exit 1
+fi
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60; do
+  kill -0 "$holder_death_child_pid" 2>/dev/null || break
+  sleep 0.1
+done
+kill -0 "$holder_death_child_pid" 2>/dev/null \
+  && { echo "FAIL backup watchdog did not terminate the orphan operation tree" >&2; exit 1; }
+HOME="$verify_home" FLEET_INSTALL_AUTHORITY_ROOT="$verify_authority" \
+  "$verify_authority/current/hill-climb-fleet" _test-runtime-lock-contender \
+  >"$tmp/holder-death-recovered.out"
+grep -q 'RUNTIME LOCK ACQUIRED' "$tmp/holder-death-recovered.out" \
+  || { echo "FAIL backup watchdog did not release after tree cleanup" >&2; exit 1; }
+
+runner_lock_ready="$tmp/runner-lock.ready"
+python3 - "$verify_authority/runtime.lock" "$runner_lock_ready" <<'PY' &
+import fcntl
+import pathlib
+import sys
+import time
+lock, ready = sys.argv[1:]
+with open(lock, 'w') as stream:
+    fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+    pathlib.Path(ready).write_text('ready\n', encoding='utf-8')
+    time.sleep(30)
+PY
+runner_lock_pid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [[ -f "$runner_lock_ready" ]] && break
+  sleep 0.1
+done
+if HOME="$verify_home" \
+    FLEET_INSTALL_AUTHORITY_ROOT="$verify_authority" \
+    FLEET_EXPECTED_HARNESS_SHA="$harness_sha" \
+    FLEET_EXPECTED_SCRIPT_SHA256="$verify_script_hash" \
+    FLEET_EXPECTED_LINEAGE_SHA256="$verify_lineage_hash" \
+    "$verify_authority/current/hill-climb-fleet" start \
+    >"$tmp/runner-lock.out" 2>"$tmp/runner-lock.err"; then
+  echo "FAIL runner entered start while the kernel lock was held" >&2
+  exit 1
+fi
+grep -q 'owns the runtime lock' "$tmp/runner-lock.err" \
+  || { echo "FAIL runner lock refusal was not named" >&2; exit 1; }
+kill -9 "$runner_lock_pid"
+wait "$runner_lock_pid" 2>/dev/null || true
+if HOME="$verify_home" \
+    FLEET_INSTALL_AUTHORITY_ROOT="$verify_authority" \
+    FLEET_EXPECTED_HARNESS_SHA=0000000000000000000000000000000000000000 \
+    FLEET_EXPECTED_SCRIPT_SHA256="$verify_script_hash" \
+    FLEET_EXPECTED_LINEAGE_SHA256="$verify_lineage_hash" \
+    "$verify_authority/current/hill-climb-fleet" start \
+    >"$tmp/runner-post-kill.out" 2>"$tmp/runner-post-kill.err"; then
+  echo "FAIL post-SIGKILL runner unexpectedly launched" >&2
+  exit 1
+fi
+grep -q 'no immutable install receipt' "$tmp/runner-post-kill.err" \
+  || { echo "FAIL runner did not reacquire the kernel lock after SIGKILL" >&2; exit 1; }
+chmod 0755 "$verify_runtime"
+if HOME="$verify_home" \
+    FLEET_INSTALL_AUTHORITY_ROOT="$verify_authority" \
+    FLEET_EXPECTED_HARNESS_SHA="$harness_sha" \
+    FLEET_EXPECTED_SCRIPT_SHA256="$verify_script_hash" \
+    FLEET_EXPECTED_LINEAGE_SHA256="$verify_lineage_hash" \
+    "$verify_authority/current/hill-climb-fleet" verify-install \
+    >"$tmp/writable-runtime.out" 2>"$tmp/writable-runtime.err"; then
+  echo "FAIL writable runtime parent passed immutable receipt verification" >&2
+  exit 1
+fi
+grep -q 'no immutable install receipt' "$tmp/writable-runtime.err" \
+  || { echo "FAIL writable-runtime refusal was not named" >&2; exit 1; }
+chmod 0555 "$verify_runtime"
+chmod 0755 "$verify_runtime" "$verify_runtime/capture-lineage"
+printf '%s\n' drift >>"$verify_runtime/capture-lineage"
+if HOME="$verify_home" \
+    FLEET_INSTALL_AUTHORITY_ROOT="$verify_authority" \
+    FLEET_EXPECTED_HARNESS_SHA="$harness_sha" \
+    FLEET_EXPECTED_SCRIPT_SHA256="$verify_script_hash" \
+    FLEET_EXPECTED_LINEAGE_SHA256="$verify_lineage_hash" \
+    "$verify_authority/current/hill-climb-fleet" verify-install >"$tmp/drift.out" 2>"$tmp/drift.err"; then
+  echo "FAIL installed runtime accepted capture-lineage drift" >&2
+  exit 1
+fi
+grep -q 'capture-lineage digest differs' "$tmp/drift.err" \
+  || { echo "FAIL installed runtime drift refusal was not named" >&2; exit 1; }
+
+forged_home="$tmp/forged-home"
+forged_authority="$tmp/forged-authority"
+forged_runtime="$forged_authority/runtime/$operation_hash"
+mkdir -p "$forged_home/.eval-harness-install-receipts" "$forged_runtime" "$forged_authority/receipts"
+cp "$repo_root/bin/hill-climb-fleet" "$forged_runtime/hill-climb-fleet"
+cp "$repo_root/bin/capture-lineage" "$forged_runtime/capture-lineage"
+chmod 0555 "$forged_runtime/"* "$forged_runtime"
+ln -s "runtime/$operation_hash" "$forged_authority/current"
+printf 'not json: "schema":"eval-harness-install.v5" "harness_sha":"%s" "installed_script_sha256":"%s" "installed_lineage_sha256":"%s"\n' \
+  "$harness_sha" "$verify_script_hash" "$verify_lineage_hash" \
+  >"$forged_home/.eval-harness-install-receipts/0000000000000000000000000000000000000000000000000000000000000000.json"
+if HOME="$forged_home" \
+    FLEET_INSTALL_AUTHORITY_ROOT="$forged_authority" \
+    FLEET_EXPECTED_HARNESS_SHA="$harness_sha" \
+    FLEET_EXPECTED_SCRIPT_SHA256="$verify_script_hash" \
+    FLEET_EXPECTED_LINEAGE_SHA256="$verify_lineage_hash" \
+    "$forged_authority/current/hill-climb-fleet" verify-install >"$tmp/forged.out" 2>"$tmp/forged.err"; then
+  echo "FAIL malformed receipt text passed install verification" >&2
+  exit 1
+fi
+grep -q 'no immutable install receipt' "$tmp/forged.err" \
+  || { echo "FAIL forged receipt refusal was not named" >&2; exit 1; }
+
+pair_repo="$tmp/pair-repo"
+mkdir -p "$pair_repo/bin"
+cp "$repo_root/bin/reset-anvil-fleet" "$pair_repo/bin/reset-anvil-fleet"
+git -C "$pair_repo" init -q
+git -C "$pair_repo" config user.name test
+git -C "$pair_repo" config user.email test@example.com
+printf '%s\n' runner-a >"$pair_repo/bin/hill-climb-fleet"
+printf '%s\n' lineage-x >"$pair_repo/bin/capture-lineage"
+git -C "$pair_repo" add bin
+git -C "$pair_repo" commit -qm pair-a-x
+runner_a_hash="$(sha256_file "$pair_repo/bin/hill-climb-fleet")"
+printf '%s\n' runner-b >"$pair_repo/bin/hill-climb-fleet"
+printf '%s\n' lineage-y >"$pair_repo/bin/capture-lineage"
+git -C "$pair_repo" add bin
+git -C "$pair_repo" commit -qm pair-b-y
+runner_b_hash="$(sha256_file "$pair_repo/bin/hill-climb-fleet")"
+lineage_y_hash="$(sha256_file "$pair_repo/bin/capture-lineage")"
+pair_head="$(git -C "$pair_repo" rev-parse HEAD)"
+if "$pair_repo/bin/reset-anvil-fleet" _test-find-preimage "$pair_head" "$runner_a_hash" "$lineage_y_hash" \
+    >"$tmp/frankenstein.out" 2>"$tmp/frankenstein.err"; then
+  echo "FAIL runner and lineage from different commits passed common-preimage proof" >&2
+  exit 1
+fi
+positive_pair="$("$pair_repo/bin/reset-anvil-fleet" _test-find-preimage "$pair_head" "$runner_b_hash" "$lineage_y_hash")"
+[[ "$positive_pair" == "$pair_head" ]] \
+  || { echo "FAIL exact common preimage commit was not found" >&2; exit 1; }
+
+control_paths="$(sed -n '/^start_remote() {/,/^}/p; /^resume_remote() {/,/^}/p; /^score_remote() {/,/^}/p' "$repo_root/bin/reset-anvil-fleet")"
+if printf '%s\n' "$control_paths" | rg -n 'install .*hill-climb-fleet|scp .*hill-climb-fleet' >"$tmp/overwrite.out"; then
+  cat "$tmp/overwrite.out" >&2
+  echo "FAIL start/resume/score wrapper can still overwrite the receipted runtime" >&2
+  exit 1
+fi
+
+printf 'PASS eval harness install: sealed stage, kernel lock, root-owned immutable runtime, terminal-state gate, exact preimages, and stable replay\n'

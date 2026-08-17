@@ -1,0 +1,23 @@
+;; App configuration — read once at load. Everything here has a sane default;
+;; the file exists so the defaults are visible and overridable, not because
+;; anything requires editing.
+{;; The base URL printed on public-facing surfaces (the create page's marquee,
+ ;; invite links, exports). nil = derive from the request, which honors
+ ;; X-Forwarded-Host/Proto and is therefore already correct on Cloud Run.
+ ;; Set it only to force a specific address — e.g. a custom domain, or showing
+ ;; the production URL while developing locally:
+ ;;   :public-base-url "https://swyx-cfp-saas-killer-109637679549.us-west1.run.app"
+ :public-base-url nil
+
+ ;; Google Sign-In (server-side OIDC). The client ID is public by design — it
+ ;; appears in every redirect URL. The client SECRET lives in secrets.clj land
+ ;; (secrets/google-oauth-client.txt locally, Secret Manager on Cloud Run);
+ ;; the button only renders when both halves are present.
+ :google-client-id "109637679549-j9espgi36hpq3agjffq6crhao9k4logg.apps.googleusercontent.com"
+
+ ;; Demo mode (bd -o42): the login page grows one-click sign-in buttons for the
+ ;; seeded demo people (organizer/reviewer/speaker). OFF by default since
+ ;; 2026-08-11: dev matches curtaincallcfp (demo-off), and the ghost-map
+ ;; replay demo replaced canned personas as the stranger's door. A dedicated
+ ;; demo instance can still opt in with DEMO_MODE=true.
+ :demo-mode false}

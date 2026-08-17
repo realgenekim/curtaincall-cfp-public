@@ -1,0 +1,1177 @@
+#!/usr/bin/env bash
+# Merge isolated scenario evidence, judge each rubric area in fresh contexts,
+# and publish one comparable score plus a ranked improvement queue.
+set -euo pipefail
+
+run_dir="${1:-}"
+base_kit="${FLEET_EVAL_KIT:-$HOME/killmysaas-evals-coding-agent}"
+judge_timeout="${FLEET_JUDGE_TIMEOUT_SECONDS:-2400}"
+fleet_executor="${FLEET_EXECUTOR:-codex}"
+judge_executor="${FLEET_JUDGE_EXECUTOR:-$fleet_executor}"
+judge_model="${FLEET_JUDGE_MODEL:-}"
+judge_reasoning_effort="${FLEET_JUDGE_REASONING_EFFORT:-}"
+judgement_schema="${FLEET_JUDGEMENT_SCHEMA:-$run_dir/app/resources/sbek-judgement.schema.json}"
+evidence_only="${FLEET_CONSOLIDATE_EVIDENCE_ONLY:-false}"
+resume="${FLEET_CONSOLIDATE_RESUME:-false}"
+judge_concurrency="${FLEET_JUDGE_CONCURRENCY:-2}"
+judge_sample_count="${FLEET_JUDGE_SAMPLE_COUNT:-5}"
+eval_kit_sha=""
+eval_kit_archive_sha256=""
+eval_config_path="$run_dir/inputs/evalconfig.json"
+eval_config_sha256=""
+final_kit=""
+temporary_kit=""
+predicate_registry="${FLEET_PREDICATE_REGISTRY:-$run_dir/app/resources/hill-climb-predicate-registry.json}"
+fold_engine="${FLEET_JUDGEMENT_FOLD:-$run_dir/app/bin/hill-climb-judgement-fold}"
+predicate_results_root="${FLEET_PREDICATE_RESULTS_DIR:-$run_dir/predicate-results}"
+candidate_root="$run_dir/judgement-candidates"
+judge_input_root="$run_dir/judgement-inputs"
+fold_receipt_root="$run_dir/judgement-folds"
+
+areas=(
+  call-for-papers
+  abstract-management
+  speaker-management
+  content-management
+  ai-agenda
+  public-widgets
+)
+
+fail() {
+  echo "ERROR consolidate-hill-climb: $*" >&2
+  exit 1
+}
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+validate_executor() {
+  case "$judge_executor" in
+    codex|claude) ;;
+    *) fail "FLEET_JUDGE_EXECUTOR must be codex or claude; got '$judge_executor'" ;;
+  esac
+}
+
+validate_reasoning_effort() {
+  case "$1" in
+    minimal|low|medium|high|xhigh) ;;
+    *) fail "FLEET_JUDGE_REASONING_EFFORT must be minimal, low, medium, high, or xhigh; got '$1'" ;;
+  esac
+}
+
+require_executor() {
+  command -v "$judge_executor" >/dev/null 2>&1 \
+    || fail "$judge_executor is required for fresh-context judges"
+  if [ "$judge_executor" = "codex" ]; then
+    env -u OPENAI_API_KEY -u CODEX_API_KEY codex login status 2>&1 \
+      | grep -q 'Logged in using ChatGPT' \
+      || fail "Codex must be authenticated with ChatGPT subscription login; run 'codex login' as $(id -un)"
+    [ -s "$judgement_schema" ] \
+      || fail "Codex judgement schema is missing: $judgement_schema"
+  fi
+}
+
+expected_ids_for_area() {
+  local area="$1"
+  (
+    cd "$final_kit"
+    npx --yes pnpm@9 run --silent sbek -- \
+      judge-brief --area "$area" --run runs/fleet-consolidated 2>/dev/null \
+      | sed -n 's/^- \([A-Z][A-Z]*-[0-9][0-9]*\) (.*/\1/p'
+  )
+}
+
+area_prefix() {
+  case "$1" in
+    call-for-papers) printf 'CFP\n' ;;
+    abstract-management) printf 'ABS\n' ;;
+    speaker-management) printf 'SPK\n' ;;
+    content-management) printf 'CNT\n' ;;
+    ai-agenda) printf 'AIA\n' ;;
+    public-widgets) printf 'EMB\n' ;;
+    *) fail "unknown rubric area: $1" ;;
+  esac
+}
+
+predicate_ids_for_area() {
+  local area="$1"
+  python3 - "$predicate_registry" "$area" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    registry = json.load(stream)
+if registry.get("schema") != "hill-climb-predicate-registry.v1":
+    raise SystemExit("wrong predicate registry schema")
+criteria = registry.get("criteria")
+if not isinstance(criteria, dict):
+    raise SystemExit("predicate registry criteria must be an object")
+for rubric_id, entry in criteria.items():
+    if (not isinstance(rubric_id, str) or not rubric_id or
+            not isinstance(entry, dict) or
+            not isinstance(entry.get("area"), str) or not entry["area"] or
+            entry.get("status") not in {"candidate", "active"} or
+            not isinstance(entry.get("predicate"), str) or not entry["predicate"] or
+            not isinstance(entry.get("rubric_clause_id"), str) or
+            not entry["rubric_clause_id"] or
+            not isinstance(entry.get("residual_model_required"), bool)):
+        raise SystemExit(f"predicate registry entry is invalid: {rubric_id}")
+print(" ".join(sorted(
+    rubric_id for rubric_id, entry in criteria.items()
+    if (isinstance(entry, dict) and entry.get("area") == sys.argv[2]
+        and entry.get("status") == "active")
+)))
+PY
+}
+
+prepare_judge_input() {
+  local area="$1" prefix input_dir temporary brief evidence_manifest input_manifest
+  local brief_sha input_sha relative file file_sha
+  prefix="$(area_prefix "$area")"
+  input_dir="$judge_input_root/$area"
+  temporary="$(mktemp -d "$run_dir/.judge-input-$prefix.XXXXXX")"
+  brief="$temporary/brief.txt"
+  evidence_manifest="$temporary/evidence.sha256"
+  input_manifest="$temporary/input.sha256"
+  (
+    cd "$final_kit"
+    npx --yes pnpm@9 run --silent sbek -- \
+      judge-brief --area "$area" --run runs/fleet-consolidated
+  ) > "$brief"
+  : > "$evidence_manifest"
+  while IFS= read -r file; do
+    relative="${file#"$final_kit/"}"
+    file_sha="$(sha256_file "$file")"
+    printf '%s  %s\n' "$file_sha" "$relative" >> "$evidence_manifest"
+  done < <(find "$final_kit/runs/fleet-consolidated" -type f \
+    -path "*/$prefix-S*/*" -print | sort)
+  [ -s "$evidence_manifest" ] || fail "no immutable evidence files found for $area"
+  brief_sha="$(sha256_file "$brief")"
+  printf '%s  brief.txt\n' "$brief_sha" > "$input_manifest"
+  cat "$evidence_manifest" >> "$input_manifest"
+  input_sha="$(sha256_file "$input_manifest")"
+  python3 - "$temporary/context.json" "$area" "$brief_sha" "$input_sha" \
+    "$eval_kit_sha" "$eval_config_sha256" <<'PY'
+import json
+import sys
+
+path, area, rubric_sha, input_sha, eval_kit_sha, config_sha = sys.argv[1:]
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump({
+        "schema": "hill-climb-judge-input.v1",
+        "area": area,
+        "rubric_sha256": rubric_sha,
+        "input_sha256": input_sha,
+        "eval_kit_sha": eval_kit_sha,
+        "eval_config_sha256": config_sha,
+    }, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+PY
+  if [ -e "$input_dir" ]; then
+    diff -qr "$input_dir" "$temporary" >/dev/null \
+      || fail "immutable judge input changed for $area"
+    rm -rf -- "$temporary"
+  else
+    mkdir -p "$judge_input_root"
+    mv "$temporary" "$input_dir"
+  fi
+}
+
+candidate_count() {
+  local area="$1" count
+  if [ ! -d "$candidate_root/$area" ]; then
+    printf '0\n'
+    return
+  fi
+  count="$(find "$candidate_root/$area" -mindepth 2 -maxdepth 2 \
+    -type f -name candidate.json -print | wc -l | tr -d ' ')"
+  printf '%s\n' "$count"
+}
+
+candidate_samples() {
+  local area="$1"
+  if [ ! -d "$candidate_root/$area" ]; then
+    printf '\n'
+    return
+  fi
+  python3 - "$candidate_root/$area" "$area" <<'PY'
+import json
+import pathlib
+import sys
+
+root, area = pathlib.Path(sys.argv[1]), sys.argv[2]
+samples = []
+for path in sorted(root.glob("attempt-*/candidate.json")):
+    with path.open(encoding="utf-8") as stream:
+        candidate = json.load(stream)
+    if (candidate.get("schema") != "hill-climb-judgement-candidate.v1" or
+            candidate.get("status") != "enrolled" or
+            candidate.get("area") != area or
+            not isinstance(candidate.get("sample"), int)):
+        raise SystemExit(f"invalid enrolled candidate: {path}")
+    samples.append(candidate["sample"])
+if len(samples) != len(set(samples)):
+    raise SystemExit(f"duplicate enrolled sample ordinal for {area}")
+print(" ".join(map(str, sorted(samples))))
+PY
+}
+
+write_judgement_receipt() {
+  local path="$1" area="$2" sample="$3" judgement_path="$4" output_sha
+  output_sha="$(sha256_file "$judgement_path")"
+  python3 - "$path" "$area" "$sample" "$output_sha" <<'PY'
+import json
+import sys
+
+path, area, sample, output_sha = sys.argv[1:]
+with open(path, "x", encoding="utf-8") as stream:
+    json.dump({
+        "schema": "hill-climb-judge-output.v1",
+        "area": area,
+        "sample": int(sample),
+        "path": "judgement.json",
+        "sha256": output_sha,
+    }, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+PY
+}
+
+write_candidate_json() {
+  local path="$1" area="$2" sample="$3" attempt="$4"
+  local invocation_sha output_receipt_sha score_receipt_sha
+  invocation_sha="$(sha256_file "$attempt/invocation.json")"
+  output_receipt_sha="$(sha256_file "$attempt/judgement-receipt.json")"
+  score_receipt_sha="$(sha256_file "$attempt/score-receipt.json")"
+  python3 - "$path" "$area" "$sample" "$(basename "$attempt")" \
+    "$invocation_sha" "$output_receipt_sha" "$score_receipt_sha" <<'PY'
+import json
+import sys
+
+(path, area, sample, attempt, invocation_sha, output_sha, score_sha) = sys.argv[1:]
+with open(path, "x", encoding="utf-8") as stream:
+    json.dump({
+        "schema": "hill-climb-judgement-candidate.v1",
+        "status": "enrolled",
+        "area": area,
+        "sample": int(sample),
+        "attempt": attempt,
+        "receipts": {
+            "invocation_sha256": invocation_sha,
+            "judgement_sha256": output_sha,
+            "score_sha256": score_sha,
+        },
+    }, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+PY
+}
+
+write_zero_judgement() {
+  local area="$1" attempt="$2" sample="$3" scenario_rows="$4"
+  local ids_file
+  ids_file="$(mktemp "$run_dir/.area-ids.XXXXXX")"
+  expected_ids_for_area "$area" > "$ids_file"
+  python3 - "$attempt/judgement.json" "$area" "$sample" "$ids_file" "$scenario_rows" <<'PY'
+import json
+import sys
+
+path, area, sample_text, ids_path, scenario_rows = sys.argv[1:]
+sample = int(sample_text)
+with open(ids_path, encoding="utf-8") as stream:
+    rubric_ids = [line.strip() for line in stream if line.strip()]
+evidence_refs = []
+for row in scenario_rows.splitlines():
+    if row.strip():
+        evidence_refs.append(f"named-zero:{row}")
+with open(path, "x", encoding="utf-8") as stream:
+    json.dump({
+        "items": [
+            {
+                "id": rubric_id,
+                "verdict": "cannot_judge",
+                "confidence": "low",
+                "reasoning": (
+                    f"Named-zero refusal(s) for {area}: {', '.join(evidence_refs)}"
+                    if evidence_refs else f"Named-zero scenario requires scored zero for {area}"
+                ),
+                "evidence_refs": [f"named-zero:{area}:{sample}"],
+            }
+            for rubric_id in rubric_ids
+        ],
+        "defects": [
+            {
+                "severity": "major",
+                "description": f"Named-zero scored zero for {area}",
+                "where": row,
+            }
+            for row in scenario_rows.splitlines() if row.strip()
+        ],
+        "area_notes": f"named zero coverage for sample {sample} in area {area}: " +
+                      (", ".join(scenario_rows.splitlines()) if scenario_rows else "named-zero"),
+    }, stream, indent=2)
+    stream.write("\n")
+PY
+  rm -f "$ids_file"
+}
+
+write_zero_context() {
+  local area="$1" rows="$2" input_dir brief_path input_manifest
+  input_dir="$judge_input_root/$area"
+  brief_path="$input_dir/brief.txt"
+  input_manifest="$input_dir/input.sha256"
+  mkdir -p "$input_dir"
+  if [ -f "$input_dir/context.json" ]; then
+    return 0
+  fi
+  {
+    printf 'Named-zero scenarios are treated as cannot_judge.\n'
+    printf 'Area: %s\n' "$area"
+    printf '%s\n' "$rows"
+  } > "$brief_path"
+  printf '%s\tbrief.txt\n' "$(sha256_file "$brief_path")" > "$input_manifest"
+  python3 - "$input_dir/context.json" "$area" "$eval_kit_sha" "$eval_config_sha256" \
+    "$input_manifest" "$brief_path" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+path, area, eval_kit_sha, eval_config_sha, manifest_path, brief_path = sys.argv[1:]
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump({
+        "schema": "hill-climb-judge-input.v1",
+        "area": area,
+        "rubric_sha256": hashlib.sha256(pathlib.Path(brief_path).read_bytes()).hexdigest(),
+        "input_sha256": hashlib.sha256(pathlib.Path(manifest_path).read_bytes()).hexdigest(),
+        "eval_kit_sha": eval_kit_sha,
+        "eval_config_sha256": eval_config_sha,
+    }, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+PY
+}
+
+enroll_zero_candidate() {
+  local area="$1" sample="$2" attempt="$3" scenario_rows="$4"
+  local judgement_sha candidate_json
+  write_zero_context "$area" "$scenario_rows"
+  printf '%s\n' "Named-zero adjudication path for ${area}: ${scenario_rows}" > "$attempt/prompt.txt"
+  write_zero_judgement "$area" "$attempt" "$sample" "$scenario_rows"
+  if [ ! -f "$attempt/judgement.json" ]; then
+    return 1
+  fi
+  write_invocation_receipt "$area" "$sample" "$attempt"
+  judgement_sha="$(sha256_file "$attempt/judgement.json")"
+  write_judgement_receipt "$attempt/judgement-receipt.json" "$area" "$sample" "$attempt/judgement.json"
+  # Deterministic, fully-typed named-zero candidate.
+  candidate_json="$(mktemp "$run_dir/.zero-candidate-report.XXXXXX")"
+  rm -f "$candidate_json"
+  python3 - "$candidate_json" "$area" "$sample" <<'PY'
+import json
+import sys
+
+path, area, sample_text = sys.argv[1:]
+sample = int(sample_text)
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump({
+        "schema": "hill-climb-candidate-report.v1",
+        "area": area,
+        "sample": sample,
+        "summary": "named-zero scenario",
+    }, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+PY
+  # Use a deterministic zero score with full coverage so fold can still run.
+  python3 - "$attempt/score-receipt.json" "$area" "$sample" \
+    "$judgement_sha" "$candidate_json" "$eval_kit_archive_sha256" "$eval_config_sha256" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+path, area, sample_text, judgement_sha, report_path, score_code_sha, config_sha = sys.argv[1:]
+report = pathlib.Path(report_path)
+sample = int(sample_text)
+with open(path, "x", encoding="utf-8") as stream:
+    json.dump({
+        "schema": "hill-climb-candidate-score.v1",
+        "area": area,
+        "sample": sample,
+        "judgement_sha256": judgement_sha,
+        "computed_score_pct": 0.0,
+        "score_pct": 0.0,
+        "coverage_pct": 100.0,
+        "report_sha256": hashlib.sha256(report.read_bytes()).hexdigest(),
+        "score_code_sha256": score_code_sha,
+        "eval_config_sha256": config_sha,
+    }, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+PY
+  mv "$candidate_json" "$attempt/candidate-report.json"
+  write_candidate_json "$attempt/candidate.json" "$area" "$sample" "$attempt"
+}
+
+next_attempt_dir() {
+  local area="$1" root attempt number=1
+  root="$candidate_root/$area"
+  mkdir -p "$root"
+  while :; do
+    attempt="$root/attempt-$(printf '%04d' "$number")"
+    if mkdir "$attempt" 2>/dev/null; then
+      printf '%s\n' "$attempt"
+      return
+    fi
+    number=$((number + 1))
+  done
+}
+
+judge_prompt_for_area() {
+  local area="$1" predicate_ids="$2"
+  printf '%s' "You are a fresh-context evidence judge for rubric area $area. Do not browse or mutate any SUT. In this eval kit, run 'npx --yes pnpm@9 run --silent sbek -- judge-brief --area $area --run runs/fleet-consolidated'. Follow that brief exactly: inspect every listed screenshot and judge only recorded evidence. Do not write into the eval kit and do not run score. Return the complete judgement JSON as your final response, with every rubric item in the brief's order and no prose outside the JSON. If the FLEET_JUDGEMENT_OUTPUT environment variable is set, use the Write tool to write the same JSON to that path and verify it exists. Deterministic predicate-controlled rubric IDs are: ${predicate_ids:-none}. For each listed ID, judge only its remaining semantic or visual clauses; do not infer the deterministic clause from screenshots or prose. State that the verdict covers residual clauses. The fold engine combines that residual verdict with the predicate receipt and forbids model fallback when the receipt is missing."
+}
+
+judgement_is_valid() {
+  local area="$1" path="$2" expected_ids
+  expected_ids="$(expected_ids_for_area "$area")" || return 1
+  [ -n "$expected_ids" ] || return 1
+  python3 - "$path" "$expected_ids" <<'PY' 2>/dev/null
+import json
+import sys
+
+path, expected_text = sys.argv[1:]
+with open(path, encoding="utf-8") as stream:
+    payload = json.load(stream)
+assert isinstance(payload, dict)
+assert isinstance(payload.get("items"), list) and payload["items"]
+assert isinstance(payload.get("defects"), list)
+assert isinstance(payload.get("area_notes"), str)
+expected = expected_text.split()
+assert [item.get("id") for item in payload["items"]] == expected
+for item in payload["items"]:
+    assert item.get("verdict") in {"pass", "partial", "fail", "not_found", "cannot_judge"}
+    assert item.get("confidence") in {"high", "medium", "low"}
+    assert isinstance(item.get("reasoning"), str)
+    assert isinstance(item.get("evidence_refs"), list)
+for defect in payload["defects"]:
+    assert defect.get("severity") in {"critical", "major", "minor"}
+    assert isinstance(defect.get("description"), str)
+    assert isinstance(defect.get("where"), str)
+PY
+}
+
+run_judge_agent() {
+  local area="$1" judgement="$2" prompt_file="$3" prompt
+  prompt="$(cat "$prompt_file")"
+  case "$judge_executor" in
+    codex)
+      cd "$final_kit"
+      exec env -u OPENAI_API_KEY -u CODEX_API_KEY \
+        timeout "$judge_timeout" codex exec \
+        --ephemeral --ignore-user-config --ignore-rules \
+        --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \
+        --model "$judge_model" \
+        -c "model_reasoning_effort=\"$judge_reasoning_effort\"" \
+        --output-schema "$judgement_schema" \
+        --output-last-message "$judgement" --json --color never "$prompt"
+      ;;
+    claude)
+      cd "$final_kit"
+      exec env FLEET_JUDGEMENT_OUTPUT="$judgement" \
+        timeout "$judge_timeout" claude -p \
+        "$prompt" \
+        --model "$judge_model" \
+        --allowedTools 'Read,Write,Bash' --verbose --output-format stream-json
+      ;;
+  esac
+}
+
+write_invocation_receipt() {
+  local area="$1" sample="$2" attempt="$3" prompt_sha rubric_sha input_sha launched_at
+  prompt_sha="$(sha256_file "$attempt/prompt.txt")"
+  rubric_sha="$(jq -er .rubric_sha256 "$judge_input_root/$area/context.json")"
+  input_sha="$(jq -er .input_sha256 "$judge_input_root/$area/context.json")"
+  launched_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  python3 - "$attempt/invocation.json" "$area" "$sample" "$judge_executor" \
+    "$judge_model" "$judge_reasoning_effort" "$prompt_sha" "$input_sha" \
+    "$rubric_sha" "$eval_kit_sha" "$eval_kit_archive_sha256" \
+    "$eval_config_sha256" "$launched_at" <<'PY'
+import json
+import sys
+
+(path, area, sample, executor, model, effort, prompt_sha, input_sha,
+ rubric_sha, eval_kit_sha, archive_sha, config_sha, launched_at) = sys.argv[1:]
+with open(path, "x", encoding="utf-8") as stream:
+    json.dump({
+        "schema": "hill-climb-judge-invocation.v1",
+        "area": area,
+        "sample": int(sample),
+        "executor": executor,
+        "model": model,
+        "reasoning_effort": effort,
+        "prompt_sha256": prompt_sha,
+        "input_sha256": input_sha,
+        "rubric_sha256": rubric_sha,
+        "eval_kit_sha": eval_kit_sha,
+        "eval_kit_archive_sha256": archive_sha,
+        "eval_config_sha256": config_sha,
+        "launched_at": launched_at,
+    }, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+PY
+}
+
+score_candidate() {
+  local area="$1" sample="$2" attempt="$3" judgement="$attempt/judgement.json"
+  local score_root score_kit score_report score_pct coverage_pct report_sha judgement_sha
+  score_root="$(mktemp -d "$run_dir/.candidate-score.XXXXXX")"
+  score_kit="$score_root/kit"
+  cp -al "$final_kit" "$score_kit"
+  rm -rf -- "$score_kit/runs/fleet-consolidated/judgements"
+  mkdir -p "$score_kit/runs/fleet-consolidated/judgements"
+  cp "$judgement" "$score_kit/runs/fleet-consolidated/judgements/$area.json"
+  rm -f "$score_kit/runs/fleet-consolidated/report.json" \
+    "$score_kit/runs/fleet-consolidated/report.html" \
+    "$score_kit/runs/fleet-consolidated/manual-checklist.md"
+  if ! (
+    cd "$score_kit"
+    npx --yes pnpm@9 run --silent sbek -- score \
+      --run runs/fleet-consolidated --areas "$area"
+  ) > "$attempt/score.log" 2>&1; then
+    rm -rf -- "$score_root"
+    return 1
+  fi
+  score_report="$score_kit/runs/fleet-consolidated/report.json"
+  [ -s "$score_report" ] || { rm -rf -- "$score_root"; return 1; }
+  cp "$score_report" "$attempt/candidate-report.json"
+  score_pct="$(jq -er --arg area "$area" '.areas[] | select(.area == $area) | .pct' "$score_report")" \
+    || { rm -rf -- "$score_root"; return 1; }
+  coverage_pct="$(jq -er --arg area "$area" '.areas[] | select(.area == $area) | .coveragePct' "$score_report")" \
+    || { rm -rf -- "$score_root"; return 1; }
+  report_sha="$(sha256_file "$attempt/candidate-report.json")"
+  judgement_sha="$(sha256_file "$judgement")"
+  python3 - "$attempt/score-receipt.json" "$area" "$sample" "$judgement_sha" \
+    "$score_pct" "$coverage_pct" "$report_sha" "$eval_kit_archive_sha256" \
+    "$eval_config_sha256" <<'PY'
+import json
+import sys
+
+path, area, sample, judgement_sha, score, coverage, report_sha, score_code_sha, config_sha = sys.argv[1:]
+computed_score = float(score)
+coverage_pct = float(coverage)
+with open(path, "x", encoding="utf-8") as stream:
+    json.dump({
+        "schema": "hill-climb-candidate-score.v1",
+        "area": area,
+        "sample": int(sample),
+        "judgement_sha256": judgement_sha,
+        "computed_score_pct": computed_score,
+        "score_pct": computed_score if coverage_pct >= 60.0 else None,
+        "coverage_pct": coverage_pct,
+        "report_sha256": report_sha,
+        "score_code_sha256": score_code_sha,
+        "eval_config_sha256": config_sha,
+    }, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+PY
+  rm -rf -- "$score_root"
+}
+
+enroll_candidate() {
+  local area="$1" sample="$2" attempt="$3" judgement="$attempt/judgement.json"
+  local judgement_sha invocation_sha output_receipt_sha score_receipt_sha
+  judgement_sha="$(sha256_file "$judgement")"
+  python3 - "$attempt/judgement-receipt.json" "$area" "$sample" "$judgement_sha" <<'PY'
+import json
+import sys
+
+path, area, sample, judgement_sha = sys.argv[1:]
+with open(path, "x", encoding="utf-8") as stream:
+    json.dump({
+        "schema": "hill-climb-judge-output.v1",
+        "area": area,
+        "sample": int(sample),
+        "path": "judgement.json",
+        "sha256": judgement_sha,
+    }, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+PY
+  if ! score_candidate "$area" "$sample" "$attempt"; then
+    return 1
+  fi
+  invocation_sha="$(sha256_file "$attempt/invocation.json")"
+  output_receipt_sha="$(sha256_file "$attempt/judgement-receipt.json")"
+  score_receipt_sha="$(sha256_file "$attempt/score-receipt.json")"
+  python3 - "$attempt/candidate.json" "$area" "$sample" "$(basename "$attempt")" \
+    "$invocation_sha" "$output_receipt_sha" "$score_receipt_sha" <<'PY'
+import json
+import sys
+
+(path, area, sample, attempt, invocation_sha,
+ output_sha, score_sha) = sys.argv[1:]
+with open(path, "x", encoding="utf-8") as stream:
+    json.dump({
+        "schema": "hill-climb-judgement-candidate.v1",
+        "status": "enrolled",
+        "area": area,
+        "sample": int(sample),
+        "attempt": attempt,
+        "receipts": {
+            "invocation_sha256": invocation_sha,
+            "judgement_sha256": output_sha,
+            "score_sha256": score_sha,
+        },
+    }, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+PY
+}
+
+cleanup() {
+  if [ -n "$temporary_kit" ] && [ -d "$temporary_kit" ]; then
+    rm -rf -- "$temporary_kit"
+  fi
+}
+trap cleanup EXIT
+
+case "$run_dir" in
+  /*) ;;
+  '') fail "usage: consolidate-hill-climb /absolute/fleet-run-directory" ;;
+  *) fail "run directory must be absolute: $run_dir" ;;
+esac
+[ -f "$run_dir/manifest.json" ] || fail "fleet manifest is missing: $run_dir/manifest.json"
+[ -d "$run_dir/slots" ] || fail "fleet slots are missing: $run_dir/slots"
+[ -d "$base_kit/node_modules" ] || fail "eval kit or node_modules is missing: $base_kit"
+eval_kit_sha="$(python3 - "$run_dir/manifest.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    print(json.load(stream).get("eval_kit_sha", ""))
+PY
+)"
+[ -n "$eval_kit_sha" ] || fail "fleet manifest lacks exact eval-kit SHA"
+eval_kit_archive_sha256="$(python3 - "$run_dir/manifest.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    print(json.load(stream).get("eval_kit_archive_sha256", ""))
+PY
+)"
+[ "${#eval_kit_archive_sha256}" -eq 64 ] \
+  || fail "fleet manifest lacks eval-kit archive SHA-256"
+eval_config_sha256="$(python3 - "$run_dir/manifest.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    print(json.load(stream).get("eval_config_sha256", ""))
+PY
+)"
+[ "${#eval_config_sha256}" -eq 64 ] || fail "fleet manifest lacks eval config SHA-256"
+if [ ! -f "$eval_config_path" ] || [ -L "$eval_config_path" ]; then
+  fail "fleet run lacks its pinned eval config input"
+fi
+[ "$(sha256_file "$eval_config_path")" = "$eval_config_sha256" ] \
+  || fail "pinned eval config does not match the fleet manifest"
+git -C "$base_kit" cat-file -e "$eval_kit_sha^{commit}" 2>/dev/null \
+  || fail "eval-kit commit is unavailable: $eval_kit_sha"
+case "$judge_timeout" in
+  ''|*[!0-9]*) fail "FLEET_JUDGE_TIMEOUT_SECONDS must be numeric" ;;
+esac
+case "$evidence_only" in
+  true|false) ;;
+  *) fail "FLEET_CONSOLIDATE_EVIDENCE_ONLY must be true or false" ;;
+esac
+case "$resume" in
+  true|false) ;;
+  *) fail "FLEET_CONSOLIDATE_RESUME must be true or false" ;;
+esac
+case "$judge_concurrency" in
+  ''|*[!0-9]*) fail "FLEET_JUDGE_CONCURRENCY must be numeric" ;;
+esac
+if [ "$judge_concurrency" -lt 1 ] || [ "$judge_concurrency" -gt "${#areas[@]}" ]; then
+  fail "FLEET_JUDGE_CONCURRENCY must be between 1 and ${#areas[@]}"
+fi
+case "$judge_sample_count" in
+  ''|*[!0-9]*) fail "FLEET_JUDGE_SAMPLE_COUNT must be numeric" ;;
+esac
+if [ "$judge_sample_count" -lt 3 ] || [ $((judge_sample_count % 2)) -ne 1 ]; then
+  fail "FLEET_JUDGE_SAMPLE_COUNT must be odd and at least 3"
+fi
+[ -x "$fold_engine" ] || fail "judgement fold engine is missing: $fold_engine"
+[ -s "$predicate_registry" ] || fail "predicate registry is missing: $predicate_registry"
+validate_executor
+if [ -z "$judge_model" ]; then
+  case "$judge_executor" in
+    codex) judge_model="gpt-5.6-sol" ;;
+    claude) judge_model="opus" ;;
+  esac
+fi
+case "$judge_executor" in
+  codex)
+    judge_reasoning_effort="${judge_reasoning_effort:-high}"
+    validate_reasoning_effort "$judge_reasoning_effort"
+    ;;
+  claude)
+    [ -z "$judge_reasoning_effort" ] \
+      || fail "FLEET_JUDGE_REASONING_EFFORT is only supported by the Codex judge"
+    judge_reasoning_effort="not-applicable"
+    ;;
+esac
+
+[ -x "$run_dir/app/bin/capture-lineage" ] \
+  || fail "deployed run lacks capture-lineage verifier"
+if [ "${FLEET_CONSOLIDATE_SKIP_LINEAGE_VERIFICATION:-false}" != "true" ]; then
+  if ! "$run_dir/app/bin/capture-lineage" verify-run \
+      --run "$run_dir" --manifest "$run_dir/manifest.json" \
+      > "$run_dir/capture-lineage-verification.json"; then
+    fail "capture lineage verification failed before judging"
+  fi
+fi
+
+final_kit="$run_dir/consolidated-kit"
+if [ -e "$final_kit" ] && [ "$resume" != "true" ]; then
+  fail "consolidated kit already exists; preserving it: $final_kit"
+fi
+
+scenarios=()
+while IFS= read -r scenario; do
+  scenarios+=("$scenario")
+done < <(python3 - "$run_dir/manifest.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    manifest = json.load(stream)
+for scenario in manifest["scenarios"]:
+    print(scenario)
+PY
+)
+[ "${#scenarios[@]}" -gt 0 ] || fail "manifest contains no scenarios"
+
+if [ ! -e "$final_kit" ]; then
+  temporary_kit="$(mktemp -d "$run_dir/.consolidated-kit.tmp.XXXXXX")"
+
+  git -C "$base_kit" archive "$eval_kit_sha" | (
+    cd "$temporary_kit"
+    tar -xf -
+  )
+  install -m 0600 "$eval_config_path" "$temporary_kit/evalconfig.json"
+  cp -aL "$base_kit/node_modules" "$temporary_kit/node_modules"
+  mkdir -p "$temporary_kit/runs/fleet-consolidated"
+  printf '%s\n' 'runs/fleet-consolidated' > "$temporary_kit/.sbek-current-run"
+
+  evidence_manifest="$temporary_kit/runs/fleet-consolidated/evidence-manifest.tsv"
+  named_zero_manifest="$temporary_kit/runs/fleet-consolidated/named-zero-manifest.tsv"
+  : > "$named_zero_manifest"
+  : > "$evidence_manifest"
+  : > "$temporary_kit/runs/fleet-consolidated/named-zeros.jsonl"
+  captured_count=0
+  named_zero_count=0
+  for scenario in "${scenarios[@]}"; do
+    matches=()
+    while IFS= read -r evidence_path; do
+      matches+=("$evidence_path")
+    done < <(
+      find "$run_dir/slots" -type f \
+        -path "*/kit/runs/*/$scenario/evidence.json" -print | sort
+    )
+    dispositions=()
+    while IFS= read -r disposition_path; do
+      dispositions+=("$disposition_path")
+    done < <(
+      find "$run_dir/slots" -type f \
+        -path "*/$scenario/terminal-disposition.json" -print | sort
+    )
+    if [ "${#dispositions[@]}" -gt 1 ]; then
+      fail "expected at most one terminal disposition for $scenario; found ${#dispositions[@]}"
+    fi
+    if [ "${#dispositions[@]}" -eq 1 ]; then
+      scenario_disposition="${dispositions[0]}"
+      if ! "$run_dir/app/bin/capture-lineage" verify-disposition \
+          --path "$scenario_disposition" --scenario "$scenario" > /dev/null; then
+        fail "invalid terminal disposition for $scenario: $scenario_disposition"
+      fi
+      scenario_status="$(jq -r .status "$scenario_disposition")"
+      if [ -z "$scenario_status" ]; then
+        fail "terminal disposition missing status for $scenario"
+      fi
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$scenario" \
+        "$scenario_status" \
+        "$(jq -r .cause "$scenario_disposition")" \
+        "$(jq -r .owner "$scenario_disposition")" \
+        "$(jq -r .scope "$scenario_disposition")" \
+        "$scenario_disposition" >> "$named_zero_manifest"
+      printf '{"scenario":"%s","status":"%s","cause":"%s","owner":"%s","scope":"%s","source":"%s","recorded_at":"%s"}\n' \
+        "$scenario" "$scenario_status" \
+        "$(jq -r .cause "$scenario_disposition" | sed 's/"/\\"/g')" \
+        "$(jq -r .owner "$scenario_disposition" | sed 's/"/\\"/g')" \
+        "$(jq -r .scope "$scenario_disposition" | sed 's/"/\\"/g')" \
+        "$scenario_disposition" \
+        "$(jq -r .recorded_at "$scenario_disposition" | sed 's/"/\\"/g')" \
+        >> "$temporary_kit/runs/fleet-consolidated/named-zeros.jsonl"
+      named_zero_count=$((named_zero_count + 1))
+      continue
+    fi
+    [ "${#matches[@]}" -eq 1 ] \
+      || fail "expected one evidence file for $scenario; found ${#matches[@]}"
+    source_scenario="$(dirname "${matches[0]}")"
+    cp -a "$source_scenario" "$temporary_kit/runs/fleet-consolidated/$scenario"
+    printf '%s\t%s\n' "$scenario" "${matches[0]}" >> "$evidence_manifest"
+    captured_count=$((captured_count + 1))
+  done
+  printf 'captured=%s\tnamed_zero=%s\ttotal=%s\texpected=%s\n' \
+    "$captured_count" "$named_zero_count" \
+    "$((captured_count + named_zero_count))" "${#scenarios[@]}" \
+    > "$temporary_kit/runs/fleet-consolidated/coverage-manifest.tsv"
+  python3 - "$temporary_kit/runs/fleet-consolidated/named-zeros.jsonl" \
+    "$temporary_kit/runs/fleet-consolidated/named-zeros.json" <<'PY'
+import json
+import pathlib
+import sys
+
+input_path = pathlib.Path(sys.argv[1])
+records = []
+for line in input_path.read_text(encoding="utf-8").splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    records.append(json.loads(line))
+pathlib.Path(sys.argv[2]).write_text(json.dumps(
+    {"schema": "hill-climb-named-zero.v1", "named_zeros": records},
+    indent=2
+) + "\n", encoding="utf-8")
+PY
+
+  python3 - "$evidence_manifest" "$named_zero_manifest" "$run_dir/manifest.json" <<'PY'
+import json
+import pathlib
+import sys
+
+def read_scenarios(path):
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        yield line.split("\t", 1)[0]
+
+with open(sys.argv[3], encoding="utf-8") as stream:
+    expected = sorted(set(json.load(stream).get("scenarios", [])))
+evidence = set(read_scenarios(pathlib.Path(sys.argv[1])))
+named = set(read_scenarios(pathlib.Path(sys.argv[2])))
+combined = sorted(evidence | named)
+if combined != expected:
+    missing = sorted(set(expected) - set(combined))
+    extra = sorted(set(combined) - set(expected))
+    raise SystemExit(f"consolidation mismatch; missing={missing}; extra={extra}")
+PY
+  mv "$temporary_kit" "$final_kit"
+  named_zero_manifest="$final_kit/runs/fleet-consolidated/named-zero-manifest.tsv"
+  temporary_kit=""
+  printf 'Consolidated %s scenarios into %s (captured=%s named_zero=%s)\n' \
+    "${#scenarios[@]}" "$final_kit" "$captured_count" "$named_zero_count"
+else
+  [ "$(cat "$final_kit/.sbek-current-run" 2>/dev/null || true)" = "runs/fleet-consolidated" ] \
+    || fail "existing consolidated kit is not a fleet-consolidated run: $final_kit"
+  evidence_manifest="$final_kit/runs/fleet-consolidated/evidence-manifest.tsv"
+  named_zero_manifest="$final_kit/runs/fleet-consolidated/named-zero-manifest.tsv"
+  [ -s "$evidence_manifest" ] || fail "existing consolidated kit lacks evidence manifest"
+  [ -f "$named_zero_manifest" ] || fail "existing consolidated kit lacks named-zero manifest"
+  python3 - "$evidence_manifest" "$named_zero_manifest" "$run_dir/manifest.json" <<'PY'
+import json
+import pathlib
+import sys
+
+def read_scenarios(path):
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        yield line.split("\t", 1)[0]
+
+with open(sys.argv[3], encoding="utf-8") as stream:
+    expected = sorted(set(json.load(stream).get("scenarios", [])))
+evidence = set(read_scenarios(pathlib.Path(sys.argv[1])))
+named = set(read_scenarios(pathlib.Path(sys.argv[2])))
+combined = sorted(evidence | named)
+if combined != expected:
+    missing = sorted(set(expected) - set(combined))
+    extra = sorted(set(combined) - set(expected))
+    raise SystemExit(
+        f"existing consolidated evidence does not match scenario manifest; "
+        f"missing={missing}; extra={extra}"
+    )
+PY
+  if [ ! -f "$final_kit/evalconfig.json" ] || [ -L "$final_kit/evalconfig.json" ]; then
+    fail "existing consolidated kit lacks its pinned eval config"
+  fi
+  [ "$(sha256_file "$final_kit/evalconfig.json")" = "$eval_config_sha256" ] \
+    || fail "existing consolidated eval config changed"
+  printf 'Resuming consolidated evidence in %s\n' "$final_kit"
+fi
+
+if [ "$evidence_only" = "true" ]; then
+  exit 0
+fi
+require_executor
+
+mkdir -p "$run_dir/judges" "$candidate_root" "$fold_receipt_root" \
+  "$final_kit/runs/fleet-consolidated/judgements"
+
+named_zero_rows_for_area() {
+  local area="$1" prefix
+  prefix="$(area_prefix "$area")"
+  awk -F'\t' -v prefix="$prefix" '$1 ~ "^" prefix "-" { print $0 }' "$named_zero_manifest"
+}
+
+pending_areas=()
+task_areas=()
+task_samples=()
+for area in "${areas[@]}"; do
+  judgement="$final_kit/runs/fleet-consolidated/judgements/$area.json"
+  fold_receipt="$fold_receipt_root/$area.json"
+  if [ -e "$judgement" ] || [ -e "$fold_receipt" ]; then
+    [ -s "$judgement" ] && [ -s "$fold_receipt" ] \
+      || fail "folded judgement and receipt must both exist for $area; refusing overwrite"
+    judgement_is_valid "$area" "$judgement" \
+      || fail "existing folded judgement is invalid for $area"
+    "$fold_engine" --area "$area" --sample-count "$judge_sample_count" \
+      --candidates "$candidate_root/$area" --predicate-registry "$predicate_registry" \
+      --predicate-results "$predicate_results_root/$area" \
+      --output "$judgement" --receipt "$fold_receipt" >/dev/null \
+      || fail "existing fold receipt failed verification for $area"
+    [ "$(jq -er .fold_status "$fold_receipt")" = complete ] \
+      || fail "existing candidate fold is coverage-withheld for $area"
+    printf 'Keeping immutable folded judgement %s\n' "$area"
+    printf '0\n' > "$run_dir/judges/$area.exit"
+    continue
+  fi
+  area_zero_rows="$(named_zero_rows_for_area "$area")"
+  scenario_count="$(find "$final_kit/runs/fleet-consolidated" -maxdepth 5 -type f \
+    -path "*/$(area_prefix "$area")-S*/*" | wc -l | tr -d ' ')"
+  if [ "$scenario_count" -eq 0 ] && [ -n "$area_zero_rows" ]; then
+    for sample in $(seq 1 "$judge_sample_count"); do
+      attempt="$(next_attempt_dir "$area")"
+      if ! enroll_zero_candidate "$area" "$sample" "$attempt" "$area_zero_rows"; then
+        rm -rf -- "$attempt"
+        fail "failed to create named-zero candidate for area $area sample $sample"
+      fi
+      printf '0\n' > "$run_dir/judges/$area.exit"
+    done
+    pending_areas+=("$area")
+    continue
+  fi
+  if [ "$scenario_count" -eq 0 ]; then
+    fail "no evidence files for $area and no named-zero disposition entries"
+  fi
+  prepare_judge_input "$area"
+  enrolled="$(candidate_count "$area")"
+  enrolled_samples="$(candidate_samples "$area")"
+  [ "$enrolled" -le "$judge_sample_count" ] \
+    || fail "too many enrolled candidates for $area: $enrolled"
+  pending_areas+=("$area")
+  sample=1
+  while [ "$sample" -le "$judge_sample_count" ]; do
+    case " $enrolled_samples " in
+      *" $sample "*) ;;
+      *)
+        task_areas+=("$area")
+        task_samples+=("$sample")
+        ;;
+    esac
+    sample=$((sample + 1))
+  done
+done
+
+judge_pids=()
+judge_areas=()
+judge_samples=()
+judge_attempts=()
+judge_failed=0
+quota_exhausted=0
+wait_for_judges() {
+  local index area sample attempt exit_code log judgement
+  for index in "${!judge_pids[@]}"; do
+    area="${judge_areas[$index]}"
+    sample="${judge_samples[$index]}"
+    attempt="${judge_attempts[$index]}"
+    log="$attempt/judge.log"
+    judgement="$attempt/judgement.json"
+    if wait "${judge_pids[$index]}"; then
+      printf '0\n' > "$attempt/judge.exit"
+      exit_code=0
+    else
+      exit_code=$?
+      printf '%s\n' "$exit_code" > "$attempt/judge.exit"
+    fi
+    if [ "$exit_code" -eq 0 ] && judgement_is_valid "$area" "$judgement"; then
+      if ! enroll_candidate "$area" "$sample" "$attempt"; then
+        judge_failed=1
+      fi
+    else
+      judge_failed=1
+      grep -Eqi "hit your session limit|usage limit|rate limit" "$log" 2>/dev/null \
+        && quota_exhausted=1
+    fi
+  done
+  judge_pids=()
+  judge_areas=()
+  judge_samples=()
+  judge_attempts=()
+}
+
+for index in "${!task_areas[@]}"; do
+  area="${task_areas[$index]}"
+  sample="${task_samples[$index]}"
+  attempt="$(next_attempt_dir "$area")"
+  predicate_ids="$(predicate_ids_for_area "$area")"
+  judge_prompt_for_area "$area" "$predicate_ids" > "$attempt/prompt.txt"
+  write_invocation_receipt "$area" "$sample" "$attempt"
+  (
+    run_judge_agent "$area" "$attempt/judgement.json" "$attempt/prompt.txt"
+  ) > "$attempt/judge.log" 2>&1 &
+  judge_pids+=("$!")
+  judge_areas+=("$area")
+  judge_samples+=("$sample")
+  judge_attempts+=("$attempt")
+  if [ "${#judge_pids[@]}" -ge "$judge_concurrency" ]; then
+    wait_for_judges
+    [ "$quota_exhausted" -eq 0 ] || break
+  fi
+done
+if [ "${#judge_pids[@]}" -gt 0 ]; then
+  wait_for_judges
+fi
+
+if [ "$quota_exhausted" -eq 1 ]; then
+  fail "judge session quota exhausted; evidence and append-only candidate attempts are preserved; retry consolidation after the stated reset time"
+fi
+[ "$judge_failed" -eq 0 ] \
+  || fail "one or more judge candidate attempts were unverified; attempts were preserved under $candidate_root"
+
+for area in "${pending_areas[@]}"; do
+  judgement="$final_kit/runs/fleet-consolidated/judgements/$area.json"
+  fold_receipt="$fold_receipt_root/$area.json"
+  "$fold_engine" --area "$area" --sample-count "$judge_sample_count" \
+    --candidates "$candidate_root/$area" --predicate-registry "$predicate_registry" \
+    --predicate-results "$predicate_results_root/$area" \
+    --output "$judgement" --receipt "$fold_receipt" \
+    >> "$run_dir/judges/$area.log" \
+    || fail "candidate fold failed for $area"
+  [ "$(jq -er .fold_status "$fold_receipt")" = complete ] \
+    || fail "candidate fold is coverage-withheld for $area"
+  printf '0\n' > "$run_dir/judges/$area.exit"
+done
+
+for area in "${areas[@]}"; do
+  judgement="$final_kit/runs/fleet-consolidated/judgements/$area.json"
+  judgement_is_valid "$area" "$judgement" \
+    || fail "fold engine did not produce a valid $area judgement"
+done
+
+(
+  cd "$final_kit"
+  npx --yes pnpm@9 run --silent sbek -- score --run runs/fleet-consolidated
+) > "$run_dir/consolidated-score.log" 2>&1
+
+report="$final_kit/runs/fleet-consolidated/report.json"
+[ -s "$report" ] || fail "score did not produce report.json"
+cp "$report" "$run_dir/report.json"
+cp "$final_kit/runs/fleet-consolidated/report.html" "$run_dir/report.html"
+
+python3 - "$run_dir/report.json" "$run_dir/ranked-insights.json" \
+  "$run_dir/RANKED-INSIGHTS.md" <<'PY'
+import json
+import os
+import sys
+
+report_path, json_path, markdown_path = sys.argv[1:]
+with open(report_path, encoding="utf-8") as stream:
+    report = json.load(stream)
+
+verdict_rank = {"fail": 0, "not_found": 1, "partial": 2, "cannot_judge": 3}
+confidence_rank = {"high": 0, "medium": 1, "low": 2}
+items = []
+defects = []
+judgement_root = os.path.join(
+    os.path.dirname(report_path), "consolidated-kit", "runs",
+    "fleet-consolidated", "judgements"
+)
+for area in report.get("areas", []):
+    area_name = area["area"]
+    area_weight = area.get("areaWeight", 0)
+    for item in area.get("items", []):
+        if item.get("verdict") == "pass":
+            continue
+        items.append({
+            "area": area_name,
+            "area_weight": area_weight,
+            "id": item["id"],
+            "verdict": item.get("verdict"),
+            "confidence": item.get("confidence"),
+            "reasoning": item.get("reasoning", ""),
+            "evidence_refs": item.get("evidence_refs", []),
+        })
+    judgement_path = os.path.join(judgement_root, f"{area_name}.json")
+    try:
+        with open(judgement_path, encoding="utf-8") as stream:
+            judgement = json.load(stream)
+        for defect in judgement.get("defects", []):
+            defects.append({"area": area_name, **defect})
+    except FileNotFoundError:
+        pass
+
+items.sort(key=lambda item: (
+    -item["area_weight"],
+    verdict_rank.get(item["verdict"], 9),
+    confidence_rank.get(item["confidence"], 9),
+    item["id"],
+))
+severity_rank = {"critical": 0, "major": 1, "minor": 2}
+defects.sort(key=lambda defect: (
+    severity_rank.get(defect.get("severity"), 9),
+    defect.get("area", ""),
+    defect.get("description", ""),
+))
+payload = {
+    "schema": "hill-climb-ranked-insights.v1",
+    "overall_pct": report.get("overallPct"),
+    "coverage_pct": report.get("overallCoveragePct"),
+    "score_withheld": report.get("scoreWithheld"),
+    "nonpassing_items": items,
+    "defects": defects,
+}
+with open(json_path, "w", encoding="utf-8") as stream:
+    json.dump(payload, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+with open(markdown_path, "w", encoding="utf-8") as stream:
+    stream.write("# Ranked hill-climb insights\n\n")
+    stream.write(
+        f"Score: **{payload['overall_pct']}%**. Coverage: "
+        f"**{payload['coverage_pct']}%**.\n\n"
+    )
+    stream.write("## Defects\n\n")
+    for defect in defects:
+        stream.write(
+            f"- **{defect.get('severity', 'unknown')} · {defect['area']}** — "
+            f"{defect.get('description', '')} ({defect.get('where', 'location not recorded')})\n"
+        )
+    stream.write("\n## Non-passing rubric items\n\n")
+    for item in items:
+        stream.write(
+            f"- **{item['id']} · {item['verdict']} · {item['area']}** — "
+            f"{item['reasoning']}\n"
+        )
+PY
+
+python3 - "$run_dir/report.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    report = json.load(stream)
+print(json.dumps({
+    "overall_pct": report.get("overallPct"),
+    "coverage_pct": report.get("overallCoveragePct"),
+    "score_withheld": report.get("scoreWithheld"),
+}, sort_keys=True))
+PY

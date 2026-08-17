@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Curtain Call — one story, five tellings</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,600;0,9..144,900;1,9..144,400&family=Source+Sans+3:wght@400;600&family=EB+Garamond:ital,wght@0,400;0,600;1,400&family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;600;700&family=Playfair+Display:ital,wght@0,500;0,800;1,500&family=Archivo:wght@400;600;900&display=swap" rel="stylesheet">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html { scroll-behavior:smooth; }
+  a { text-decoration:none; }
+
+  .switcher { position:fixed; top:14px; left:50%; transform:translateX(-50%); z-index:99;
+              display:flex; gap:4px; background:rgba(20,18,14,.88); backdrop-filter:blur(8px);
+              padding:6px; border-radius:999px; box-shadow:0 4px 20px rgba(0,0,0,.3); }
+  .switcher a { color:#cfc7ba; font-size:12px; font-weight:600; padding:6px 13px; border-radius:999px; }
+  .switcher a:hover { background:rgba(255,255,255,.14); color:#fff; }
+  section { min-height:100vh; padding:100px 6vw 90px; position:relative; overflow:hidden; }
+  .tno { position:absolute; top:16px; left:20px; font:600 10px/1.4 'IBM Plex Mono',monospace;
+         letter-spacing:.13em; opacity:.5; text-transform:uppercase; max-width:40em; }
+
+  @keyframes rise { from {opacity:0; transform:translateY(14px);} to {opacity:1; transform:none;} }
+  .r1,.r2,.r3,.r4 { animation:rise .5s ease-out both; }
+  .r2 { animation-delay:.12s; } .r3 { animation-delay:.24s; } .r4 { animation-delay:.36s; }
+
+  /* ══════════ 1 · ZEN PAPER — the story told as a quiet confession ══════════ */
+  #zen { background:#FAF7F2; color:#221E17; font-family:'Source Sans 3',sans-serif; }
+  #zen .wrap { max-width:840px; margin:0 auto; }
+  #zen .kicker { font-weight:600; font-size:13px; letter-spacing:.24em; text-transform:uppercase; color:#9C9284; margin-bottom:30px; }
+  #zen h1 { font:300 clamp(36px,5vw,64px)/1.1 'Fraunces',serif; font-variation-settings:'SOFT' 0,'WONK' 0; letter-spacing:-.01em; }
+  #zen h1 b { font-weight:900; background-image:linear-gradient(180deg,transparent 58%,#FFF1B8 58%,#FFF1B8 94%,transparent 94%); }
+  #zen .confess { margin:34px 0 44px; font-size:clamp(17px,1.5vw,20px); color:#7C7264; line-height:1.65; max-width:38em; }
+  #zen .duo { display:grid; grid-template-columns:1fr 1fr; gap:22px; margin-bottom:50px; }
+  #zen .card { background:#fff; border:1px solid #E9E1D5; border-radius:8px; padding:26px; }
+  #zen .aud { font-size:11.5px; font-weight:600; letter-spacing:.18em; text-transform:uppercase; color:#9C9284; margin-bottom:10px; }
+  #zen .card h2 { font:600 22px 'Fraunces',serif; margin-bottom:8px; }
+  #zen .card p { color:#7C7264; line-height:1.55; font-size:15.5px; margin-bottom:14px; }
+  #zen .card a { font-weight:600; color:#1B7A4B; } #zen .card.spk a { color:#8a6a2a; }
+  #zen .graves { display:flex; gap:10px; flex-wrap:wrap; margin:8px 0 44px; }
+  #zen .grave { background:#F1EADD; border-radius:999px; padding:7px 15px; font:400 12.5px 'IBM Plex Mono',monospace; color:#6d6455; }
+  #zen .grave.loved { background:#FFF1B8; color:#5a4a1e; }
+  #zen .cta { display:inline-block; background:#1B7A4B; color:#fff; font-weight:600; font-size:17px; padding:15px 34px; border-radius:10px; }
+  #zen .cta:hover { background:#166540; }
+  #zen .quiet { margin-left:14px; font-size:14px; color:#B4A996; }
+  #zen .mirror { display:grid; grid-template-columns:1fr 1fr; gap:26px; margin:44px 0 46px; }
+  #zen .list h3 { font:600 12.5px 'Source Sans 3'; letter-spacing:.18em; text-transform:uppercase; margin-bottom:14px; }
+  #zen .hate h3 { color:#B3261E; } #zen .proud h3 { color:#1B7A4B; }
+  #zen .list ul { list-style:none; }
+  #zen .list li { padding:9px 0 9px 30px; position:relative; font-size:16px; line-height:1.5; color:#494234;
+                  border-bottom:1px solid #EFE8DC; }
+  #zen .list li:last-child { border-bottom:none; }
+  #zen .hate li::before { content:"✗"; position:absolute; left:2px; color:#B3261E; font-weight:700; }
+  #zen .proud li::before { content:"✓"; position:absolute; left:2px; color:#1B7A4B; font-weight:700; }
+  #zen .hate .ex { color:#9a8f7a; font-size:14px; font-style:italic; }
+
+  /* ══════════ 2 · THE BROADSHEET — the story as front-page news ══════════ */
+  #press { background:#F3EDE0; color:#191510; font-family:'EB Garamond',serif; }
+  #press .paper { max-width:900px; margin:0 auto; background:#FAF6EC; border:1px solid #DDD2BB;
+                  box-shadow:0 18px 60px rgba(70,55,25,.18); padding:44px 52px 40px; }
+  #press .masthead { text-align:center; border-bottom:4px double #191510; padding-bottom:14px; }
+  #press .masthead h1 { font:800 clamp(34px,4.6vw,58px) 'Playfair Display',serif; letter-spacing:.02em; }
+  #press .dateline { display:flex; justify-content:space-between; font:400 12px 'IBM Plex Mono',monospace;
+                     border-bottom:1px solid #191510; padding:8px 0; margin-bottom:26px; letter-spacing:.06em; }
+  #press .headline { font-size:clamp(28px,3.6vw,44px); font-weight:600; line-height:1.14; text-align:center; margin-bottom:6px; }
+  #press .subhead { text-align:center; font-style:italic; font-size:19px; color:#6b5f48; margin-bottom:30px; }
+  #press .cols { column-count:3; column-gap:28px; column-rule:1px solid #DDD2BB; font-size:16px; line-height:1.55; text-align:justify; }
+  #press .cols p { margin-bottom:12px; }
+  #press .cols .lede::first-letter { font:800 52px/0.8 'Playfair Display',serif; float:left; padding:6px 8px 0 0; }
+  #press .pull { border-top:2px solid #191510; border-bottom:2px solid #191510; padding:12px 4px; margin:10px 0 14px;
+                 font-size:20px; font-weight:600; font-style:italic; text-align:center; break-inside:avoid; }
+  #press .ad { break-inside:avoid; border:2px solid #191510; padding:16px; text-align:center; margin-top:12px; }
+  #press .ad .t { font:900 20px 'Archivo'; text-transform:uppercase; letter-spacing:.05em; }
+  #press .ad p { font-size:14.5px; font-style:italic; margin:8px 0 12px; }
+  #press .ad a { display:inline-block; background:#191510; color:#FAF6EC; font:600 14px 'Archivo'; padding:10px 20px; }
+  #press .ad a:hover { background:#B3261E; }
+
+  /* ══════════ 3 · THE POSTMORTEM — the story as an incident report ══════════ */
+  #pm { background:#101613; color:#DCE5DF; font-family:'IBM Plex Sans',sans-serif; }
+  #pm .wrap { max-width:820px; margin:0 auto; }
+  #pm .file { font:400 12.5px 'IBM Plex Mono',monospace; color:#5F7A6B; letter-spacing:.08em; margin-bottom:26px; }
+  #pm h1 { font-size:clamp(30px,4vw,50px); font-weight:700; line-height:1.15; margin-bottom:8px; }
+  #pm h1 span { color:#5BD08F; }
+  #pm .sev { display:inline-block; font:600 12px 'IBM Plex Mono',monospace; background:#3A0E10; color:#FF8B7E;
+             border:1px solid #7c2a24; border-radius:4px; padding:4px 10px; margin:14px 0 30px; letter-spacing:.1em; }
+  #pm dl { display:grid; grid-template-columns:210px 1fr; border-top:1px solid #24312A; font-size:15.5px; }
+  #pm dt { font:600 12.5px 'IBM Plex Mono',monospace; color:#5F7A6B; padding:14px 0; border-bottom:1px solid #24312A;
+           text-transform:uppercase; letter-spacing:.1em; }
+  #pm dd { padding:13px 0 13px 14px; border-bottom:1px solid #24312A; line-height:1.55; }
+  #pm dd b { color:#fff; }
+  #pm dd .ok { color:#5BD08F; font-weight:600; }
+  #pm .rca { margin:30px 0; padding:20px 22px; background:#16211B; border-left:3px solid #5BD08F; border-radius:0 8px 8px 0; }
+  #pm .rca .h { font:600 12px 'IBM Plex Mono',monospace; color:#5BD08F; letter-spacing:.14em; margin-bottom:8px; }
+  #pm .rca p { line-height:1.6; color:#B9C8BF; }
+  #pm .actions a { display:inline-block; background:#5BD08F; color:#0B1410; font-weight:700; padding:14px 28px; border-radius:6px; margin-right:14px; }
+  #pm .actions a:hover { background:#7ee2ab; }
+  #pm .actions .ghost { background:transparent; color:#5BD08F; border:1px solid #33553F; }
+
+  /* ══════════ 4 · THE PLAYBILL — the story as a theatre program ══════════ */
+  #bill { background:#0E0B09 radial-gradient(ellipse 62% 50% at 50% 30%, rgba(255,214,140,.16), transparent 70%);
+          color:#F4EBDD; font-family:'Playfair Display',serif; }
+  #bill::before, #bill::after { content:""; position:absolute; top:0; bottom:0; width:9vw;
+          background:repeating-linear-gradient(90deg,#3A0E10 0 20px,#4C1215 20px 40px); opacity:.9; }
+  #bill::before { left:0; border-right:5px solid #2A090b; } #bill::after { right:0; border-left:5px solid #2A090b; }
+  #bill .prog { max-width:640px; margin:0 auto; text-align:center; }
+  #bill .tonight { font:600 12px 'Archivo'; letter-spacing:.4em; color:#C9A15E; text-transform:uppercase; margin-bottom:18px; }
+  #bill h1 { font-size:clamp(40px,5.6vw,70px); font-weight:800; line-height:1.05; }
+  #bill h1 i { font-style:italic; font-weight:500; color:#E8C687; }
+  #bill .strap { font-style:italic; font-size:19px; color:#B9AB95; margin:18px 0 34px; }
+  #bill .rule { border:none; border-top:1px solid #4a3b28; margin:26px auto; width:70%; position:relative; }
+  #bill .rule::after { content:"❦"; position:absolute; top:-13px; left:50%; transform:translateX(-50%);
+                       background:#0E0B09; padding:0 12px; color:#C9A15E; }
+  #bill .acts { text-align:left; display:inline-block; font-family:'Archivo'; font-size:15px; line-height:2.15; color:#CBBFa8; }
+  #bill .acts b { color:#F4EBDD; font-weight:600; display:inline-block; min-width:9.5em; }
+  #bill .acts .dead { color:#8a6a5a; text-decoration:line-through; text-decoration-color:#B3261E; }
+  #bill .acts .love { color:#E8C687; }
+  #bill .finale { font-size:22px; font-style:italic; margin:26px 0 30px; }
+  #bill .cta { font-family:'Archivo'; display:inline-block; border:1px solid #C9A15E; color:#E8C687;
+               font-weight:600; letter-spacing:.06em; padding:14px 36px; border-radius:2px; }
+  #bill .cta:hover { background:#C9A15E; color:#17110A; }
+  #bill .note { font:400 12px 'IBM Plex Mono',monospace; color:#6E6252; margin-top:26px; letter-spacing:.06em; }
+
+  /* ══════════ 5 · THE LEDGER — the story as the append-only log itself ══════════ */
+  #ledger { background:#FBF9F4; color:#1C1913; font-family:'Archivo',sans-serif;
+            background-image:repeating-linear-gradient(180deg, transparent 0 31px, #EDE6D6 31px 32px); }
+  #ledger .grid { max-width:1060px; margin:0 auto; display:grid; grid-template-columns:1fr 1.1fr; gap:5vw; align-items:center; }
+  #ledger h1 { font-size:clamp(32px,3.8vw,54px); font-weight:900; line-height:1.06; letter-spacing:-.02em; }
+  #ledger h1 span { color:#B3261E; }
+  #ledger .sub { margin:24px 0 30px; font-size:17.5px; line-height:1.6; color:#6d6455; max-width:30em; }
+  #ledger .duo { font-size:15px; line-height:1.6; color:#494234; margin-bottom:30px; }
+  #ledger .duo b { display:block; font-weight:600; color:#1C1913; }
+  #ledger .duo div { margin-bottom:14px; padding-left:14px; }
+  #ledger .duo .o { border-left:3px solid #1B7A4B; } #ledger .duo .s { border-left:3px solid #B9924A; }
+  #ledger .cta { display:inline-block; background:#1C1913; color:#FBF9F4; font-weight:600; padding:14px 30px; border-radius:8px; }
+  #ledger .cta:hover { background:#B3261E; }
+  #ledger .tape { background:#fff; border:1px solid #E4DCC9; border-radius:8px;
+                  box-shadow:0 16px 44px rgba(60,45,20,.14); padding:24px 26px 16px;
+                  font:400 13px/2.05 'IBM Plex Mono',monospace; color:#4b4335; transform:rotate(.5deg); }
+  #ledger .tape .h { font-weight:600; color:#1C1913; border-bottom:2px solid #1C1913; margin-bottom:8px; letter-spacing:.04em; }
+  #ledger .tape .dead { color:#a04038; }
+  #ledger .tape .love { background:#FFF7E0; }
+  #ledger .tape .hot { background:#FFF1B8; font-weight:600; }
+  #ledger .tape .foot { border-top:1px dashed #C9BFa8; margin-top:8px; padding-top:6px; color:#9a8f7a; font-size:11.5px; }
+</style>
+</head>
+<body>
+
+<nav class="switcher">
+  <a href="#zen">1 Zen</a><a href="#press">2 Broadsheet</a><a href="#pm">3 Postmortem</a><a href="#bill">4 Playbill</a><a href="#ledger">5 Ledger</a>
+</nav>
+
+<!-- ═══════════════ 1 · ZEN PAPER ═══════════════ -->
+<section id="zen">
+  <div class="tno">Treatment 01 · Zen Paper — pain first, pride second · house Warm Paper</div>
+  <div class="wrap">
+    <div class="kicker r1">Curtain Call · calls for papers, without the paperwork</div>
+    <h1 class="r2">The CFP tool organizers have dreamed of for fifteen years.<br><b>We were the ones complaining.</b></h1>
+    <p class="confess r3">24 conferences over 12 years, on five of some of the worst tools on the
+       planet. We know exactly what conference organizers hate — I have personally gnashed
+       my teeth about these problems for over a decade.</p>
+
+    <div class="mirror r3">
+      <div class="list hate">
+        <h3>Everything we hate about CFP tools</h3>
+        <ul>
+          <li>Reviewers can't actually talk to each other — opinions go to die in silos</li>
+          <li>Committee members forced to log in to yet another tool just to leave a comment</li>
+          <li>Form-filling, forever. It turns the best part of running a conference into a chore</li>
+          <li>Deciding and notifying smeared into one terrifying button</li>
+          <li>Your program, trapped — export means copy-paste</li>
+          <li class="ex">Exhibit A of our desperation: Trello boards, Zapier glue, one Google Sheet
+              running the schedule for ten straight years, and an entire front-end we built by
+              scraping our own CFP tool</li>
+        </ul>
+      </div>
+      <div class="list proud">
+        <h3>What we're proud of in this one</h3>
+        <ul>
+          <li>Review is a conversation — every score and comment on one shared page</li>
+          <li>Committee members click one link. Speakers never make an account at all</li>
+          <li>Zero to open CFP in ten minutes — the acceptance test is a stopwatch</li>
+          <li>Decide quietly, then tell everyone deliberately — and it remembers who's been told</li>
+          <li>sessions.json, speakers.json, calendar.ics, a real API — your site drinks directly</li>
+          <li>Append-only ledger: nothing is ever deleted, everything can be rewound</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="duo r4">
+      <div class="card org">
+        <div class="aud">For organizers — you choose the tool</div>
+        <h2>Run the whole call on one calm page.</h2>
+        <p>Built from 20,000 committee Slack messages' worth of scar tissue, after swyx
+           dared the internet to kill his SaaS bill.</p>
+        <a href="#">Open your call for papers →</a>
+      </div>
+      <div class="card spk">
+        <div class="aud">For speakers — the people it must not lose</div>
+        <h2>The easiest submission you'll ever make.</h2>
+        <p>One page. No account until you press submit. A half-typed abstract that
+           survives anything. Edit until the call closes.</p>
+        <a href="#">See a live call →</a>
+      </div>
+    </div>
+    <a class="cta r4" href="#">Create your event — live in ten minutes</a>
+    <span class="quiet r4">win or lose, the $10K prize goes to STEM charity</span>
+  </div>
+</section>
+
+<!-- ═══════════════ 2 · THE BROADSHEET ═══════════════ -->
+<section id="press">
+  <div class="tno">Treatment 02 · The Broadsheet — the story as front-page news</div>
+  <div class="paper">
+    <div class="masthead"><h1>The Curtain Call</h1></div>
+    <div class="dateline"><span>VOL. I · No. 1</span><span>CONFERENCE DESK — AUGUST 2026</span><span>PRICE: YOUR SAAS BILL</span></div>
+    <div class="headline">ORGANIZER, HELD HOSTAGE FIFTEEN YEARS,<br>BUILDS OWN CFP TOOL AT LAST</div>
+    <div class="subhead">Five incumbents implicated · 20,000 committee messages entered into evidence · beloved BusyConf mourned</div>
+    <div class="cols">
+      <p class="lede">For fifteen years, the conference desk of a certain Portland publishing
+         house ran its calls for papers on five of the worst tools on the planet — and, per
+         sworn committee testimony, was held hostage by every one of them. Workarounds date
+         to 2014: Trello boards, Zapier relays, the notorious ten-year "Schedule Blocking"
+         spreadsheet, and finally an entire replacement front-end constructed by scraping
+         the incumbent's own pages.</p>
+      <p>Investigators reviewing the twenty thousand Slack messages describe a committee
+         "referring to speakers by Google Sheets row number" (the Cvent year), reviewing by
+         thumbs-tally (the eventPower year), and observing one vendor patch its application
+         live during the weekly decision call. Only BusyConf, adopted 2018, drew praise —
+         "the beloved era" — before dying of Heroku repricing in 2023, still mourned.</p>
+      <div class="pull">"Review is a conversation among trusted peers — not an evaluation plan."</div>
+      <p>The new tool, built in the open after S. Wang ("swyx") publicly dared readers to
+         kill his software bill, opens a call for papers in under ten minutes, keeps every
+         score and comment on one shared page, separates deciding from telling, and emits
+         the exact open-data files a conference website drinks. Its ledger, engineers note,
+         cannot delete anything — every change is a recorded fact. The proprietor has
+         pledged the contest's $10,000 prize to STEM charity.</p>
+      <div class="ad">
+        <div class="t">Speakers!</div>
+        <p>The easiest submission you will ever make. One page, no account, nothing ever lost.</p>
+        <a href="#">SUBMIT A TALK</a>
+      </div>
+      <div class="ad" style="margin-top:14px;">
+        <div class="t">Organizers!</div>
+        <p>Your call for papers, live before the kettle boils.</p>
+        <a href="#">OPEN YOUR CFP</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════ 3 · THE POSTMORTEM ═══════════════ -->
+<section id="pm">
+  <div class="tno">Treatment 03 · The Postmortem — the story as an incident report (engineers trust postmortems)</div>
+  <div class="wrap">
+    <div class="file">INCIDENT-2011-∞ · FILED 2026-08-09 · STATUS: <b style="color:#5BD08F">RESOLVED</b></div>
+    <h1>Fifteen years of CFP tooling failures, <span>root-caused and fixed.</span></h1>
+    <div class="sev">SEV-1 · DURATION: 2011 → 2026 · CUSTOMERS AFFECTED: every conference we ran</div>
+    <dl>
+      <dt>Impact</dt><dd>Five tools adopted, five abandoned. Committee reduced to <b>referring to
+        speakers by spreadsheet row</b>. Review conducted by thumbs-tally. One vendor observed
+        patching production during the decision call.</dd>
+      <dt>Workarounds</dt><dd>Trello (2016), Zapier, the ten-year "Schedule Blocking" Google Sheet,
+        and a complete replacement front-end built by <b>scraping our own CFP tool</b> (2021–2025).</dd>
+      <dt>Evidence</dt><dd>20,000 committee Slack messages, 2014–2026, reviewed in full.</dd>
+      <dt>Trigger</dt><dd>2026-08-09: swyx dares the internet to kill his SaaS bill. <span class="ok">We accept.</span></dd>
+      <dt>Resolution</dt><dd><b>Curtain Call.</b> Open a CFP in ten minutes · review on one shared page ·
+        decide and tell as separate deliberate acts · append-only store (nothing deletable, ever) ·
+        sessions.json / speakers.json / .ics / API with stable IDs. <span class="ok">Verified in production.</span></dd>
+    </dl>
+    <div class="rca">
+      <div class="h">ROOT CAUSE</div>
+      <p>CFP tools are built for tool vendors' demos, not for the weekly call where five trusted
+         people argue a conference into existence. Fix: build for the call. Two sorts are the only
+         work queues; every opinion visible; the schedule tolerates half-decisions.</p>
+    </div>
+    <div class="actions">
+      <a href="#">Adopt the fix — open your CFP</a>
+      <a class="ghost" href="#">Speakers: submit a talk</a>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════ 4 · THE PLAYBILL ═══════════════ -->
+<section id="bill">
+  <div class="tno" style="left:11vw;">Treatment 04 · The Playbill — the story as tonight's program</div>
+  <div class="prog">
+    <div class="tonight">Curtain Call · World Premiere</div>
+    <h1>Fifteen Years<br><i>Backstage</i></h1>
+    <div class="strap">a true story, performed nightly wherever conferences are made</div>
+    <hr class="rule">
+    <div class="acts">
+      <div><b>ACT I — eventPower</b> <span class="dead">review by thumbs-tally</span></div>
+      <div><b>ACT II — Cvent</b> <span class="dead">"refer to them by Sheets row"</span></div>
+      <div><b>ACT III — BusyConf</b> <span class="love">the beloved era ♥ (dies of Heroku repricing)</span></div>
+      <div><b>ACT IV — Sessionize</b> <span class="dead">we scraped it to survive it</span></div>
+      <div><b>INTERMISSION</b> ten years of one Google Sheet, running the real schedule</div>
+      <div><b>FINALE — 2026</b> swyx dares the internet. we build the tool at last.</div>
+    </div>
+    <hr class="rule">
+    <div class="finale">Organizers, the stage is yours in ten minutes.<br>Speakers, the easiest audition of your life.</div>
+    <a class="cta" href="#">Raise the curtain</a>
+    <div class="note">PRIZE, IF WON, DONATED TO STEM CHARITY · NO SPEAKER EVER MAKES AN ACCOUNT · NOTHING IS EVER DELETED</div>
+  </div>
+</section>
+
+<!-- ═══════════════ 5 · THE LEDGER ═══════════════ -->
+<section id="ledger">
+  <div class="tno">Treatment 05 · The Ledger — the story told AS the append-only log</div>
+  <div class="grid">
+    <div>
+      <h1>Fifteen years, five tools, one lesson: <span>never lose the work.</span></h1>
+      <p class="sub">Curtain Call is an append-only ledger wearing a friendly face. The story of how
+         it came to exist is best told the way the tool itself would record it — and everything
+         on that tape really happened.</p>
+      <div class="duo">
+        <div class="o"><b>Organizers</b> run the whole call on one calm page — open in ten minutes,
+             review together, decide quietly, tell deliberately.</div>
+        <div class="s"><b>Speakers</b> get the easiest submission of their lives — one page, no
+             account, nothing ever lost.</div>
+      </div>
+      <a class="cta" href="#">Open the books — create your event</a>
+    </div>
+    <div class="tape">
+      <div class="h">HISTORY.LOG — THE CONFERENCE DESK, 2011→</div>
+      <div>2016&nbsp; eventpower.adopted&nbsp;&nbsp;&nbsp;review=thumbs-tally</div>
+      <div class="dead">2017&nbsp; eventpower.abandoned&nbsp;&nbsp;→ cvent.adopted</div>
+      <div class="dead">2017&nbsp; committee.refers-to-speakers-by-sheets-row</div>
+      <div class="love">2018&nbsp; busyconf.adopted&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"the beloved era"</div>
+      <div class="dead">2023&nbsp; busyconf.died&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;cause=heroku-repricing</div>
+      <div>2021&nbsp; sessionize.adopted + scraper.written&nbsp;(self-defense)</div>
+      <div>2014-24 workarounds.written&nbsp;&nbsp;trello, zapier, the-Sheet</div>
+      <div>2026-08-09&nbsp; swyx.dares-internet&nbsp;&nbsp;"kill my SaaS"</div>
+      <div>2026-08-09&nbsp; slack.messages.reviewed&nbsp;n=20,000</div>
+      <div class="hot">2026-08-10&nbsp; curtaincall.created&nbsp;&nbsp;— you are here</div>
+      <div class="foot">append-only · nothing above can be edited or deleted · that's the product</div>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

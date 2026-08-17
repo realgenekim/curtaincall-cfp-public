@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Host playbill — round 2 (chair + speaker profile)</title>
+<style>
+  :root {
+    --paper:#FAF7F2; --paper-deep:#F1EADD; --card:#FFFFFF;
+    --ink:#221E17; --ink-soft:#3B342A; --muted:#7C7264; --muted-2:#948A7B;
+    --kicker:#9C9284; --line:#E9E1D5; --line-soft:#EFE8DC;
+    --link:#1E62A8; --go:#1B7A4B; --focus-line:#B9924A;
+    --radius:7px; --radius-lg:12px; --pill:999px;
+    --font-display:'Fraunces','Iowan Old Style','Palatino Linotype',Georgia,serif;
+    --font-ui:'Source Sans 3',system-ui,'Seravek','Avenir Next','Segoe UI',sans-serif;
+  }
+  @font-face { font-family:'Fraunces';
+    src:url('http://localhost:20501/vendor/fraunces-latin.woff2') format('woff2');
+    font-weight:100 900; font-style:normal; font-display:swap; }
+  @font-face { font-family:'Source Sans 3';
+    src:url('http://localhost:20501/vendor/source-sans-3-latin.woff2') format('woff2');
+    font-weight:200 900; font-style:normal; font-display:swap; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:#EDE7DC; font-family:var(--font-ui); color:var(--ink); padding:28px; }
+  h1 { font-family:var(--font-display); font-size:26px; margin-bottom:4px; }
+  .sub { color:var(--muted); margin-bottom:24px; font-size:14.5px; max-width:74ch; }
+  .lbl { font-family:var(--font-display); font-weight:700; font-size:17px; margin:30px 0 3px; }
+  .why { color:var(--muted); font-size:12.5px; margin-bottom:12px; max-width:640px; }
+  a { color:var(--link); text-decoration:none; }
+  .kick { font-size:11.5px; letter-spacing:.1em; text-transform:uppercase;
+          color:var(--kicker); font-weight:600; }
+  .pill-open { background:var(--go); color:#fff; font-size:11px; font-weight:700;
+               border-radius:var(--pill); padding:2px 10px; white-space:nowrap; }
+  .row2 { display:flex; gap:24px; flex-wrap:wrap; }
+
+  .playbill { background:var(--paper); border:1px solid var(--line); border-radius:14px;
+              width:560px; padding:42px 48px 34px; text-align:center; }
+  .pb-ava { width:92px; height:92px; border-radius:50%; background:var(--paper-deep);
+            border:1px solid var(--line); margin:0 auto 14px; display:flex;
+            align-items:center; justify-content:center;
+            font-family:var(--font-display); font-size:32px; font-weight:700;
+            color:var(--muted); }
+  .pb-name { font-family:var(--font-display); font-size:36px; font-weight:800; }
+  .pb-tag { color:var(--ink-soft); font-size:15px; margin-top:2px; }
+  .pb-bio { color:var(--muted); font-size:14px; line-height:1.55; max-width:44ch;
+            margin:14px auto 4px; text-align:center; }
+  .pb-links { display:flex; gap:16px; justify-content:center; font-size:13px;
+              margin:10px 0 22px; }
+  .pb-events .kick { display:block; text-align:left; margin-bottom:2px; }
+  .trow { display:flex; align-items:baseline; gap:10px; padding:9px 2px;
+          border-top:1px solid var(--line-soft); font-size:15px; text-align:left; }
+  .trow:first-of-type { border-top:none; }
+  .trow b { font-family:var(--font-display); }
+  .dots { flex:1; border-bottom:1.5px dotted var(--line); }
+  .n { color:var(--ink-soft); white-space:nowrap; font-variant-numeric:tabular-nums; }
+  .back { display:inline-block; margin-top:24px; color:var(--muted); font-size:13px; }
+  .empty-note { background:var(--paper-deep); border-radius:var(--radius);
+                font-size:12px; color:var(--muted); padding:8px 12px; margin-top:16px;
+                text-align:left; }
+</style>
+</head>
+<body>
+<h1>Host playbill — round 2</h1>
+<p class="sub">Host = the event's committee <b>chair</b> (found in the store: swyx chairs AI Engineer Code Summit, Gene Kim chairs Enterprise AI Summit — no more "ai.engineer" domain fallback). The speaker profile (tagline · org · bio · headshot · links) folds in: one profile, both hats. Both profiles are EMPTY today — left card shows Gene's page as it renders now; right card shows swyx's once his profile is filled.</p>
+
+<div class="row2">
+  <div>
+    <p class="lbl">Gene Kim — profile empty (today's truth)</p>
+    <p class="why">Graceful without a profile: initials, name, events. The nudge line renders only to the host themself, linking to their own portal.</p>
+    <div class="playbill">
+      <span class="kick">Curtain Call · host</span>
+      <div class="pb-ava" style="margin-top:10px;">GK</div>
+      <div class="pb-name">Gene Kim</div>
+      <div class="pb-events" style="margin-top:22px;">
+        <span class="kick">Their events</span>
+        <div class="trow"><b>Enterprise AI Summit</b><span class="dots"></span>
+          <span class="n">81 submissions</span><a href="#">agenda →</a><span class="pill-open">call open</span></div>
+      </div>
+      <div class="empty-note">Seen only by Gene: "This is your public host page — <a href='#'>fill your speaker profile</a> and your bio, headshot, and links appear here."</div>
+      <a class="back" href="#">← Curtain Call</a>
+    </div>
+  </div>
+
+  <div>
+    <p class="lbl">swyx — profile filled (the goal state)</p>
+    <p class="why">Headshot replaces initials; tagline, bio, and links appear. Same page, richer as the profile grows.</p>
+    <div class="playbill">
+      <span class="kick">Curtain Call · host</span>
+      <div class="pb-ava" style="margin-top:10px; font-size:14px;">photo</div>
+      <div class="pb-name">swyx</div>
+      <div class="pb-tag">Curator, AI Engineer · Latent Space</div>
+      <p class="pb-bio">Runs the AI Engineer conferences and the Latent Space podcast.
+        Dared the internet to kill his SaaS bill; this page is what happened.</p>
+      <div class="pb-links"><a href="#">website</a><a href="#">linkedin</a></div>
+      <div class="pb-events">
+        <span class="kick">Their events</span>
+        <div class="trow"><b>AI Engineer Code Summit</b><span class="dots"></span>
+          <span class="n">502 submissions</span><a href="#">agenda →</a><span class="pill-open">call open</span></div>
+      </div>
+      <a class="back" href="#">← Curtain Call</a>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

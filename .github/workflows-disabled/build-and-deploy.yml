@@ -1,0 +1,125 @@
+name: Test and deploy (Curtain Call)
+
+# Keyless deploy via Workload Identity Federation — NO service-account key
+# anywhere. Push to staging → test → build (Jib) → tagged 0%-traffic revision
+# on BOTH services → verify staging and STOP. Production moves only through
+# the guarded local Makefile promotion command. Deploys build from the COMMIT,
+# not a working tree, so parallel local agents can't leak half-done edits into an image
+# (the 2026-08-11 lesson).
+#
+# WIF (provisioned from skiff 2026-08-11):
+#   provider: projects/109637679549/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+#   provider condition: repository_owner == realgenekim
+#   SA binding (workloadIdentityUser): ONLY realgenekim/curtaincall-cfp
+#   gha-deployer roles: run.developer, artifactregistry.writer,
+#     serviceAccountUser on cfp-saas-killer-run, secretAccessor on the two
+#     preflight secrets.
+
+on:
+  push:
+    branches: [staging]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write   # REQUIRED for WIF OIDC
+
+concurrency:
+  group: deploy-curtaincall
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java (Temurin 21)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Clojure CLI (+ clj-kondo for view-architecture-test)
+        uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          cli: latest
+          clj-kondo: latest
+
+      - name: Cache Clojure deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+            ~/.deps.clj
+          key: cljdeps-${{ hashFiles('deps.edn') }}
+          restore-keys: cljdeps-
+
+      # bin/kaocha exports CFP_MAIL_DISABLE=1 — tests structurally cannot
+      # send real mail even if creds were somehow present (they aren't in CI).
+      - name: Run tests (kaocha)
+        run: bin/kaocha unit
+
+      - name: Run exhaustive test-namespace inventory
+        run: bin/kaocha ci --fail-fast
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/staging' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java (Temurin 21)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Clojure CLI
+        uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          cli: latest
+
+      - name: Cache Clojure deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+            ~/.deps.clj
+          key: cljdeps-${{ hashFiles('deps.edn') }}
+          restore-keys: cljdeps-
+
+      - name: Authenticate to Google Cloud (keyless — Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: swyx-cfp-saas-killer
+          workload_identity_provider: projects/109637679549/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: gha-deployer@swyx-cfp-saas-killer.iam.gserviceaccount.com
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker auth for Artifact Registry (Jib push)
+        run: gcloud auth configure-docker us-west1-docker.pkg.dev --quiet
+
+      - name: Guard — must be swyx-cfp-saas-killer (no silent wrong-project deploys)
+        run: |
+          test "$(gcloud config get-value project 2>/dev/null)" = "swyx-cfp-saas-killer" \
+            || { echo "::error::active project is not swyx-cfp-saas-killer"; exit 1; }
+
+      # preflight-deploy checks the three boot-killers (cookie key, oauth
+      # secret, GCP_PROJECT env) BEFORE the 4-minute build; deploy-staging
+      # builds the uberjar, Jib-pushes the image, and creates a tagged
+      # 0%-traffic revision on the main service.
+      - name: Build + deploy tagged revision (swyx-cfp-saas-killer)
+        run: make deploy-staging
+
+      # curtaincallcfp runs the SAME image — deploy tagged, but do not flip.
+      - name: Deploy tagged revision (curtaincallcfp)
+        run: make deploy-curtaincall-staging
+
+      - name: Verify both staging revisions and stop before production
+        run: make verify-staging-release EXPECTED_SHA="$GITHUB_SHA"

@@ -1,0 +1,33 @@
+secrets/
+.cpcache/
+.nrepl-port
+target/
+*.log
+.DS_Store
+# 32MB source video — regenerate with: yt-dlp https://youtu.be/vUuK4Knl7oc (see docs/video/)
+docs/video/walkthrough.webm
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+docs/recordings/**/*.mp4
+docs/recordings/**/*.m4a
+data/
+backups/
+resources/public/images/people/*.png
+resources/build-sha.txt
+resources/build-time.txt
+docs/mockups/landing-art/
+00TESTLOG.txt
+secrets
+.last-serving-*
+.promotion-receipts/
+00SERVER-LOGS.txt
+.agent-msg-*.tmp
+.lsp/
+
+# w2o4.1 local store checkpoint (39MB projection, never truth)
+cache/
+bin/__pycache__

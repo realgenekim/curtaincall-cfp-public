@@ -1,0 +1,699 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail() {
+  printf 'eval-harness-install: %s\n' "$*" >&2
+  exit 1
+}
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+require_sealed() {
+  python3 - "$1" "$2" "$(id -u)" <<'PY'
+import os
+import stat
+import sys
+
+path, kind, expected_uid = sys.argv[1:]
+metadata = os.lstat(path)
+expected_type = stat.S_ISDIR if kind == 'directory' else stat.S_ISREG
+if not expected_type(metadata.st_mode) or metadata.st_uid != int(expected_uid) \
+        or metadata.st_mode & 0o222:
+    raise SystemExit(f'staged {kind} is not sealed by the installer authority: {path}')
+PY
+}
+
+[[ $# -eq 14 ]] || fail "expected stage, manifest hash, operation hash, preimage commit, harness sha, installer sha, old script hash, old lineage hash, new script hash, new lineage hash, leaf hash, target user, target home, and authority root"
+stage=$1
+manifest_hash=$2
+operation_hash=$3
+preimage_commit=$4
+harness_sha=$5
+installer_sha=$6
+old_script_hash=$7
+old_lineage_hash=$8
+new_script_hash=$9
+new_lineage_hash=${10}
+expected_leaf_hash=${11}
+target_user=${12}
+target_home=${13}
+authority_root=${14}
+
+for digest in "$manifest_hash" "$operation_hash" "$preimage_commit" "$harness_sha" "$installer_sha" "$old_script_hash" "$new_script_hash" "$new_lineage_hash" "$expected_leaf_hash"; do
+  [[ "$digest" =~ ^[0-9a-f]{40}$ || "$digest" =~ ^[0-9a-f]{64}$ ]] \
+    || fail "invalid digest: $digest"
+done
+[[ "$old_lineage_hash" == absent || "$old_lineage_hash" =~ ^[0-9a-f]{64}$ ]] \
+  || fail "invalid old lineage digest"
+case "$stage" in
+  /tmp/eval-harness-upload."$manifest_hash".*) ;;
+  *) fail "stage path does not bind the manifest" ;;
+esac
+require_sealed "$stage" directory || fail "stage is absent, symlinked, or writable"
+
+source_script="$stage/hill-climb-fleet"
+source_lineage="$stage/capture-lineage"
+leaf="$stage/eval-harness-install-remote"
+manifest="$stage/install-manifest.txt"
+for source in "$source_script" "$source_lineage" "$leaf" "$manifest"; do
+  require_sealed "$source" file \
+    || fail "staged input is absent, non-regular, symlinked, or writable: $source"
+done
+[[ "$(sha256_file "$source_script")" == "$new_script_hash" ]] || fail "staged hill-climb-fleet digest mismatch"
+[[ "$(sha256_file "$source_lineage")" == "$new_lineage_hash" ]] || fail "staged capture-lineage digest mismatch"
+[[ "$(sha256_file "$leaf")" == "$expected_leaf_hash" ]] || fail "installer leaf digest mismatch"
+[[ "$(sha256_file "$manifest")" == "$manifest_hash" ]] || fail "install manifest digest mismatch"
+expected_manifest="$(printf '%s\n' \
+  'schema=eval-harness-install-manifest.v2' \
+  "operation_sha=$operation_hash" \
+  "preimage_commit=$preimage_commit" \
+  "harness_sha=$harness_sha" \
+  "installer_sha=$installer_sha" \
+  "old_script_sha=$old_script_hash" \
+  "old_lineage_sha=$old_lineage_hash" \
+  "new_script_sha=$new_script_hash" \
+  "new_lineage_sha=$new_lineage_hash" \
+  "leaf_sha=$expected_leaf_hash" \
+  'target_script=runtime/hill-climb-fleet' \
+  'target_lineage=runtime/capture-lineage' \
+  'target_mode=0555')"
+[[ "$(cat "$manifest")" == "$expected_manifest" ]] || fail "install manifest fields differ from approved inputs"
+
+home_root="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$target_home")"
+[[ -d "$home_root" && ! -L "$target_home" ]] || fail "installer home is absent or symlinked"
+[[ "$target_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || fail "invalid target user"
+[[ "$(id -u "$target_user")" =~ ^[0-9]+$ ]] || fail "target user does not exist"
+if [[ "$target_user" == tester ]]; then
+  [[ "$(id -u)" -eq 0 ]] || fail "production install requires root authority"
+  [[ "$home_root" == /home/tester ]] || fail "tester home differs from fixed production target"
+  [[ "$authority_root" == /var/lib/eval-harness-install ]] || fail "production authority root differs from fixed path"
+fi
+[[ ! -L "$authority_root" ]] || fail "install authority root is symlinked"
+mkdir -p "$authority_root"
+authority_root="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$authority_root")"
+chmod 0755 "$authority_root"
+pending_dir="$authority_root/pending"
+receipt_dir="$authority_root/receipts"
+runtime_root="$authority_root/runtime"
+for directory in "$pending_dir" "$receipt_dir" "$runtime_root"; do
+  [[ ! -L "$directory" ]] || fail "install authority directory is symlinked: $directory"
+  mkdir -p "$directory"
+done
+if [[ "$target_user" == tester ]]; then
+  chown 0:0 "$authority_root" "$pending_dir" "$receipt_dir" "$runtime_root"
+fi
+chmod 0700 "$pending_dir"
+chmod 0755 "$receipt_dir" "$runtime_root"
+
+# The installer and capture runner share this kernel-held lock. There is no
+# separately published owner record: SIGKILL closes fd 9 and releases the
+# lock, so a crash cannot leave a half-created or permanently wedged lease.
+runtime_lock="$authority_root/runtime.lock"
+python3 - "$runtime_lock" "$(id -u)" "$(id -g "$target_user")" <<'PY'
+import os
+import stat
+import sys
+path, expected_uid, expected_gid = sys.argv[1:]
+expected_uid = int(expected_uid)
+expected_gid = int(expected_gid)
+try:
+    old_umask = os.umask(0)
+    try:
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o660)
+    finally:
+        os.umask(old_umask)
+except FileExistsError:
+    descriptor = None
+else:
+    os.fchown(descriptor, expected_uid, expected_gid)
+    os.fchmod(descriptor, 0o660)
+    os.fsync(descriptor)
+    os.close(descriptor)
+    parent = os.open(os.path.dirname(path), os.O_RDONLY)
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+metadata = os.lstat(path)
+if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != expected_uid \
+        or metadata.st_gid != expected_gid or stat.S_IMODE(metadata.st_mode) != 0o660:
+    raise SystemExit('runtime lock is not an authority-owned regular 0660 file')
+PY
+if [[ -z "${EVAL_HARNESS_INSTALL_LOCK_CHILD:-}" ]]; then
+  # The primary lock-holder and its backup watchdog own the flock. The leaf
+  # and every command it invokes run in a distinct process group with no lock
+  # descriptor; the holders release only after that group is quiescent.
+  exec python3 - "$runtime_lock" "$0" "$operation_hash" "$@" <<'PY'
+import fcntl
+import ctypes
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+
+lock_path, script, operation, *arguments = sys.argv[1:]
+descriptor = os.open(lock_path, os.O_WRONLY)
+try:
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print('eval-harness-install: capture or another installer owns the runtime lock', file=sys.stderr)
+    raise SystemExit(1)
+os.set_inheritable(descriptor, False)
+environment = os.environ.copy()
+environment['EVAL_HARNESS_INSTALL_LOCK_CHILD'] = operation
+environment['EVAL_HARNESS_INSTALL_LOCK_PARENT_PID'] = str(os.getpid())
+subtree_state_dir = tempfile.mkdtemp(prefix='eval-runtime-subtrees.')
+environment['EVAL_RUNTIME_SUBTREE_STATE_DIR'] = subtree_state_dir
+holder_pid = os.getpid()
+
+def die_with_lock_holder():
+    if sys.platform.startswith('linux'):
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(1, signal.SIGKILL) != 0:
+            raise OSError(ctypes.get_errno(), 'prctl(PR_SET_PDEATHSIG) failed')
+        if os.getppid() != holder_pid:
+            os.kill(os.getpid(), signal.SIGKILL)
+
+def group_exists(group):
+    try:
+        os.killpg(group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+def active_subtrees():
+    try:
+        return bool(os.listdir(subtree_state_dir))
+    except FileNotFoundError:
+        return False
+
+def cleanup_subtree_state_dir():
+    try:
+        os.rmdir(subtree_state_dir)
+    except (FileNotFoundError, OSError):
+        pass
+
+def terminate_group(group):
+    try:
+        os.killpg(group, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = __import__('time').monotonic() + 2.0
+    while __import__('time').monotonic() < deadline:
+        if not group_exists(group) and not active_subtrees():
+            cleanup_subtree_state_dir()
+            return
+        __import__('time').sleep(0.02)
+    if active_subtrees():
+        print('eval-harness-install: registered deadline subtree is quarantined; '
+              'runtime lock remains held until its supervisor clears it', file=sys.stderr, flush=True)
+    while active_subtrees():
+        __import__('time').sleep(0.1)
+    if group_exists(group):
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    deadline = __import__('time').monotonic() + 5.0
+    while __import__('time').monotonic() < deadline:
+        if not group_exists(group):
+            cleanup_subtree_state_dir()
+            return
+        __import__('time').sleep(0.02)
+    if group_exists(group) or active_subtrees():
+        print(f'eval-harness-install: operation process group {group} is quarantined; '
+              'runtime lock remains held until it disappears', file=sys.stderr, flush=True)
+    while group_exists(group) or active_subtrees():
+        __import__('time').sleep(1.0)
+    cleanup_subtree_state_dir()
+
+gate_code = r'''\
+import os
+import sys
+gate = int(sys.argv[1])
+command = sys.argv[2:]
+message = os.read(gate, 1)
+os.close(gate)
+if message != b'G':
+    raise SystemExit(125)
+os.execvpe(command[0], command, os.environ)
+'''
+gate_read, gate_write = os.pipe()
+watch_read, watch_write = os.pipe()
+ready_read, ready_write = os.pipe()
+child = subprocess.Popen([sys.executable, '-c', gate_code, str(gate_read),
+                          'bash', script, *arguments],
+                         close_fds=True, pass_fds=(gate_read,), env=environment,
+                         preexec_fn=die_with_lock_holder, start_new_session=True)
+operation_group = child.pid
+os.close(gate_read)
+watchdog_pid = os.fork()
+if watchdog_pid == 0:
+    os.close(watch_write)
+    os.close(gate_write)
+    os.close(ready_read)
+    try:
+        os.write(ready_write, b'R')
+        os.close(ready_write)
+        message = os.read(watch_read, 1)
+        if message != b'D':
+            terminate_group(operation_group)
+    finally:
+        os.close(watch_read)
+        cleanup_subtree_state_dir()
+    os._exit(0)
+os.close(watch_read)
+os.close(ready_write)
+watchdog_ready = os.read(ready_read, 1)
+os.close(ready_read)
+if watchdog_ready != b'R':
+    os.close(gate_write)
+    terminate_group(operation_group)
+    raise RuntimeError('backup watchdog did not acknowledge before operation release')
+pregate_test_dir = environment.get('EVAL_HARNESS_INSTALL_TEST_PRE_GATE_DIR')
+if pregate_test_dir:
+    pathlib = __import__('pathlib')
+    target = pathlib.Path(pregate_test_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    (target / 'holder.pid').write_text(f'{os.getpid()}\n', encoding='utf-8')
+    (target / 'child.pid').write_text(f'{operation_group}\n', encoding='utf-8')
+    (target / 'ready').write_text('ready\n', encoding='utf-8')
+    while True:
+        __import__('time').sleep(1.0)
+os.write(gate_write, b'G')
+os.close(gate_write)
+
+def forward(signum, _frame):
+    try:
+        os.killpg(operation_group, signum)
+    except ProcessLookupError:
+        pass
+
+for watched in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(watched, forward)
+status = 1
+try:
+    status = child.wait()
+finally:
+    terminate_group(operation_group)
+    try:
+        os.write(watch_write, b'D')
+    except BrokenPipeError:
+        pass
+    os.close(watch_write)
+    try:
+        os.waitpid(watchdog_pid, 0)
+    except ChildProcessError:
+        pass
+    cleanup_subtree_state_dir()
+raise SystemExit(status)
+PY
+fi
+[[ "$EVAL_HARNESS_INSTALL_LOCK_CHILD" == "$operation_hash" ]] \
+  || fail "runtime lock holder bound a different install operation"
+python3 - "$EVAL_HARNESS_INSTALL_LOCK_PARENT_PID" "$runtime_lock" "$PPID" <<'PY' \
+  || fail "runtime lock child lacks its dedicated holder"
+import fcntl
+import os
+import sys
+parent, path, shell_parent = sys.argv[1:]
+if not parent.isdigit() or shell_parent != parent:
+    raise SystemExit(1)
+descriptor = os.open(path, os.O_WRONLY)
+try:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(0)
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        raise SystemExit(1)
+finally:
+    os.close(descriptor)
+PY
+unset EVAL_HARNESS_INSTALL_LOCK_CHILD EVAL_HARNESS_INSTALL_LOCK_PARENT_PID
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+target_dir="$runtime_root/$operation_hash"
+target_script="$target_dir/hill-climb-fleet"
+target_lineage="$target_dir/capture-lineage"
+current_runtime="$authority_root/current"
+
+current="$home_root/fleet-runs/current"
+if [[ -e "$current" || -L "$current" ]]; then
+  [[ -L "$current" ]] || fail "current run pointer is not a symlink"
+  current_run="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$current")"
+  case "$current_run" in "$home_root/fleet-runs/"*) ;; *) fail "current run escapes fleet state root" ;; esac
+  current_state="$current_run/state.json"
+  [[ -f "$current_state" && ! -L "$current_state" ]] || fail "current run state is absent, non-regular, or symlinked"
+  status="$(python3 -c 'import json,sys; value=json.load(open(sys.argv[1])).get("status"); assert isinstance(value,str) and value; print(value)' "$current_state")" \
+    || fail "current run state is malformed"
+  case "$status" in
+    complete|failed|cancelled|stopped|stopped-contaminated|evidence-complete) ;;
+    *) fail "current run is not terminal: $status" ;;
+  esac
+fi
+
+legacy_dir="$home_root/bin"
+if [[ -e "$current_runtime" || -L "$current_runtime" ]]; then
+  [[ -L "$current_runtime" ]] || fail "active runtime pointer is not a symlink"
+  active_dir="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$current_runtime")"
+  case "$active_dir" in "$runtime_root/"*) ;; *) fail "active runtime escapes authority root" ;; esac
+else
+  active_dir="$legacy_dir"
+fi
+active_script="$active_dir/hill-climb-fleet"
+active_lineage="$active_dir/capture-lineage"
+for target in "$active_script" "$active_lineage"; do
+  [[ ! -L "$target" ]] || fail "active runtime is symlinked: $target"
+  [[ ! -e "$target" || -f "$target" ]] || fail "active runtime is not regular: $target"
+done
+observed_script=absent
+observed_lineage=absent
+[[ -f "$active_script" ]] && observed_script="$(sha256_file "$active_script")"
+[[ -f "$active_lineage" ]] && observed_lineage="$(sha256_file "$active_lineage")"
+case "$observed_script:$observed_lineage" in
+  "$old_script_hash:$old_lineage_hash"|"$old_script_hash:$new_lineage_hash"|"$new_script_hash:$new_lineage_hash") ;;
+  "$new_script_hash:$old_lineage_hash") fail "runner advanced before its capture-lineage dependency" ;;
+  *) fail "runtime pair preimage mismatch: runner=$observed_script lineage=$observed_lineage" ;;
+esac
+
+receipt_path="$receipt_dir/$operation_hash.json"
+pending_path="$pending_dir/$operation_hash.json"
+terminalize_pending() {
+  [[ -e "$pending_path" || -L "$pending_path" ]] || return 0
+  python3 - "$pending_path" "$operation_hash" "$harness_sha" "$installer_sha" \
+    "$new_script_hash" "$new_lineage_hash" "$expected_leaf_hash" "$(id -u)" <<'PY'
+import json
+import os
+import stat
+import sys
+
+path, operation, harness, installer, script_sha, lineage_sha, leaf_sha, expected_uid = sys.argv[1:]
+mode = os.lstat(path).st_mode
+if not stat.S_ISREG(mode) or os.stat(path).st_uid != int(expected_uid):
+    raise SystemExit('pending install intent is not authority-owned')
+with open(path, encoding='utf-8') as stream:
+    value = json.load(stream)
+if value.get('schema') != 'eval-harness-install-pending.v1' \
+        or value.get('operation_sha256') != operation \
+        or value.get('harness_sha') != harness \
+        or value.get('installer_sha') != installer \
+        or value.get('installed_script_sha256') != script_sha \
+        or value.get('installed_lineage_sha256') != lineage_sha \
+        or value.get('installer_leaf_sha256') != leaf_sha:
+    raise SystemExit('pending install intent differs from completed operation')
+PY
+  rm -f -- "$pending_path"
+  python3 - "$pending_dir" <<'PY'
+import os
+import sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+}
+if [[ -e "$receipt_path" || -L "$receipt_path" ]]; then
+  [[ -f "$receipt_path" && ! -L "$receipt_path" ]] || fail "install receipt is non-regular or symlinked"
+  [[ "$active_dir" == "$target_dir" \
+      && "$observed_script" == "$new_script_hash" \
+      && "$observed_lineage" == "$new_lineage_hash" ]] \
+    || fail "install receipt exists but the active immutable runtime drifted"
+  [[ "$(python3 -c 'import os,sys; print(os.lstat(sys.argv[1]).st_uid)' "$current_runtime")" == "$(id -u)" ]] \
+    || fail "active runtime pointer lacks installer authority"
+  python3 - "$receipt_path" "$operation_hash" "$harness_sha" "$installer_sha" \
+    "$new_script_hash" "$new_lineage_hash" "$expected_leaf_hash" "$(id -u)" <<'PY'
+import json
+import os
+import stat
+import sys
+
+path, operation, harness, installer, script_sha, lineage_sha, leaf_sha, expected_uid = sys.argv[1:]
+mode = os.lstat(path).st_mode
+if not stat.S_ISREG(mode) or os.stat(path).st_uid != int(expected_uid) \
+        or stat.S_IMODE(mode) != 0o444:
+    raise SystemExit('existing install receipt is not regular')
+with open(path, encoding='utf-8') as stream:
+    value = json.load(stream)
+required = {
+    'schema', 'ok', 'state', 'operation_sha256', 'manifest_sha256',
+    'preimage_commit', 'harness_sha', 'installer_sha', 'previous_script_sha256',
+    'previous_lineage_sha256', 'installed_script_sha256',
+    'installed_lineage_sha256', 'installer_leaf_sha256', 'target_script',
+    'target_lineage', 'target_mode', 'authority', 'proves', 'does_not_prove',
+}
+if set(value) != required \
+        or value.get('schema') != 'eval-harness-install.v5' \
+        or value.get('ok') is not True \
+        or value.get('state') not in {'installed', 'adopted'} \
+        or value.get('operation_sha256') != operation \
+        or value.get('harness_sha') != harness \
+        or value.get('installer_sha') != installer \
+        or not isinstance(value.get('preimage_commit'), str) \
+        or len(value['preimage_commit']) != 40 \
+        or value.get('installed_script_sha256') != script_sha \
+        or value.get('installed_lineage_sha256') != lineage_sha \
+        or value.get('installer_leaf_sha256') != leaf_sha \
+        or value.get('target_script') != f'runtime/{operation}/hill-climb-fleet' \
+        or value.get('target_lineage') != f'runtime/{operation}/capture-lineage' \
+        or value.get('target_mode') != '0555' \
+        or value.get('authority') != 'root-control-plane' \
+        or value.get('proves') != ['installed-runtime-bytes'] \
+        or value.get('does_not_prove') != ['capture-launched', 'integration', 'deployment']:
+    raise SystemExit('existing install receipt differs from approved operation')
+for field in ('manifest_sha256', 'previous_script_sha256'):
+    if not isinstance(value.get(field), str) or len(value[field]) != 64:
+        raise SystemExit('existing install receipt has an invalid digest')
+previous_lineage = value.get('previous_lineage_sha256')
+if previous_lineage != 'absent' and (not isinstance(previous_lineage, str) or len(previous_lineage) != 64):
+    raise SystemExit('existing install receipt has invalid lineage evidence')
+PY
+  terminalize_pending
+  cat "$receipt_path"
+  exit 0
+fi
+
+python3 - "$pending_path" "$operation_hash" "$manifest_hash" "$preimage_commit" "$harness_sha" \
+  "$installer_sha" "$old_script_hash" "$old_lineage_hash" "$new_script_hash" \
+  "$new_lineage_hash" "$expected_leaf_hash" <<'PY'
+import json
+import os
+import stat
+import sys
+import tempfile
+
+(path, operation, manifest, preimage, harness, installer, previous_script,
+ previous_lineage, installed_script, installed_lineage, leaf) = sys.argv[1:]
+value = {
+    'schema': 'eval-harness-install-pending.v1',
+    'operation_sha256': operation,
+    'manifest_sha256': manifest,
+    'preimage_commit': preimage,
+    'harness_sha': harness,
+    'installer_sha': installer,
+    'previous_script_sha256': previous_script,
+    'previous_lineage_sha256': previous_lineage,
+    'installed_script_sha256': installed_script,
+    'installed_lineage_sha256': installed_lineage,
+    'installer_leaf_sha256': leaf,
+}
+data = (json.dumps(value, sort_keys=True, separators=(',', ':')) + '\n').encode()
+directory = os.path.dirname(path)
+fd, temporary = tempfile.mkstemp(prefix='.pending-install.', dir=directory)
+try:
+    with os.fdopen(fd, 'wb') as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    try:
+        os.link(temporary, path)
+    except FileExistsError:
+        mode = os.lstat(path).st_mode
+        if not stat.S_ISREG(mode) or open(path, 'rb').read() != data:
+            raise SystemExit('existing pending install intent differs')
+    directory_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+PY
+
+state=installed
+if [[ -e "$target_dir" || -L "$target_dir" ]]; then
+  [[ -d "$target_dir" && ! -L "$target_dir" ]] || fail "immutable runtime target is not a directory"
+  [[ -f "$target_script" && ! -L "$target_script" \
+      && -f "$target_lineage" && ! -L "$target_lineage" ]] \
+    || fail "immutable runtime target is incomplete"
+  [[ "$(sha256_file "$target_script")" == "$new_script_hash" \
+      && "$(sha256_file "$target_lineage")" == "$new_lineage_hash" ]] \
+    || fail "immutable runtime target differs from approved bytes"
+  python3 - "$target_dir" "$target_script" "$target_lineage" "$(id -u)" <<'PY'
+import os
+import stat
+import sys
+directory, script, lineage, expected_uid = sys.argv[1:]
+expected_uid = int(expected_uid)
+metadata = [os.lstat(path) for path in (directory, script, lineage)]
+if not stat.S_ISDIR(metadata[0].st_mode) \
+        or any(not stat.S_ISREG(value.st_mode) for value in metadata[1:]) \
+        or any(value.st_uid != expected_uid for value in metadata) \
+        or any(stat.S_IMODE(value.st_mode) != 0o555 for value in metadata):
+    raise SystemExit('immutable runtime target has unsafe ownership or mode')
+PY
+  state=adopted
+else
+  runtime_tmp="$(mktemp -d "$runtime_root/.runtime.$operation_hash.XXXXXX")"
+  cleanup_runtime_tmp() {
+    if [[ -n "${runtime_tmp:-}" && -d "$runtime_tmp" ]]; then
+      chmod 0700 "$runtime_tmp" 2>/dev/null || true
+      rm -f -- "$runtime_tmp/hill-climb-fleet" "$runtime_tmp/capture-lineage"
+      rmdir "$runtime_tmp" 2>/dev/null || true
+    fi
+  }
+  trap cleanup_runtime_tmp EXIT
+  install -m 0555 "$source_lineage" "$runtime_tmp/capture-lineage"
+  if [[ "${EVAL_HARNESS_INSTALL_TEST_STOP_AFTER_LINEAGE:-false}" == true ]]; then
+    [[ "$target_user" != tester ]] || fail "test-only interruption is forbidden for production target"
+    sync
+    exit 75
+  fi
+  install -m 0555 "$source_script" "$runtime_tmp/hill-climb-fleet"
+  chmod 0555 "$runtime_tmp"
+  python3 - "$runtime_tmp" "$target_dir" <<'PY'
+import os
+import sys
+source, target = sys.argv[1:]
+for name in ('hill-climb-fleet', 'capture-lineage'):
+    descriptor = os.open(os.path.join(source, name), os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+source_directory = os.open(source, os.O_RDONLY)
+try:
+    os.fsync(source_directory)
+finally:
+    os.close(source_directory)
+try:
+    os.rename(source, target)
+except FileExistsError:
+    raise SystemExit('immutable runtime publication raced')
+parent = os.open(os.path.dirname(target), os.O_RDONLY)
+try:
+    os.fsync(parent)
+finally:
+    os.close(parent)
+PY
+  runtime_tmp=""
+fi
+
+if [[ "${EVAL_HARNESS_INSTALL_TEST_STOP_AFTER_PUBLISH:-false}" == true ]]; then
+  [[ "$target_user" != tester ]] || fail "test-only interruption is forbidden for production target"
+  sync
+  exit 77
+fi
+
+current_tmp="$authority_root/.current.$operation_hash.$$"
+ln -s "runtime/$operation_hash" "$current_tmp"
+python3 - "$current_tmp" "$current_runtime" "$authority_root" <<'PY'
+import os
+import sys
+source, target, directory = sys.argv[1:]
+os.replace(source, target)
+fd = os.open(directory, os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+if [[ "${EVAL_HARNESS_INSTALL_TEST_STOP_AFTER_RUNNER:-false}" == true ]]; then
+  [[ "$target_user" != tester ]] || fail "test-only interruption is forbidden for production target"
+  sync
+  exit 76
+fi
+
+installed_script_hash="$(sha256_file "$target_script")"
+installed_lineage_hash="$(sha256_file "$target_lineage")"
+[[ "$installed_script_hash" == "$new_script_hash" ]] || fail "installed hill-climb-fleet digest mismatch"
+[[ "$installed_lineage_hash" == "$new_lineage_hash" ]] || fail "installed capture-lineage digest mismatch"
+python3 - "$receipt_path" "$state" "$operation_hash" "$manifest_hash" "$preimage_commit" "$harness_sha" \
+  "$installer_sha" "$old_script_hash" "$old_lineage_hash" \
+  "$installed_script_hash" "$installed_lineage_hash" "$expected_leaf_hash" <<'PY'
+import json
+import os
+import stat
+import sys
+import tempfile
+
+path, state, operation, manifest, preimage_commit, harness, installer, previous_script, previous_lineage, installed_script, installed_lineage, leaf_sha = sys.argv[1:]
+receipt = {
+    'schema': 'eval-harness-install.v5',
+    'ok': True,
+    'state': state,
+    'operation_sha256': operation,
+    'manifest_sha256': manifest,
+    'preimage_commit': preimage_commit,
+    'harness_sha': harness,
+    'installer_sha': installer,
+    'previous_script_sha256': previous_script,
+    'previous_lineage_sha256': previous_lineage,
+    'installed_script_sha256': installed_script,
+    'installed_lineage_sha256': installed_lineage,
+    'installer_leaf_sha256': leaf_sha,
+    'target_script': f'runtime/{operation}/hill-climb-fleet',
+    'target_lineage': f'runtime/{operation}/capture-lineage',
+    'target_mode': '0555',
+    'authority': 'root-control-plane',
+    'proves': ['installed-runtime-bytes'],
+    'does_not_prove': ['capture-launched', 'integration', 'deployment'],
+}
+data = (json.dumps(receipt, sort_keys=True, separators=(',', ':')) + "\n").encode()
+directory = os.path.dirname(path)
+fd, temporary = tempfile.mkstemp(prefix=".install-receipt.", dir=directory)
+try:
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(data)
+        stream.flush()
+        os.fchmod(stream.fileno(), 0o444)
+        os.fsync(stream.fileno())
+    try:
+        os.link(temporary, path)
+    except FileExistsError:
+        mode = os.lstat(path).st_mode
+        if not stat.S_ISREG(mode) or open(path, "rb").read() != data:
+            raise SystemExit("existing install receipt differs")
+    directory_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+PY
+if [[ "${EVAL_HARNESS_INSTALL_TEST_STOP_AFTER_RECEIPT:-false}" == true ]]; then
+  [[ "$target_user" != tester ]] || fail "test-only interruption is forbidden for production target"
+  exit 77
+fi
+terminalize_pending
+cat "$receipt_path"

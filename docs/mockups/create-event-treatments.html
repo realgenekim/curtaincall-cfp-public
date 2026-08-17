@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Create Event — four visual treatments</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:SOFT,WONK,opsz,wght@0..100,0..1,9..144,300..700&family=Source+Sans+3:wght@300..700&family=Newsreader:opsz,wght@6..72,300..600&family=Libre+Franklin:wght@300..700&family=Nunito+Sans:wght@300..900&family=Public+Sans:wght@300..700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* ============================================================
+   PAGE CHROME — deliberately neutral so the treatments carry all
+   the personality. Dark mono bars = "contact sheet" framing.
+   ============================================================ */
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:#151412;font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;color:#e8e4dc}
+.pagehead{padding:26px 28px 24px;border-bottom:1px solid #2c2a26}
+.pagehead h1{margin:0;font-size:14px;font-weight:500;letter-spacing:.02em;color:#f2eee6}
+.pagehead p{margin:8px 0 0;font-size:12px;line-height:1.6;color:#8d877c;max-width:62ch}
+.pagehead .jump{margin:16px 0 0;display:flex;flex-wrap:wrap;gap:8px}
+.pagehead .jump a{font-size:11px;letter-spacing:.04em;color:#c9c2b5;text-decoration:none;border:1px solid #34312b;padding:5px 10px;border-radius:2px}
+.pagehead .jump a:hover{background:#22201c;color:#fff}
+
+.labelbar{position:sticky;top:0;z-index:9;display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;
+  padding:11px 28px;background:#151412;border-top:1px solid #2c2a26;border-bottom:1px solid #2c2a26}
+.labelbar .sw{width:9px;height:9px;border-radius:2px;align-self:center}
+.labelbar .lb-num{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#7e786d}
+.labelbar .lb-name{font-size:13px;font-weight:500;color:#f6f2ea;letter-spacing:.01em}
+.labelbar .lb-desc{font-size:11.5px;color:#8d877c;line-height:1.5}
+
+/* structural bits shared by every treatment (no styling opinions here) */
+.tw input{font:inherit;color:inherit;width:100%}
+.tw button{font:inherit;cursor:pointer}
+.tw summary{cursor:pointer;list-style:none}
+.tw summary::-webkit-details-marker{display:none}
+.tw .dates{display:grid;grid-template-columns:1fr 1fr}
+.tw .more-body{display:grid;grid-template-columns:1fr 1fr}
+.tw .stage{padding:64px 28px 76px}
+.tw .canvas{margin:0 auto}
+.tw .chev{display:inline-block;transition:transform .16s ease}
+.tw details[open] .chev{transform:rotate(90deg)}
+
+/* ============================================================
+   TREATMENT 1 — WARM PAPER
+   cream paper · Fraunces display · marker-yellow stroke · green pill
+   ============================================================ */
+.t1 .stage{background:#FAF7F2;color:#221E17;font-family:"Source Sans 3",system-ui,sans-serif;padding-top:72px}
+.t1 .canvas{max-width:660px}
+.t1 .kicker{font-size:13px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:#9C9284;margin-bottom:26px}
+.t1 .marquee{margin:0;font-family:"Fraunces",Georgia,serif;font-variation-settings:"SOFT" 60,"WONK" 1,"opsz" 110;
+  font-weight:600;font-size:clamp(30px,3.9vw,46px);line-height:1.16;letter-spacing:-.012em;color:#221E17}
+.t1 .hl{background-image:linear-gradient(180deg,rgba(255,241,184,0) 54%,#FFF1B8 54%,#FFF1B8 93%,rgba(255,241,184,0) 93%);
+  -webkit-box-decoration-break:clone;box-decoration-break:clone;padding:0 .06em}
+.t1 .cap{margin:20px 0 0;font-size:15px;line-height:1.6;color:#7C7264}
+.t1 .urlline{margin:8px 0 0;font-size:16px}
+.t1 .url{color:#1E62A8;text-decoration:none;border-bottom:1px solid rgba(30,98,168,.32);padding-bottom:1px}
+.t1 .url:hover{color:#134B84;border-bottom-color:#134B84}
+.t1 .form{margin-top:46px;border-top:1px solid #E9E1D5;padding-top:36px}
+.t1 .field{margin-bottom:26px}
+.t1 .lab{display:block;font-size:15px;font-weight:600;color:#3B342A;margin-bottom:9px}
+.t1 .inp{background:#fff;border:1px solid #DDD4C6;border-radius:7px;padding:13px 14px;font-size:17px;color:#221E17;
+  box-shadow:inset 0 1px 2px rgba(90,74,50,.06);transition:border-color .12s,box-shadow .12s}
+.t1 .inp::placeholder{color:#B4A996}
+.t1 .inp:hover{border-color:#CBBFAC}
+.t1 .inp:focus{outline:none;border-color:#B9924A;box-shadow:0 0 0 4px #FFF1B8,inset 0 1px 2px rgba(90,74,50,.05)}
+.t1 .dates{gap:14px}
+.t1 .more{margin:6px 0 34px;border-top:1px solid #EFE8DC;border-bottom:1px solid #EFE8DC}
+.t1 summary{padding:16px 2px;font-size:15.5px;color:#5C5344;display:flex;gap:10px;align-items:baseline;border-radius:6px}
+.t1 summary:hover{color:#221E17}
+.t1 summary:focus-visible{outline:none;box-shadow:0 0 0 4px #FFF1B8}
+.t1 .chev{color:#B29C78;font-size:12px}
+.t1 .more-t{font-weight:600;color:#3B342A}
+.t1 .more-s{color:#948A7B}
+.t1 .more-body{gap:16px 18px;padding:4px 0 22px}
+.t1 .more-body label{display:block;font-size:13.5px;font-weight:600;color:#6B6153;margin-bottom:6px}
+.t1 .more-body .inp{font-size:15px;padding:10px 12px}
+.t1 .actions{display:flex;align-items:center;gap:22px;flex-wrap:wrap}
+.t1 .btn-primary{background:#1B7A4B;color:#fff;border:none;border-radius:999px;padding:15px 30px;font-size:17px;font-weight:600;
+  letter-spacing:.005em;box-shadow:0 1px 0 rgba(0,0,0,.14),inset 0 1px 0 rgba(255,255,255,.22);transition:background .13s,transform .08s}
+.t1 .btn-primary:hover{background:#166540}
+.t1 .btn-primary:active{transform:translateY(1px)}
+.t1 .btn-primary:focus-visible{outline:none;box-shadow:0 0 0 4px #FFF1B8,0 0 0 5px #1B7A4B}
+.t1 .btn-quiet{background:none;border:none;color:#1E62A8;font-size:15.5px;text-decoration:underline;text-underline-offset:3px;
+  text-decoration-color:rgba(30,98,168,.35);padding:6px 2px;border-radius:5px}
+.t1 .btn-quiet:hover{color:#134B84;text-decoration-color:#134B84}
+.t1 .btn-quiet:focus-visible{outline:none;box-shadow:0 0 0 4px #FFF1B8}
+.t1 .foot{margin:40px 0 0;font-size:14.5px;line-height:1.75;color:#857B6C;max-width:56ch}
+.t1 .foot-em{color:#3B342A;font-weight:600}
+.t1 .ghost{margin-top:46px;padding:24px 26px;background:#F4EFE6;border-radius:12px;border:1px dashed #DFD5C4}
+.t1 .ghost-lab{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#A79B88;margin-bottom:12px}
+.t1 .ghost-marq{font-family:"Fraunces",Georgia,serif;font-variation-settings:"SOFT" 60,"WONK" 1,"opsz" 110;font-weight:500;
+  font-size:34px;line-height:1.15;color:#C4B9A6}
+.t1 .ghost-cap{margin-top:10px;font-size:14px;color:#BDB2A0}
+
+/* ============================================================
+   TREATMENT 2 — EDITORIAL IVORY
+   masthead rules · Newsreader headline · small-caps labels · deep red
+   ============================================================ */
+.t2 .stage{background:#FBF9F3;color:#14120E;font-family:"Libre Franklin",Helvetica,sans-serif}
+.t2 .canvas{max-width:720px}
+.t2 .kicker{font-size:10.5px;letter-spacing:.22em;text-transform:uppercase;color:#8E887A;
+  padding-bottom:12px;border-bottom:2px solid #14120E;margin-bottom:34px}
+.t2 .marquee{margin:0;font-family:"Newsreader",Georgia,serif;font-variation-settings:"opsz" 48;font-weight:500;
+  font-size:clamp(32px,4.5vw,54px);line-height:1.08;letter-spacing:-.018em;color:#14120E}
+.t2 .cap{margin:18px 0 0;font-size:12px;letter-spacing:.03em;color:#7E786A;line-height:1.6;
+  padding-top:14px;border-top:1px solid rgba(20,18,14,.18)}
+.t2 .urlline{margin:9px 0 0;font-size:14.5px;font-family:"Newsreader",Georgia,serif}
+.t2 .url{color:#9C1F1B;text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:3px}
+.t2 .url:hover{background:#F4E7E3}
+.t2 .form{margin-top:44px}
+.t2 .field{display:grid;grid-template-columns:160px 1fr;gap:26px;align-items:baseline;
+  border-top:1px solid rgba(20,18,14,.2);padding:20px 0}
+.t2 .lab{font-variant:all-small-caps;font-size:13.5px;letter-spacing:.13em;color:#4A4438;font-weight:500}
+.t2 .inp{background:transparent;border:none;border-bottom:1px solid rgba(20,18,14,.28);border-radius:0;padding:5px 2px 8px;
+  font-family:"Newsreader",Georgia,serif;font-size:21px;color:#14120E}
+.t2 .inp::placeholder{color:#ABA495;font-style:italic}
+.t2 .inp:hover{border-bottom-color:#14120E}
+.t2 .inp:focus{outline:none;border-bottom:2px solid #9C1F1B;padding-bottom:7px;background:rgba(156,31,27,.045)}
+.t2 .dates{gap:30px}
+.t2 .more{border-top:1px solid rgba(20,18,14,.2);border-bottom:2px solid #14120E;margin-bottom:36px}
+.t2 summary{padding:18px 0;display:flex;gap:10px;align-items:baseline;font-size:12.5px;letter-spacing:.06em;color:#4A4438}
+.t2 summary:hover{color:#9C1F1B}
+.t2 summary:focus-visible{outline:2px solid #9C1F1B;outline-offset:3px}
+.t2 .chev{font-size:10px;color:#9C1F1B}
+.t2 .more-t{font-variant:all-small-caps;letter-spacing:.14em;font-size:13.5px;font-weight:500;color:#14120E}
+.t2 .more-s{color:#8E887A}
+.t2 .more-body{gap:20px 30px;padding:2px 0 26px}
+.t2 .more-body label{display:block;font-variant:all-small-caps;letter-spacing:.13em;font-size:12px;color:#6E6859;margin-bottom:2px}
+.t2 .more-body .inp{font-size:17px}
+.t2 .actions{display:flex;align-items:center;gap:26px;flex-wrap:wrap}
+.t2 .btn-primary{background:#9C1F1B;color:#FBF9F3;border:none;border-radius:2px;padding:15px 26px;font-size:13px;
+  font-weight:600;letter-spacing:.09em;text-transform:uppercase;transition:background .13s}
+.t2 .btn-primary:hover{background:#7A1512}
+.t2 .btn-primary:focus-visible{outline:2px solid #14120E;outline-offset:3px}
+.t2 .btn-quiet{background:none;border:none;color:#4A4438;font-size:14px;text-decoration:underline;text-underline-offset:4px;
+  text-decoration-color:rgba(20,18,14,.35);padding:4px 0}
+.t2 .btn-quiet:hover{color:#9C1F1B;text-decoration-color:#9C1F1B}
+.t2 .btn-quiet:focus-visible{outline:2px solid #9C1F1B;outline-offset:3px}
+.t2 .foot{margin:42px 0 0;padding-top:16px;border-top:1px solid rgba(20,18,14,.2);font-size:13px;line-height:1.8;
+  color:#7E786A;max-width:62ch}
+.t2 .foot-em{color:#14120E;font-style:italic;font-family:"Newsreader",Georgia,serif;font-size:15px}
+.t2 .ghost{margin-top:44px;padding-left:20px;border-left:3px solid rgba(20,18,14,.14)}
+.t2 .ghost-lab{font-variant:all-small-caps;letter-spacing:.2em;font-size:12px;color:#A29B8B;margin-bottom:10px}
+.t2 .ghost-marq{font-family:"Newsreader",Georgia,serif;font-weight:400;font-size:38px;line-height:1.1;color:#C3BCAA;font-style:italic}
+.t2 .ghost-cap{margin-top:8px;font-size:12px;color:#BEB7A6;letter-spacing:.03em}
+
+/* ============================================================
+   TREATMENT 3 — CARDSTOCK
+   dotted warm-gray field · white card w/ trim marks · sticky note · Nunito
+   ============================================================ */
+.t3 .stage{background-color:#EFEDE8;background-image:radial-gradient(#DAD5C9 1.1px,transparent 1.1px);
+  background-size:15px 15px;color:#2A2723;font-family:"Nunito Sans",system-ui,sans-serif;padding:70px 28px 88px}
+.t3 .canvas{max-width:672px;background:#fff;border:1px solid #E2DDD2;border-radius:16px;padding:46px 48px 44px;
+  outline:1px dashed #D7D0C0;outline-offset:9px;
+  box-shadow:0 1px 0 #fff inset,0 2px 3px rgba(60,50,30,.05),0 14px 30px -18px rgba(60,50,30,.35)}
+.t3 .kicker{display:inline-block;font-size:11.5px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;
+  color:#8A8172;background:#F3F1EB;border-radius:20px;padding:5px 12px;margin-bottom:26px}
+.t3 .marquee{margin:0;font-weight:800;font-size:clamp(27px,3.5vw,40px);line-height:1.2;letter-spacing:-.017em;color:#232019}
+.t3 .cap{display:inline-block;margin:18px 0 0;font-size:14px;font-weight:600;line-height:1.5;color:#5E5646;
+  background:#FFF2A8;padding:8px 14px;transform:rotate(-.55deg);box-shadow:1px 2px 0 rgba(90,75,30,.09)}
+.t3 .urlline{margin:14px 0 0;font-size:15.5px;font-weight:700}
+.t3 .url{color:#2A6EA8;text-decoration:none;border-bottom:2px solid rgba(42,110,168,.25)}
+.t3 .url:hover{color:#1D5484;border-bottom-color:#1D5484}
+.t3 .form{margin-top:36px;padding-top:30px;border-top:2px dotted #E4DFD3}
+.t3 .field{margin-bottom:22px}
+.t3 .lab{display:block;font-size:14px;font-weight:800;color:#3E3931;margin-bottom:7px}
+.t3 .inp{background:#FCFBF8;border:2px solid #E0DACC;border-radius:10px;padding:12px 14px;font-size:16.5px;font-weight:600;
+  color:#2A2723;transition:border-color .12s,background .12s}
+.t3 .inp::placeholder{color:#B6AE9E;font-weight:400}
+.t3 .inp:hover{border-color:#CFC6B2;background:#fff}
+.t3 .inp:focus{outline:2px dashed #C9A227;outline-offset:3px;border-color:#C9A227;background:#fff}
+.t3 .dates{gap:14px}
+.t3 .more{margin:2px 0 30px;background:#FAF9F5;border:2px solid #EEEAE0;border-radius:12px}
+.t3 summary{padding:14px 16px;font-size:14.5px;color:#5E5646;display:flex;gap:10px;align-items:baseline;border-radius:10px}
+.t3 summary:hover{background:#F4F2EA;color:#2A2723}
+.t3 summary:focus-visible{outline:2px dashed #C9A227;outline-offset:2px}
+.t3 .chev{font-size:11px;color:#B09A55}
+.t3 .more-t{font-weight:800;color:#3E3931}
+.t3 .more-s{color:#8A8172}
+.t3 .more-body{gap:16px 18px;padding:2px 16px 18px}
+.t3 .more-body label{display:block;font-size:12.5px;font-weight:800;color:#6E6555;margin-bottom:5px}
+.t3 .more-body .inp{font-size:14.5px;padding:9px 12px;border-width:2px}
+.t3 .actions{display:flex;align-items:center;gap:20px;flex-wrap:wrap}
+.t3 .btn-primary{background:#4E9C3E;color:#fff;border:none;border-bottom:3px solid #3B7A2E;border-radius:11px;
+  padding:14px 26px 13px;font-size:16.5px;font-weight:800;letter-spacing:.005em;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.35);transition:background .12s}
+.t3 .btn-primary:hover{background:#458C37}
+.t3 .btn-primary:active{border-bottom-width:1px;transform:translateY(2px)}
+.t3 .btn-primary:focus-visible{outline:2px dashed #C9A227;outline-offset:4px}
+.t3 .btn-quiet{background:none;border:2px solid #E4DFD3;border-radius:10px;color:#6E6555;font-size:14.5px;font-weight:700;padding:11px 16px}
+.t3 .btn-quiet:hover{border-color:#CFC6B2;color:#3E3931;background:#FAF9F5}
+.t3 .btn-quiet:focus-visible{outline:2px dashed #C9A227;outline-offset:3px}
+.t3 .foot{margin:34px 0 0;padding-top:22px;border-top:2px dotted #E4DFD3;font-size:13.5px;line-height:1.75;color:#7C7365;max-width:58ch}
+.t3 .foot-em{color:#3E3931;font-weight:800}
+.t3 .ghost{margin:26px auto 0;max-width:672px;background:#fff;border:1px solid #E6E1D6;border-radius:14px;padding:22px 26px}
+.t3 .ghost-lab{font-size:11px;font-weight:800;letter-spacing:.13em;text-transform:uppercase;color:#A9A192;margin-bottom:12px}
+.t3 .ghost-marq{font-size:31px;font-weight:800;line-height:1.2;color:#C8C2B4}
+.t3 .ghost-cap{display:inline-block;margin-top:12px;font-size:13px;font-weight:600;color:#B5AE9E;background:#F6F4EC;padding:6px 12px;transform:rotate(-.55deg)}
+
+/* ============================================================
+   TREATMENT 4 — QUIET MODERN
+   near-white · Public Sans only · thin borders · one amber accent
+   ============================================================ */
+.t4 .stage{background:#FCFBF9;color:#1A1917;font-family:"Public Sans",system-ui,sans-serif;padding:60px 28px 72px}
+.t4 .canvas{max-width:600px}
+.t4 .kicker{font-size:11.5px;font-weight:500;letter-spacing:.11em;text-transform:uppercase;color:#8C877F;margin-bottom:22px}
+.t4 .marquee{margin:0;font-weight:600;font-size:clamp(26px,3.3vw,38px);line-height:1.22;letter-spacing:-.021em;color:#12110F}
+.t4 .cap{margin:14px 0 0;font-size:13.5px;line-height:1.55;color:#79746C}
+.t4 .urlline{margin:6px 0 0;font-size:13.5px;font-family:"IBM Plex Mono",ui-monospace,monospace}
+.t4 .url{color:#B0700C;text-decoration:none;border-bottom:1px solid rgba(176,112,12,.3)}
+.t4 .url:hover{border-bottom-color:#B0700C}
+.t4 .form{margin-top:34px;padding-top:28px;border-top:1px solid #E8E4DD}
+.t4 .field{margin-bottom:18px}
+.t4 .lab{display:block;font-size:13px;font-weight:500;color:#494540;margin-bottom:6px}
+.t4 .inp{background:#fff;border:1px solid #E1DCD4;border-radius:6px;padding:10px 12px;font-size:15px;color:#1A1917;transition:border-color .12s,box-shadow .12s}
+.t4 .inp::placeholder{color:#AFA9A0}
+.t4 .inp:hover{border-color:#CFC8BD}
+.t4 .inp:focus{outline:none;border-color:#B0700C;box-shadow:0 0 0 3px rgba(176,112,12,.16)}
+.t4 .dates{gap:10px}
+.t4 .more{margin:4px 0 26px;border:1px solid #E8E4DD;border-radius:6px;background:#FDFCFA}
+.t4 summary{padding:11px 13px;font-size:13.5px;color:#6B665F;display:flex;gap:9px;align-items:baseline;border-radius:5px}
+.t4 summary:hover{color:#1A1917;background:#F7F5F1}
+.t4 summary:focus-visible{outline:none;box-shadow:0 0 0 3px rgba(176,112,12,.16);border-color:#B0700C}
+.t4 .chev{font-size:10px;color:#A39D93}
+.t4 .more-t{font-weight:500;color:#3B3833}
+.t4 .more-s{color:#8C877F}
+.t4 .more-body{gap:14px 14px;padding:2px 13px 16px}
+.t4 .more-body label{display:block;font-size:12px;font-weight:500;color:#79746C;margin-bottom:5px}
+.t4 .more-body .inp{font-size:14px;padding:8px 11px}
+.t4 .actions{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.t4 .btn-primary{background:#B0700C;color:#fff;border:1px solid #96600A;border-radius:6px;padding:11px 20px;font-size:14.5px;font-weight:600;transition:background .12s}
+.t4 .btn-primary:hover{background:#96600A}
+.t4 .btn-primary:focus-visible{outline:none;box-shadow:0 0 0 3px rgba(176,112,12,.3)}
+.t4 .btn-quiet{background:#fff;border:1px solid #E1DCD4;border-radius:6px;color:#6B665F;font-size:14px;padding:11px 16px}
+.t4 .btn-quiet:hover{border-color:#CFC8BD;color:#1A1917}
+.t4 .btn-quiet:focus-visible{outline:none;box-shadow:0 0 0 3px rgba(176,112,12,.16);border-color:#B0700C}
+.t4 .foot{margin:30px 0 0;padding-top:18px;border-top:1px solid #E8E4DD;font-size:12.5px;line-height:1.7;color:#8C877F;max-width:60ch}
+.t4 .foot-em{color:#3B3833;font-weight:500}
+.t4 .ghost{margin-top:30px;padding:18px 20px;border:1px solid #EDE9E2;border-radius:6px;background:#FDFCFA}
+.t4 .ghost-lab{font-size:10.5px;font-weight:500;letter-spacing:.13em;text-transform:uppercase;color:#A8A29A;margin-bottom:10px}
+.t4 .ghost-marq{font-size:28px;font-weight:600;letter-spacing:-.021em;line-height:1.2;color:#CBC5BC}
+.t4 .ghost-cap{margin-top:8px;font-size:13px;color:#C2BCB3}
+
+@media (max-width:640px){
+  .tw .stage{padding-left:18px;padding-right:18px}
+  .tw .dates{grid-template-columns:1fr}
+  .tw .more-body{grid-template-columns:1fr}
+  .t2 .field{grid-template-columns:1fr;gap:8px}
+  .t3 .canvas{padding:30px 24px}
+}
+</style>
+</head>
+<body>
+
+<header class="pagehead">
+  <h1>Create Event — four treatments · pick one, or mix ("2's type, 1's warmth")</h1>
+  <p>Same page, same copy, same fields, four visual languages. Scroll and react. Inputs, disclosures and buttons are real — click into a field to see each treatment's focus ring.</p>
+  <nav class="jump">
+    <a href="#t1">01 Warm Paper</a>
+    <a href="#t2">02 Editorial Ivory</a>
+    <a href="#t3">03 Cardstock</a>
+    <a href="#t4">04 Quiet Modern</a>
+  </nav>
+</header>
+
+<!-- ============================ TREATMENT 1 ============================ -->
+<section class="tw t1" id="t1">
+  <div class="labelbar">
+    <span class="sw" style="background:#FFF1B8"></span>
+    <span class="lb-num">Treatment 1</span>
+    <span class="lb-name">Warm Paper</span>
+    <span class="lb-desc">Basecamp-faithful. Cream paper, soft serif display, a marker stroke under the event name, green pill button. Cozy and unhurried.</span>
+  </div>
+  <div class="stage">
+    <div class="canvas">
+      <div class="kicker">New event</div>
+
+      <h1 class="marquee"><span class="hl">Enterprise AI Summit — Charlotte, NC · Oct 7–8, 2026</span></h1>
+      <p class="cap">↳ how your event appears everywhere: public page · invites · emails</p>
+      <p class="urlline"><a class="url" href="#t1">cfp.itrevolution.com/enterprise-ai-summit</a></p>
+
+      <form class="form" action="#">
+        <div class="field">
+          <label class="lab" for="t1-name">Event name</label>
+          <input class="inp" id="t1-name" type="text" value="Enterprise AI Summit">
+        </div>
+        <div class="field">
+          <span class="lab">Event dates</span>
+          <div class="dates">
+            <input class="inp" type="text" value="Oct 7, 2026" aria-label="First day">
+            <input class="inp" type="text" value="Oct 8, 2026" aria-label="Last day">
+          </div>
+        </div>
+
+        <details class="more">
+          <summary><span class="chev">▸</span><span class="more-t">More options</span><span class="more-s">— location, website, CFP window, URL, timezone…</span></summary>
+          <div class="more-body">
+            <div><label>Location</label><input class="inp" type="text" placeholder="Charlotte Convention Center"></div>
+            <div><label>Website</label><input class="inp" type="text" placeholder="enterpriseaisummit.com"></div>
+            <div><label>CFP closes</label><input class="inp" type="text" placeholder="Aug 15, 2026"></div>
+            <div><label>Timezone</label><input class="inp" type="text" placeholder="America/New_York"></div>
+          </div>
+        </details>
+
+        <div class="actions">
+          <button class="btn-primary" type="button">Open your call for speakers →</button>
+          <button class="btn-quiet" type="button">Create a demo event instead</button>
+        </div>
+      </form>
+
+      <p class="foot">On create: a Program Committee is spawned · the seed form is installed · your public CFP URL goes live.<br>
+        <span class="foot-em">Target: under ten minutes from here to the first submission.</span></p>
+
+      <aside class="ghost">
+        <div class="ghost-lab">Empty state — before you type</div>
+        <div class="ghost-marq">Your event…</div>
+        <div class="ghost-cap">↳ how your event appears everywhere</div>
+      </aside>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ TREATMENT 2 ============================ -->
+<section class="tw t2" id="t2">
+  <div class="labelbar">
+    <span class="sw" style="background:#9C1F1B"></span>
+    <span class="lb-num">Treatment 2</span>
+    <span class="lb-name">Editorial Ivory</span>
+    <span class="lb-desc">Magazine masthead. High-contrast serif headline, hairline rules, small-caps labels, one deep red for the action. Refined and quiet.</span>
+  </div>
+  <div class="stage">
+    <div class="canvas">
+      <div class="kicker">New event</div>
+
+      <h1 class="marquee">Enterprise AI Summit — Charlotte, NC · Oct 7–8, 2026</h1>
+      <p class="cap">↳ how your event appears everywhere: public page · invites · emails</p>
+      <p class="urlline"><a class="url" href="#t2">cfp.itrevolution.com/enterprise-ai-summit</a></p>
+
+      <form class="form" action="#">
+        <div class="field">
+          <label class="lab" for="t2-name">Event name</label>
+          <input class="inp" id="t2-name" type="text" value="Enterprise AI Summit">
+        </div>
+        <div class="field">
+          <span class="lab">Event dates</span>
+          <div class="dates">
+            <input class="inp" type="text" value="Oct 7, 2026" aria-label="First day">
+            <input class="inp" type="text" value="Oct 8, 2026" aria-label="Last day">
+          </div>
+        </div>
+
+        <details class="more">
+          <summary><span class="chev">▸</span><span class="more-t">More options</span><span class="more-s">— location, website, CFP window, URL, timezone…</span></summary>
+          <div class="more-body">
+            <div><label>Location</label><input class="inp" type="text" placeholder="Charlotte Convention Center"></div>
+            <div><label>Website</label><input class="inp" type="text" placeholder="enterpriseaisummit.com"></div>
+            <div><label>CFP closes</label><input class="inp" type="text" placeholder="Aug 15, 2026"></div>
+            <div><label>Timezone</label><input class="inp" type="text" placeholder="America/New_York"></div>
+          </div>
+        </details>
+
+        <div class="actions">
+          <button class="btn-primary" type="button">Open your call for speakers →</button>
+          <button class="btn-quiet" type="button">Create a demo event instead</button>
+        </div>
+      </form>
+
+      <p class="foot">On create: a Program Committee is spawned · the seed form is installed · your public CFP URL goes live.<br>
+        <span class="foot-em">Target: under ten minutes from here to the first submission.</span></p>
+
+      <aside class="ghost">
+        <div class="ghost-lab">Empty state — before you type</div>
+        <div class="ghost-marq">Your event…</div>
+        <div class="ghost-cap">↳ how your event appears everywhere</div>
+      </aside>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ TREATMENT 3 ============================ -->
+<section class="tw t3" id="t3">
+  <div class="labelbar">
+    <span class="sw" style="background:#FFF2A8"></span>
+    <span class="lb-num">Treatment 3</span>
+    <span class="lb-name">Cardstock</span>
+    <span class="lb-desc">Early-Basecamp nostalgia. Dotted field, white card with trim marks, a sticky note behind the caption, chunky friendly sans.</span>
+  </div>
+  <div class="stage">
+    <div class="canvas">
+      <div class="kicker">New event</div>
+
+      <h1 class="marquee">Enterprise AI Summit — Charlotte, NC · Oct 7–8, 2026</h1>
+      <p class="cap">↳ how your event appears everywhere: public page · invites · emails</p>
+      <p class="urlline"><a class="url" href="#t3">cfp.itrevolution.com/enterprise-ai-summit</a></p>
+
+      <form class="form" action="#">
+        <div class="field">
+          <label class="lab" for="t3-name">Event name</label>
+          <input class="inp" id="t3-name" type="text" value="Enterprise AI Summit">
+        </div>
+        <div class="field">
+          <span class="lab">Event dates</span>
+          <div class="dates">
+            <input class="inp" type="text" value="Oct 7, 2026" aria-label="First day">
+            <input class="inp" type="text" value="Oct 8, 2026" aria-label="Last day">
+          </div>
+        </div>
+
+        <details class="more">
+          <summary><span class="chev">▸</span><span class="more-t">More options</span><span class="more-s">— location, website, CFP window, URL, timezone…</span></summary>
+          <div class="more-body">
+            <div><label>Location</label><input class="inp" type="text" placeholder="Charlotte Convention Center"></div>
+            <div><label>Website</label><input class="inp" type="text" placeholder="enterpriseaisummit.com"></div>
+            <div><label>CFP closes</label><input class="inp" type="text" placeholder="Aug 15, 2026"></div>
+            <div><label>Timezone</label><input class="inp" type="text" placeholder="America/New_York"></div>
+          </div>
+        </details>
+
+        <div class="actions">
+          <button class="btn-primary" type="button">Open your call for speakers →</button>
+          <button class="btn-quiet" type="button">Create a demo event instead</button>
+        </div>
+      </form>
+
+      <p class="foot">On create: a Program Committee is spawned · the seed form is installed · your public CFP URL goes live.<br>
+        <span class="foot-em">Target: under ten minutes from here to the first submission.</span></p>
+    </div>
+
+    <aside class="ghost">
+      <div class="ghost-lab">Empty state — before you type</div>
+      <div class="ghost-marq">Your event…</div>
+      <div class="ghost-cap">↳ how your event appears everywhere</div>
+    </aside>
+  </div>
+</section>
+
+<!-- ============================ TREATMENT 4 ============================ -->
+<section class="tw t4" id="t4">
+  <div class="labelbar">
+    <span class="sw" style="background:#B0700C"></span>
+    <span class="lb-num">Treatment 4</span>
+    <span class="lb-name">Quiet Modern</span>
+    <span class="lb-desc">The restrained one. Humanist sans throughout, thin borders, tight rhythm, a single amber accent — focus ring, button, URL. Nothing else colored.</span>
+  </div>
+  <div class="stage">
+    <div class="canvas">
+      <div class="kicker">New event</div>
+
+      <h1 class="marquee">Enterprise AI Summit — Charlotte, NC · Oct 7–8, 2026</h1>
+      <p class="cap">↳ how your event appears everywhere: public page · invites · emails</p>
+      <p class="urlline"><a class="url" href="#t4">cfp.itrevolution.com/enterprise-ai-summit</a></p>
+
+      <form class="form" action="#">
+        <div class="field">
+          <label class="lab" for="t4-name">Event name</label>
+          <input class="inp" id="t4-name" type="text" value="Enterprise AI Summit">
+        </div>
+        <div class="field">
+          <span class="lab">Event dates</span>
+          <div class="dates">
+            <input class="inp" type="text" value="Oct 7, 2026" aria-label="First day">
+            <input class="inp" type="text" value="Oct 8, 2026" aria-label="Last day">
+          </div>
+        </div>
+
+        <details class="more">
+          <summary><span class="chev">▸</span><span class="more-t">More options</span><span class="more-s">— location, website, CFP window, URL, timezone…</span></summary>
+          <div class="more-body">
+            <div><label>Location</label><input class="inp" type="text" placeholder="Charlotte Convention Center"></div>
+            <div><label>Website</label><input class="inp" type="text" placeholder="enterpriseaisummit.com"></div>
+            <div><label>CFP closes</label><input class="inp" type="text" placeholder="Aug 15, 2026"></div>
+            <div><label>Timezone</label><input class="inp" type="text" placeholder="America/New_York"></div>
+          </div>
+        </details>
+
+        <div class="actions">
+          <button class="btn-primary" type="button">Open your call for speakers →</button>
+          <button class="btn-quiet" type="button">Create a demo event instead</button>
+        </div>
+      </form>
+
+      <p class="foot">On create: a Program Committee is spawned · the seed form is installed · your public CFP URL goes live.<br>
+        <span class="foot-em">Target: under ten minutes from here to the first submission.</span></p>
+
+      <aside class="ghost">
+        <div class="ghost-lab">Empty state — before you type</div>
+        <div class="ghost-marq">Your event…</div>
+        <div class="ghost-cap">↳ how your event appears everywhere</div>
+      </aside>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

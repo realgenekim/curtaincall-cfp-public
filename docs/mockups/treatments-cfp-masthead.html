@@ -1,0 +1,87 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>CFP masthead treatments</title>
+<link rel="stylesheet" href="/css/app.css">
+<style>
+  body { background: var(--paper, #f7f3ec); margin:0; padding:2em 0 6em; }
+  .sheet { max-width: 900px; margin: 0 auto; }
+  .tlabel { font-size:12px; font-weight:700; letter-spacing:0.14em; color:#b8382f;
+            text-transform:uppercase; margin: 3.5em 0 1em; border-top: 3px solid #b8382f;
+            padding-top: 0.5em; }
+  .frame { background: var(--paper, #f7f3ec); border:1px solid var(--line, #ddd); padding: 1.5em 2em 2em; }
+  .eyebrow { font-size:11px; font-weight:600; letter-spacing:0.14em; text-transform:uppercase; color:var(--muted,#999); }
+  h1.big { font-family: var(--font-display); font-size: 2.3em; margin: 0.2em 0 0.3em; letter-spacing:-0.01em; }
+  .thesis { font-family: var(--font-display); font-size: 1.28em; line-height: 1.42; color: var(--ink,#222);
+            max-width: 34em; letter-spacing:-0.005em; margin: 0.4em 0 0.8em; }
+  .meta { color: var(--ink-soft,#555); font-size: 0.95em; margin: 0.3em 0; }
+  .meta a { color: inherit; }
+  .chiprow { display:flex; align-items:center; gap:0.6em; margin-top:0.9em; flex-wrap:wrap; }
+  .chiplabel { font-size:11px; font-weight:600; letter-spacing:0.1em; text-transform:uppercase; color:var(--muted,#999); }
+  .chip { display:inline-flex; align-items:center; gap:0.5em; padding:0.2em 0.85em 0.2em 0.25em;
+          border-radius:999px; background:var(--line-soft,#eee); text-decoration:none; color:var(--ink,#222); font-weight:600; }
+  .chip img { width:28px; height:28px; border-radius:50%; object-fit:cover; filter:grayscale(1); }
+  .chipattr { font-size:0.92em; color:var(--muted,#999); }
+  .cta { font-weight:600; color:var(--ink,#222); margin-top:1.1em; font-size:1em; }
+  .byline-row { font-size:12px; letter-spacing:0.06em; text-transform:uppercase; color:var(--ink-soft,#555);
+                font-weight:600; margin:0.6em 0 0.2em; }
+  .fn { font-size:0.82em; color:var(--muted,#999); max-width:46em; margin-top:1em; }
+  .twocol { display:grid; grid-template-columns: 1.6fr 1fr; gap:2.5em; align-items:start; }
+  .rail { border-left:1px solid var(--line,#ddd); padding-left:1.5em; font-size:0.92em; color:var(--ink-soft,#555); }
+  .rail .rl { margin-bottom:0.8em; }
+  .rail .rk { font-size:10.5px; font-weight:700; letter-spacing:0.12em; text-transform:uppercase; color:var(--muted,#999); display:block; }
+  .divider { border:0; border-top:1px solid var(--line,#ddd); margin:1.6em 0 0; }
+</style></head><body><div class="sheet">
+
+<div class="tlabel">T1 — The restructure (thesis only; byline→chip; CTA one line; colophon→footer)</div>
+<div class="frame">
+  <div class="eyebrow">Call for Speakers</div>
+  <h1 class="big">Enterprise AI Summit — Charlotte, NC · Oct 7–8, 2026</h1>
+  <p class="thesis">This conference assembles the most switched-on people using AI and vibe coding to advance enterprise goals. This is a community of people who are on the frontier of exploring ways of working that may seem radical and potentially risky, the payoff is so obviously high, staying still is simply not an option.</p>
+  <div class="meta">Submissions close Sept 1 · <a href="#">Official event website ↗</a></div>
+  <div class="chiprow"><span class="chiplabel">Organizer:</span>
+    <span class="chip"><img src="https://events.itrevolution.com/images/speakers/gene-kim.jpg"><span>Gene Kim</span></span>
+    <span class="chipattr">— WSJ-bestselling author of The Phoenix Project, The DevOps Handbook &amp; Vibe Coding</span></div>
+  <p class="cta">We have an amazing program planned for you! We have just a few open slots, so if you have an amazing story to share, submit a proposal!</p>
+  <hr class="divider">
+</div>
+
+<div class="tlabel">T2 — Same content, differentiated furniture (byline row + CTA + footnote, all in place)</div>
+<div class="frame">
+  <div class="eyebrow">Call for Speakers</div>
+  <h1 class="big">Enterprise AI Summit — Charlotte, NC · Oct 7–8, 2026</h1>
+  <p class="thesis">This conference assembles the most switched-on people using AI and vibe coding to advance enterprise goals. This is a community of people who are on the frontier of exploring ways of working that may seem radical and potentially risky, the payoff is so obviously high, staying still is simply not an option.</p>
+  <div class="byline-row">Hosted by Gene Kim · Researcher · WSJ-bestselling author of The Phoenix Project, DevOps Handbook &amp; Vibe Coding</div>
+  <p class="cta">We have an amazing program planned for you! We have just a few open slots, so if you have an amazing story to share, submit a proposal!</p>
+  <p class="fn">(And this was all made possible by @Swyx's amazing "Kill My SaaS In One Weekend" project – the goal was to write a CFP and agenda publishing tool in a weekend. Read more about the process of doing this <a href="#">here</a>!)</p>
+  <hr class="divider">
+</div>
+
+<div class="tlabel">T3 — Two-column editorial (thesis left, facts rail right)</div>
+<div class="frame">
+  <div class="eyebrow">Call for Speakers</div>
+  <h1 class="big">Enterprise AI Summit — Charlotte, NC · Oct 7–8, 2026</h1>
+  <div class="twocol">
+    <div>
+      <p class="thesis">This conference assembles the most switched-on people using AI and vibe coding to advance enterprise goals. This is a community of people who are on the frontier of exploring ways of working that may seem radical and potentially risky, the payoff is so obviously high, staying still is simply not an option.</p>
+      <p class="cta">We have an amazing program planned for you! We have just a few open slots — submit a proposal.</p>
+    </div>
+    <div class="rail">
+      <div class="rl"><span class="rk">Organizer</span>
+        <span class="chip" style="margin-top:4px"><img src="https://events.itrevolution.com/images/speakers/gene-kim.jpg"><span>Gene Kim</span></span><br>
+        WSJ-bestselling author of The Phoenix Project, The DevOps Handbook &amp; Vibe Coding</div>
+      <div class="rl"><span class="rk">Dates</span> October 7–8, 2026 · Charlotte, NC</div>
+      <div class="rl"><span class="rk">Links</span> <a href="#">Official event website ↗</a></div>
+    </div>
+  </div>
+  <hr class="divider">
+</div>
+
+<div class="tlabel">T4 — Maximal air (title, thesis, one combined line; everything else lives below)</div>
+<div class="frame">
+  <div class="eyebrow">Call for Speakers</div>
+  <h1 class="big">Enterprise AI Summit — Charlotte, NC · Oct 7–8, 2026</h1>
+  <p class="thesis">This conference assembles the most switched-on people using AI and vibe coding to advance enterprise goals. This is a community of people who are on the frontier of exploring ways of working that may seem radical and potentially risky, the payoff is so obviously high, staying still is simply not an option.</p>
+  <div class="meta">Hosted by <b>Gene Kim</b> · a few speaking slots remain · <a href="#">Official event website ↗</a></div>
+  <hr class="divider">
+</div>
+
+</div></body></html>

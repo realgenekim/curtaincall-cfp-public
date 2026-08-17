@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Watch the anvil dev seats (dev-a/b/c) for stuck states and emit ONE line per
+# problem per poll. Silent while seats are healthy/working. Designed to run
+# under a persistent Monitor: each stdout line is an alert to the Mayor.
+#
+# Stuck signals: BLOCKED text, usage-limit refusal, interrupted conversation,
+# goal stalled, or a pane whose content is byte-identical across two
+# consecutive polls while NOT showing a Working spinner (frozen/idle-drift).
+set -uo pipefail
+
+ANVIL="${ANVIL_HOST:-root@ANVIL-TAILNET-HOST}"
+POLL="${DEV_WATCH_POLL_SECONDS:-600}"
+declare -A LAST_HASH
+
+declare -A SEATS=( [dev-a]=%32 [dev-b]=%34 [dev-c]=%45 )
+
+while true; do
+  for seat in dev-a dev-b dev-c; do
+    pane="${SEATS[$seat]}"
+    content="$(ssh -o BatchMode=yes "$ANVIL" \
+      "sudo -iu gene tmux capture-pane -t $pane -p 2>/dev/null" 2>/dev/null || true)"
+    if [ -z "$content" ]; then
+      echo "$seat PANE-GONE ($pane): capture returned nothing — seat dead or renumbered"
+      continue
+    fi
+    tailtxt="$(printf '%s\n' "$content" | grep -v '^[[:space:]]*$' | tail -12)"
+    if printf '%s' "$tailtxt" | grep -qi 'usage limit'; then
+      echo "$seat FUEL-DEAD: usage-limit refusal visible"
+      continue
+    fi
+    if printf '%s' "$tailtxt" | grep -q 'BLOCKED'; then
+      echo "$seat BLOCKED: $(printf '%s\n' "$tailtxt" | grep 'BLOCKED' | tail -1 | cut -c1-160)"
+      continue
+    fi
+    if printf '%s' "$tailtxt" | grep -q 'Conversation interrupted\|Goal stalled'; then
+      echo "$seat STALLED: interrupted/goal-stalled banner visible"
+      continue
+    fi
+    hash="$(printf '%s' "$content" | shasum | cut -d' ' -f1)"
+    if [ "${LAST_HASH[$seat]:-}" = "$hash" ] \
+       && ! printf '%s' "$tailtxt" | grep -q 'Working ('; then
+      echo "$seat FROZEN: pane unchanged for ${POLL}s and no Working spinner"
+    fi
+    LAST_HASH[$seat]="$hash"
+  done
+  sleep "$POLL"
+done

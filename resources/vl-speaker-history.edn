@@ -1,0 +1,156 @@
+;; Curated "Previously at IT Revolution" speaker history — the video-library moat.
+;;
+;; Source of record: the-itrev-conference-ledger wiki entity pages
+;;   (~/src/the-itrev-conference-ledger/wiki/entities/<slug>.md).
+;; Each entity page carries YAML frontmatter (slug/name/org/vizier-id) and a body
+;; that grounds every prior talk (Vimeo link + title) and states
+;; "Presented across N events in this corpus".
+;;
+;; :history-url points at the public IT Revolution speaker profile. That page is
+;; the canonical archive for the speaker's talks, events, and career timeline.
+;;
+;; :name-key is lowercase+trimmed for name-match against public speaker records.
+;; :talk-count is the "Presented across N events" figure (or the count of talk
+;; headings when the page omits the summary line).
+;;
+;; This is a CURATED subset (Gene confirmed the repeat speakers), not all 626
+;; entity pages. Extend by adding maps here.
+
+[{:name "Steve Yegge"
+  :since 2024
+  :years [2024 2025 2026]
+  :name-key "steve yegge"
+  :org "Sourcegraph"
+  :talk-count 4
+  :history-url "https://videos.itrevolution.com/speakers/steve-yegge"
+  :talks [{:title "From Vibe Code to Fleet Mode: The Agentic Pivot Nobody's Ready For"
+           :url "https://vimeo.com/1184927954"}
+          {:title "Why Coding By Hand Is Dead: Lessons Learned in Chat Oriented Programming"
+           :url "https://vimeo.com/1061201938"}
+          {:title "The Death of the Junior Developer, and Other Lessons Learned"
+           :url "https://vimeo.com/1023437621"}]}
+
+ {:name "Dustin Warner"
+  :since 2026
+  :years [2026]
+  :name-key "dustin warner"
+  :org "NRC Health"
+  :talk-count 1
+  :history-url "https://videos.itrevolution.com/speakers/dustin-warner"
+  :talks [{:title "Production > Prototype: How a Small Team Replaced a Core Platform in 90 Days"
+           :url "https://vimeo.com/1183530553"}]}
+
+ {:name "Angie Jones"
+  :name-key "angie jones"
+  :org "Agentic AI Foundation"
+  :talk-count 1
+  :history-url "https://videos.itrevolution.com/speakers/angie-jones"
+  :talks [{:title "Building an AI Native Engineering Org"
+           :url "https://vimeo.com/1183220322"}]}
+
+ {:name "Scott Prugh"
+  :name-key "scott prugh"
+  :org "ACI Worldwide"
+  :talk-count 5
+  :history-url "https://videos.itrevolution.com/speakers/scott-prugh"
+  :talks [{:title "Coordination Costs and Rewiring Organizations to Win With AI"
+           :url "https://vimeo.com/1122499759"}
+          {:title "ACCOUNTING VS. PHYSICS - How Coordination Costs Are Killing Your Effectiveness"
+           :url "https://vimeo.com/763825194"}
+          {:title "DevOps And Modernization 2.0"
+           :url "https://vimeo.com/432109880"}]}
+
+ {:name "Nathen Harvey"
+  :name-key "nathen harvey"
+  :org "Google Cloud"
+  :talk-count 6
+  :history-url "https://videos.itrevolution.com/speakers/nathen-harvey"
+  :talks [{:title "State of AI-assisted Software Development: 2025 DORA Report"
+           :url "https://vimeo.com/1122021768"}
+          {:title "A Decade with DORA"
+           :url "https://vimeo.com/1002107791"}
+          {:title "The State of DevOps - Capabilities for Building High-performing Technology Teams"
+           :url "https://vimeo.com/779257276"}]}
+
+ {:name "Matthew McLarty"
+  :name-key "matthew mclarty"
+  :org "Boomi"
+  :talk-count 2
+  :history-url "https://videos.itrevolution.com/speakers/matthew-mclarty"
+  :talks [{:title "Optionality & The Science of Happy Accidents"
+           :url "https://vimeo.com/1002115865"}]}
+
+ {:name "Jondavid \"JD\" Black"
+  :since 2023
+  :years [2023]
+  :name-key "jondavid \"jd\" black"
+  :org "Northrop Grumman"
+  :talk-count 1
+  :history-url "https://videos.itrevolution.com/speakers/jondavid-jd-black"
+  :talks [{:title "Architecture-As-Code: DevOps for System Engineering"
+           :url "https://videos.itrevolution.com/watch/872732698"}]}
+
+ {:name "Fernando Cornago"
+  :since 2019
+  :years [2019 2020 2021 2022 2023 2024 2025]
+  :name-key "fernando cornago"
+  :org "adidas"
+  :talk-count 8
+  :history-url "https://videos.itrevolution.com/speakers/fernando-cornago"
+  :talks [{:title "Further Results of Our 500-Person GenAI and Developer Pilot" :url "https://vimeo.com/1061198586"}
+          {:title "Journey to Composability in Commerce: Boosting Efficiency and Innovation with GenAI at adidas" :url "https://vimeo.com/1002959409"}
+          {:title "adidas Capability Diamond" :url "https://vimeo.com/830906721"}
+          {:title "How Software Engineering Boosts the Next adidas Commerce Transformation" :url "https://vimeo.com/763825098"}
+          {:title "From 6-Eye Principle to Release at Scale – adidas Digital Tech 2021" :url "https://vimeo.com/550704056"}
+          {:title "DevOps Journey at adidas III: Exploring Data in the Cloud" :url "https://vimeo.com/431737448"}
+          {:title "Where Cloud Native Meets the Sporting Goods Industry" :url "https://vimeo.com/485159429"}
+          {:title "Adidas Digital Platform - Where Cloud Native Meets the Sporting Goods Industry" :url "https://vimeo.com/505538088"}]}
+
+ {:name "Mik Kersten"
+  :since 2018
+  :years [2018 2019 2020 2021 2022 2023 2024 2025]
+  :name-key "mik kersten"
+  :org "Planview"
+  :talk-count 9
+  :history-url "https://videos.itrevolution.com/speakers/mik-kersten"
+  :talks [{:title "Output to Outcome: An Operating Model for the Age of AI" :url "https://vimeo.com/1122480653"}
+          {:title "Decoupling from Foundational LLMs" :url "https://vimeo.com/941733504"}
+          {:title "Generative Value Streams: When Code is not a Constraint" :url "https://vimeo.com/827648936"}
+          {:title "Modularizing the Messy Matrix" :url "https://vimeo.com/762364230"}
+          {:title "Product Org Design: Flow Follows Form" :url "https://vimeo.com/708550206"}
+          {:title "DevOps & OKRs: From Micromanagement Misery to Finding Flow" :url "https://vimeo.com/623408808"}
+          {:title "OKRs & DevOps: From Micromanagement Misery to Finding Flow" :url "https://vimeo.com/550704601"}
+          {:title "The CIO Who Mistook Tech Debt for a Hat (and other Flow Diagnostics)" :url "https://vimeo.com/467489079"}
+          {:title "Project to Product - How Value Stream Networks Will Transform IT & Business" :url "https://vimeo.com/524021757"}]}
+
+ {:name "Elisabeth Hendrickson"
+  :since 2014
+  :years [2014 2015 2017 2020]
+  :name-key "elisabeth hendrickson"
+  :org "Curious Duck Digital Laboratory"
+  :talk-count 4
+  :history-url "https://videos.itrevolution.com/speakers/elisabeth-hendrickson"
+  :talks [{:title "Influence > Authority and Other Principles of Leadership"
+           :url "https://videos.itrevolution.com/watch/466912311"}
+          {:title "Data and DevOps: Breaking Down the Silos"
+           :url "https://videos.itrevolution.com/watch/524029942"}
+          {:title "Its All About Feedback"
+           :url "https://videos.itrevolution.com/watch/524439999"}
+          {:title "On the Care and Feeding of Feedback Cycles"
+           :url "https://videos.itrevolution.com/watch/524584582"}]}
+
+ ;; Topo :since is 2014 per GENE (operator override, 2026-08-11) — the corpus
+ ;; transcripts only reach back to ~2018; he has been on these stages since the
+ ;; first DevOps Enterprise Summit. :years below = transcribed talks only.
+ {:name "Tapabrata \"Topo\" Pal"
+  :since 2014
+  :years [2018 2022 2023 2025 2026]
+  :name-key "tapabrata \"topo\" pal"
+  :org "M&T Bank"
+  :talk-count 5
+  :history-url "https://videos.itrevolution.com/speakers/tapabrata-topo-pal"
+  :talks [{:title "Fireside Chat with Dr. Topo Pal" :url "https://vimeo.com/1183546399"}
+          {:title "From Concept to Prototype: Leveraging Generative AI for Rapid Development in an Enterprise" :url "https://vimeo.com/1121938969"}
+          {:title "DevOps @ Fidelity - Investing in Inner Source and Engineering Excellence" :url "https://vimeo.com/831894741"}
+          {:title "DevOps @ Fidelity - Investing in Inner Source and Engineering Excellence" :url "https://vimeo.com/762364409"}
+          {:title "Bank on Open Source for DevOps Success" :url "https://vimeo.com/524021208"}]}]

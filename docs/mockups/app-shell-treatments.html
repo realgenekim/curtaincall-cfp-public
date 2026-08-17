@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>App shell — three Warm Paper navigation variants</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:SOFT,WONK,opsz,wght@0..100,0..1,9..144,300..700&family=Source+Sans+3:ital,wght@0,300..700;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* ============================================================
+   Warm Paper is now the house language. This file varies ONLY
+   the navigation architecture — palette, type and the marker
+   stroke are constant across all three so the comparison is
+   about "where am I", not about taste.
+   ============================================================ */
+:root{
+  --paper:#FAF7F2;      --paper-deep:#F1EADD;   --paper-card:#FFFFFF;
+  --ink:#221E17;        --ink-2:#4E463A;        --muted:#857B6C;    --faint:#A79B88;
+  --rule:#E9E1D5;       --rule-2:#EFE8DC;
+  --marker:#FFF1B8;     --marker-edge:#F0D879;
+  --blue:#1E62A8;       --blue-d:#134B84;       --green:#1B7A4B;
+  --serif:"Fraunces",Georgia,serif;
+  --sans:"Source Sans 3",system-ui,-apple-system,sans-serif;
+}
+*{box-sizing:border-box}
+body{margin:0;background:#151412;font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace;color:#e8e4dc}
+
+/* ---- page chrome (neutral, same as the type study) ---- */
+.pagehead{padding:26px 28px 24px;border-bottom:1px solid #2c2a26}
+.pagehead h1{margin:0;font-size:14px;font-weight:500;color:#f2eee6}
+.pagehead p{margin:8px 0 0;font-size:12px;line-height:1.6;color:#8d877c;max-width:74ch}
+.pagehead .jump{margin:16px 0 0;display:flex;flex-wrap:wrap;gap:8px}
+.pagehead .jump a{font-size:11px;letter-spacing:.04em;color:#c9c2b5;text-decoration:none;border:1px solid #34312b;padding:5px 10px;border-radius:2px}
+.pagehead .jump a:hover{background:#22201c;color:#fff}
+.labelbar{position:sticky;top:0;z-index:9;display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;
+  padding:11px 28px;background:#151412;border-top:1px solid #2c2a26;border-bottom:1px solid #2c2a26}
+.labelbar .sw{width:9px;height:9px;border-radius:2px;background:var(--marker);align-self:center}
+.labelbar .lb-num{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#7e786d}
+.labelbar .lb-name{font-size:13px;font-weight:500;color:#f6f2ea}
+.labelbar .lb-desc{font-size:11.5px;color:#8d877c;line-height:1.5}
+
+/* ---- shared Warm Paper primitives ---- */
+.vw{background:var(--paper);color:var(--ink);font-family:var(--sans)}
+.vw a{color:var(--blue);text-decoration:none}
+.vw .mk{background-image:linear-gradient(180deg,rgba(255,241,184,0) 52%,var(--marker) 52%,var(--marker) 94%,rgba(255,241,184,0) 94%);
+  -webkit-box-decoration-break:clone;box-decoration-break:clone;padding:0 .12em}
+.vw .shell{display:flex;align-items:stretch;min-height:600px}
+.vw .main{flex:1;min-width:0;padding:30px 40px 52px}
+.vw .card{background:var(--paper-card);border:1px solid var(--rule);border-radius:12px;padding:28px 30px 30px;
+  box-shadow:0 1px 2px rgba(90,74,50,.04),0 12px 26px -20px rgba(90,74,50,.45)}
+.vw .card h2{margin:0;font-family:var(--serif);font-variation-settings:"SOFT" 60,"WONK" 1,"opsz" 60;
+  font-weight:600;font-size:27px;letter-spacing:-.01em;color:var(--ink)}
+.vw .card .sub{margin:9px 0 0;font-size:15px;line-height:1.6;color:var(--muted);max-width:60ch}
+.vw .toolbar{display:flex;gap:10px;margin:22px 0 20px;flex-wrap:wrap}
+.vw .btn{border:none;border-radius:999px;background:var(--green);color:#fff;font:600 14.5px/1 var(--sans);padding:11px 20px;cursor:pointer}
+.vw .btn:hover{background:#166540}
+.vw .btn:focus-visible{outline:none;box-shadow:0 0 0 4px var(--marker),0 0 0 5px var(--green)}
+.vw .btn.ghost{background:#fff;color:var(--ink-2);border:1px solid var(--rule)}
+.vw .btn.ghost:hover{border-color:#D8CDB9;color:var(--ink)}
+/* schedule skeleton — enough structure that proportions read honestly */
+.vw .sched{display:grid;grid-template-columns:66px repeat(3,1fr);gap:8px;margin-top:6px}
+.vw .rm{font-size:12px;letter-spacing:.09em;text-transform:uppercase;color:var(--faint);padding:0 0 4px 2px}
+.vw .hr{font-size:12.5px;color:var(--faint);padding-top:11px;font-variant-numeric:tabular-nums}
+.vw .blk{background:#FCFAF5;border:1px solid var(--rule);border-left:3px solid var(--marker-edge);border-radius:7px;padding:10px 11px;min-height:58px}
+.vw .blk b{display:block;font-size:13.5px;font-weight:600;color:var(--ink-2);line-height:1.35}
+.vw .blk span{font-size:12px;color:var(--faint)}
+.vw .blk.tbd{background:transparent;border:1px dashed #DFD5C4;border-left:1px dashed #DFD5C4;color:var(--faint);
+  display:flex;align-items:center;justify-content:center;font-size:12.5px;letter-spacing:.05em}
+/* speaker-portal state strip (shown under every variant) */
+.vw .ss{border-top:1px solid var(--rule);background:#F6F2EA;padding:20px 40px 26px}
+.vw .ss-lab{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);margin-bottom:14px}
+.vw .ss-bar{background:var(--paper);border:1px solid var(--rule);border-radius:10px;padding:18px 22px;
+  display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap}
+.vw .ss-ev{font-family:var(--serif);font-variation-settings:"SOFT" 60,"WONK" 1,"opsz" 40;font-weight:600;font-size:19px;color:var(--ink)}
+.vw .ss-ev small{display:block;font-family:var(--sans);font-variation-settings:normal;font-weight:400;font-size:12.5px;color:var(--faint);margin-top:3px;letter-spacing:.01em}
+.vw .ss-links{display:flex;align-items:baseline;gap:4px;font-size:14.5px}
+.vw .ss-links a{padding:4px 8px;border-radius:5px;color:var(--ink-2)}
+.vw .ss-links a:hover{color:var(--ink);background:#F1EADE}
+.vw .ss-links .dot{color:var(--faint);font-size:12px}
+.vw .ss-links a:focus-visible{outline:none;box-shadow:0 0 0 3px var(--marker)}
+
+/* ============================================================
+   VARIANT 1 — PAPER EDGE
+   full-height cream column, quiet ink links, active = marker stroke
+   ============================================================ */
+.v1 .rail{width:246px;flex:none;background:var(--paper-deep);border-right:1px solid #E5DCCB;padding:26px 20px 24px;
+  display:flex;flex-direction:column}
+.v1 .allev{font-size:13px;color:var(--muted);display:inline-block;margin-bottom:16px}
+.v1 .allev:hover{color:var(--ink)}
+.v1 .ev-name{font-family:var(--serif);font-variation-settings:"SOFT" 60,"WONK" 1,"opsz" 40;font-weight:600;
+  font-size:19px;line-height:1.25;color:var(--ink)}
+.v1 .ev-dates{font-size:12.5px;color:var(--faint);margin-top:5px}
+.v1 .nav{margin-top:22px;padding-top:18px;border-top:1px solid #E5DCCB;display:flex;flex-direction:column;align-items:flex-start;gap:1px}
+.v1 .nav a{font-size:15.5px;color:var(--ink-2);padding:7px 3px;border-radius:5px}
+.v1 .nav a:hover{color:var(--ink)}
+.v1 .nav a:focus-visible{outline:none;box-shadow:0 0 0 3px var(--marker)}
+.v1 .nav a.on{color:var(--ink);font-weight:600}
+.v1 .whoami{margin-top:auto;padding-top:22px;border-top:1px solid #E5DCCB;font-size:12.5px;color:var(--faint);line-height:1.7}
+.v1 .whoami strong{color:var(--ink-2);font-weight:600}
+.v1 .whoami a{display:inline-block;margin-top:4px;font-size:12.5px;color:var(--muted);border-bottom:1px solid #DFD5C4}
+.v1 .whoami a:hover{color:var(--ink);border-bottom-color:var(--ink)}
+.v1 .crumbs{font-size:13px;color:var(--muted);margin-bottom:22px;line-height:1.7}
+.v1 .crumbs a{color:var(--muted);border-bottom:1px solid transparent}
+.v1 .crumbs a:hover{color:var(--ink);border-bottom-color:#D8CDB9}
+.v1 .crumbs a:focus-visible{outline:none;box-shadow:0 0 0 3px var(--marker);border-radius:3px}
+.v1 .crumbs .sep{color:var(--faint);padding:0 7px}
+.v1 .crumbs .here{color:var(--ink);font-weight:600}
+
+/* ============================================================
+   VARIANT 2 — LEFT RAIL, MARKER SPINE
+   narrower rail on the same paper; active = a painted yellow spine
+   ============================================================ */
+.v2 .rail{width:206px;flex:none;border-right:1px solid var(--rule);padding:28px 16px 24px 26px;display:flex;flex-direction:column}
+.v2 .ev-name{font-family:var(--serif);font-variation-settings:"SOFT" 60,"WONK" 1,"opsz" 36;font-weight:600;
+  font-size:18px;line-height:1.22;color:var(--ink);letter-spacing:-.005em}
+.v2 .ev-dates{font-size:12px;color:var(--faint);margin-top:6px;line-height:1.5}
+.v2 .allev{display:inline-block;margin-top:12px;font-size:12.5px;color:var(--muted)}
+.v2 .allev:hover{color:var(--ink)}
+.v2 .nav{margin-top:26px;display:flex;flex-direction:column;gap:0}
+.v2 .nav a{position:relative;font-size:15px;color:var(--ink-2);padding:9px 10px 9px 15px;border-radius:0 6px 6px 0}
+.v2 .nav a:hover{color:var(--ink);background:#F5F0E7}
+.v2 .nav a:focus-visible{outline:none;box-shadow:0 0 0 3px var(--marker)}
+.v2 .nav a.on{color:var(--ink);font-weight:700}
+/* the spine: two stacked bars, slightly offset + rotated, so it reads drawn-by-hand */
+.v2 .nav a.on::before{content:"";position:absolute;left:0;top:2px;bottom:2px;width:3px;background:#E8BE3E;border-radius:3px;transform:rotate(.6deg)}
+.v2 .nav a.on::after{content:"";position:absolute;left:1.5px;top:6px;bottom:7px;width:3px;background:var(--marker);border-radius:3px;transform:rotate(-.9deg)}
+.v2 .whoami{margin-top:auto;padding-top:20px;font-size:12.5px;color:var(--faint);line-height:1.7}
+.v2 .whoami strong{color:var(--ink-2);font-weight:600}
+.v2 .whoami a{color:var(--muted);border-bottom:1px solid #DFD5C4}
+.v2 .whoami a:hover{color:var(--ink)}
+.v2 .main{padding-top:34px}
+.v2 .trail{font-size:12.5px;color:var(--faint);letter-spacing:.02em;margin-bottom:8px}
+.v2 .trail a{color:var(--muted)}
+.v2 .trail a:hover{color:var(--ink);border-bottom:1px solid #D8CDB9}
+.v2 .trail a:focus-visible{outline:none;box-shadow:0 0 0 3px var(--marker);border-radius:3px}
+.v2 .trail .sep{padding:0 6px;color:#C6BAA6}
+.v2 .page-h1{margin:0 0 6px;font-family:var(--serif);font-variation-settings:"SOFT" 60,"WONK" 1,"opsz" 96;
+  font-weight:600;font-size:40px;line-height:1.1;letter-spacing:-.015em;color:var(--ink)}
+.v2 .page-sub{margin:0 0 26px;font-size:15.5px;color:var(--muted);max-width:62ch;line-height:1.6}
+.v2 .card h2{font-size:20px}
+
+/* ============================================================
+   VARIANT 3 — NO SIDEBAR (BASECAMP PURIST)
+   centered column; the highlighted event name IS the breadcrumb root
+   ============================================================ */
+.v3 .shell{display:block;min-height:0}
+.v3 .top{border-bottom:1px solid var(--rule);padding:30px 28px 0}
+.v3 .col{max-width:940px;margin:0 auto}
+.v3 .up{font-size:13px;color:var(--muted);margin-bottom:12px}
+.v3 .up a{color:var(--muted);border-bottom:1px solid transparent}
+.v3 .up a:hover{color:var(--ink);border-bottom-color:#D8CDB9}
+.v3 .up a:focus-visible{outline:none;box-shadow:0 0 0 3px var(--marker);border-radius:3px}
+.v3 .ev-name{font-family:var(--serif);font-variation-settings:"SOFT" 60,"WONK" 1,"opsz" 96;font-weight:600;
+  font-size:clamp(26px,3vw,34px);line-height:1.2;letter-spacing:-.012em;color:var(--ink);margin:0}
+.v3 .ev-dates{font-size:13.5px;color:var(--faint);margin-top:9px}
+.v3 .tabs{display:flex;flex-wrap:wrap;gap:2px;margin-top:20px}
+.v3 .tabs a{font-size:15px;color:var(--ink-2);padding:9px 11px 14px;border-radius:5px 5px 0 0}
+.v3 .tabs a:hover{color:var(--ink);background:#F3EEE5}
+.v3 .tabs a:focus-visible{outline:none;box-shadow:0 0 0 3px var(--marker)}
+.v3 .tabs a.on{color:var(--ink);font-weight:600}
+.v3 .main{padding:32px 28px 54px}
+.v3 .whoami{max-width:940px;margin:18px auto 0;font-size:12.5px;color:var(--faint);text-align:right}
+.v3 .whoami strong{color:var(--ink-2);font-weight:600}
+.v3 .whoami a{color:var(--muted);border-bottom:1px solid #DFD5C4;margin-left:8px}
+.v3 .whoami a:hover{color:var(--ink)}
+.v3 .ss{padding-left:28px;padding-right:28px}
+.v3 .ss-inner{max-width:940px;margin:0 auto}
+
+@media (max-width:820px){
+  .vw .shell{display:block}
+  .v1 .rail,.v2 .rail{width:auto;border-right:none;border-bottom:1px solid var(--rule)}
+  .v1 .nav,.v2 .nav{flex-direction:row;flex-wrap:wrap;gap:6px}
+  .vw .main{padding:24px 20px 40px}
+  .vw .ss{padding-left:20px;padding-right:20px}
+  .vw .sched{grid-template-columns:52px 1fr}
+  .vw .rm:nth-child(n+3){display:none}
+}
+</style>
+</head>
+<body>
+
+<header class="pagehead">
+  <h1>App shell in Warm Paper — three navigation variants</h1>
+  <p>Same treatment Gene picked, same page (Schedule, inside Enterprise AI Summit), three answers to "where am I". Nav labels are the real ones from views.clj. Every link is a real anchor — hover and tab through them; the focus ring is the marker yellow in all three. Each variant ends with the speaker-portal header, which is the same shell stripped to three links.</p>
+  <nav class="jump">
+    <a href="#v1">01 Paper edge</a>
+    <a href="#v2">02 Marker spine</a>
+    <a href="#v3">03 No sidebar</a>
+  </nav>
+</header>
+
+<!-- ============================ VARIANT 1 ============================ -->
+<section class="vw v1" id="v1">
+  <div class="labelbar">
+    <span class="sw"></span>
+    <span class="lb-num">Variant 1</span>
+    <span class="lb-name">Paper edge</span>
+    <span class="lb-desc">A slightly deeper cream column with a hairline edge. The active page is a highlighted word, not a filled tab. Breadcrumbs ride above the content.</span>
+  </div>
+
+  <div class="shell">
+    <aside class="rail">
+      <a class="allev" href="#v1">← All events</a>
+      <div class="ev-name">Enterprise AI Summit</div>
+      <div class="ev-dates">Oct 7–8, 2026 · Charlotte, NC</div>
+      <nav class="nav">
+        <a href="#v1">Dashboard</a>
+        <a href="#v1">Submissions</a>
+        <a href="#v1">Review Board</a>
+        <a href="#v1">Committee</a>
+        <a href="#v1">Form</a>
+        <a class="on" href="#v1"><span class="mk">Schedule</span></a>
+        <a href="#v1">Inform Speakers</a>
+        <a href="#v1">Comms</a>
+        <a href="#v1">Log</a>
+        <a href="#v1">Settings</a>
+      </nav>
+      <div class="whoami">signed in as <strong>Gene Kim</strong><br><a href="#v1">Log out</a></div>
+    </aside>
+
+    <main class="main">
+      <div class="crumbs">
+        <a href="#v1">Events</a><span class="sep">›</span><a href="#v1">Enterprise AI Summit — Oct 7–8, 2026</a><span class="sep">›</span><span class="here">Schedule</span>
+      </div>
+      <div class="card">
+        <h2>Schedule</h2>
+        <p class="sub">Two days, three rooms, 31 accepted talks. Unassigned rooms and TBD blocks are fine — the sheet is a draft until you lock it.</p>
+        <div class="toolbar">
+          <button class="btn" type="button">Add a block</button>
+          <button class="btn ghost" type="button">Unscheduled (9)</button>
+          <button class="btn ghost" type="button">Lock day one</button>
+        </div>
+        <div class="sched">
+          <div></div><div class="rm">Ballroom A</div><div class="rm">Studio B</div><div class="rm">Workshop C</div>
+          <div class="hr">09:30</div>
+          <div class="blk"><b>Opening keynote</b><span>Gene Kim · 45m</span></div>
+          <div class="blk tbd">TBD</div>
+          <div class="blk"><b>Evals from scratch</b><span>A. Ferreira · 90m</span></div>
+          <div class="hr">11:00</div>
+          <div class="blk"><b>The agent that paged us</b><span>R. Okafor · 30m</span></div>
+          <div class="blk"><b>Cost per resolved ticket</b><span>M. Lindqvist · 30m</span></div>
+          <div class="blk tbd">unassigned</div>
+          <div class="hr">13:15</div>
+          <div class="blk tbd">TBD</div>
+          <div class="blk"><b>Retrieval, honestly</b><span>D. Suzuki · 45m</span></div>
+          <div class="blk tbd">TBD</div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <div class="ss">
+    <div class="ss-lab">Speaker portal — same shell, three links, no rail</div>
+    <div class="ss-bar">
+      <div class="ss-ev">Enterprise AI Summit<small>Oct 7–8, 2026 · Charlotte, NC</small></div>
+      <div class="ss-links">
+        <a href="#v1"><span class="mk">Your submissions</span></a><span class="dot">·</span><a href="#v1">Profile</a><span class="dot">·</span><a href="#v1">Log out</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ VARIANT 2 ============================ -->
+<section class="vw v2" id="v2">
+  <div class="labelbar">
+    <span class="sw"></span>
+    <span class="lb-num">Variant 2</span>
+    <span class="lb-name">Left rail, marker spine</span>
+    <span class="lb-desc">Narrower rail on plain paper. The active page gets a hand-drawn yellow spine. Breadcrumb collapses into the content header, under a big Fraunces page title.</span>
+  </div>
+
+  <div class="shell">
+    <aside class="rail">
+      <div class="ev-name">Enterprise AI Summit</div>
+      <div class="ev-dates">Oct 7–8, 2026<br>Charlotte, NC</div>
+      <a class="allev" href="#v2">← All events</a>
+      <nav class="nav">
+        <a href="#v2">Dashboard</a>
+        <a href="#v2">Submissions</a>
+        <a href="#v2">Review Board</a>
+        <a href="#v2">Committee</a>
+        <a href="#v2">Form</a>
+        <a class="on" href="#v2">Schedule</a>
+        <a href="#v2">Inform Speakers</a>
+        <a href="#v2">Comms</a>
+        <a href="#v2">Log</a>
+        <a href="#v2">Settings</a>
+      </nav>
+      <div class="whoami">signed in as <strong>Gene Kim</strong><br><a href="#v2">Log out</a></div>
+    </aside>
+
+    <main class="main">
+      <div class="trail"><a href="#v2">Events</a><span class="sep">›</span><a href="#v2">Enterprise AI Summit — Oct 7–8, 2026</a></div>
+      <h1 class="page-h1">Schedule</h1>
+      <p class="page-sub">Two days, three rooms, 31 accepted talks. Unassigned rooms and TBD blocks are fine — the sheet is a draft until you lock it.</p>
+      <div class="card">
+        <h2>Day one — Wednesday, Oct 7</h2>
+        <div class="toolbar">
+          <button class="btn" type="button">Add a block</button>
+          <button class="btn ghost" type="button">Unscheduled (9)</button>
+          <button class="btn ghost" type="button">Lock day one</button>
+        </div>
+        <div class="sched">
+          <div></div><div class="rm">Ballroom A</div><div class="rm">Studio B</div><div class="rm">Workshop C</div>
+          <div class="hr">09:30</div>
+          <div class="blk"><b>Opening keynote</b><span>Gene Kim · 45m</span></div>
+          <div class="blk tbd">TBD</div>
+          <div class="blk"><b>Evals from scratch</b><span>A. Ferreira · 90m</span></div>
+          <div class="hr">11:00</div>
+          <div class="blk"><b>The agent that paged us</b><span>R. Okafor · 30m</span></div>
+          <div class="blk"><b>Cost per resolved ticket</b><span>M. Lindqvist · 30m</span></div>
+          <div class="blk tbd">unassigned</div>
+          <div class="hr">13:15</div>
+          <div class="blk tbd">TBD</div>
+          <div class="blk"><b>Retrieval, honestly</b><span>D. Suzuki · 45m</span></div>
+          <div class="blk tbd">TBD</div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <div class="ss">
+    <div class="ss-lab">Speaker portal — same shell, three links, no rail</div>
+    <div class="ss-bar">
+      <div class="ss-ev">Enterprise AI Summit<small>Oct 7–8, 2026 · Charlotte, NC</small></div>
+      <div class="ss-links">
+        <a href="#v2"><span class="mk">Your submissions</span></a><span class="dot">·</span><a href="#v2">Profile</a><span class="dot">·</span><a href="#v2">Log out</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ VARIANT 3 ============================ -->
+<section class="vw v3" id="v3">
+  <div class="labelbar">
+    <span class="sw"></span>
+    <span class="lb-num">Variant 3</span>
+    <span class="lb-name">No sidebar — Basecamp purist</span>
+    <span class="lb-desc">No rail at all. The highlighted event name is the breadcrumb root and the page links sit under it in one quiet row. Everything is one centered column.</span>
+  </div>
+
+  <div class="shell">
+    <div class="top">
+      <div class="col">
+        <div class="up"><a href="#v3">← Events</a></div>
+        <h1 class="ev-name"><span class="mk">Enterprise AI Summit</span></h1>
+        <div class="ev-dates">Oct 7–8, 2026 · Charlotte, NC · cfp.itrevolution.com/enterprise-ai-summit</div>
+        <nav class="tabs">
+          <a href="#v3">Dashboard</a>
+          <a href="#v3">Submissions</a>
+          <a href="#v3">Review Board</a>
+          <a href="#v3">Committee</a>
+          <a href="#v3">Form</a>
+          <a class="on" href="#v3"><span class="mk">Schedule</span></a>
+          <a href="#v3">Inform Speakers</a>
+          <a href="#v3">Comms</a>
+          <a href="#v3">Log</a>
+          <a href="#v3">Settings</a>
+        </nav>
+      </div>
+    </div>
+
+    <main class="main">
+      <div class="col">
+        <div class="card">
+          <h2>Schedule</h2>
+          <p class="sub">Two days, three rooms, 31 accepted talks. Unassigned rooms and TBD blocks are fine — the sheet is a draft until you lock it.</p>
+          <div class="toolbar">
+            <button class="btn" type="button">Add a block</button>
+            <button class="btn ghost" type="button">Unscheduled (9)</button>
+            <button class="btn ghost" type="button">Lock day one</button>
+          </div>
+          <div class="sched">
+            <div></div><div class="rm">Ballroom A</div><div class="rm">Studio B</div><div class="rm">Workshop C</div>
+            <div class="hr">09:30</div>
+            <div class="blk"><b>Opening keynote</b><span>Gene Kim · 45m</span></div>
+            <div class="blk tbd">TBD</div>
+            <div class="blk"><b>Evals from scratch</b><span>A. Ferreira · 90m</span></div>
+            <div class="hr">11:00</div>
+            <div class="blk"><b>The agent that paged us</b><span>R. Okafor · 30m</span></div>
+            <div class="blk"><b>Cost per resolved ticket</b><span>M. Lindqvist · 30m</span></div>
+            <div class="blk tbd">unassigned</div>
+            <div class="hr">13:15</div>
+            <div class="blk tbd">TBD</div>
+            <div class="blk"><b>Retrieval, honestly</b><span>D. Suzuki · 45m</span></div>
+            <div class="blk tbd">TBD</div>
+          </div>
+        </div>
+      </div>
+      <div class="whoami">signed in as <strong>Gene Kim</strong><a href="#v3">Log out</a></div>
+    </main>
+  </div>
+
+  <div class="ss">
+    <div class="ss-inner">
+      <div class="ss-lab">Speaker portal — the same page, one link fewer</div>
+      <div class="ss-bar">
+        <div class="ss-ev">Enterprise AI Summit<small>Oct 7–8, 2026 · Charlotte, NC</small></div>
+        <div class="ss-links">
+          <a href="#v3"><span class="mk">Your submissions</span></a><span class="dot">·</span><a href="#v3">Profile</a><span class="dot">·</span><a href="#v3">Log out</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail() {
+  printf 'dev-lane: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  dev-lane prepare REPO WORKTREE BASE_SHA
+  dev-lane publish WORKTREE ALLOWED_PATHS_FILE INBOX JOB_ID PRIORITY BEAD MODEL EFFORT
+  dev-lane recover INBOX JOB_ID
+EOF
+  exit 64
+}
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+canonical_path() {
+  local path=$1 part
+  [[ -n "$path" && "$path" != /* && "$path" != *\\* ]] || return 1
+  IFS=/ read -r -a parts <<<"$path"
+  for part in "${parts[@]}"; do
+    [[ -n "$part" && "$part" != . && "$part" != .. ]] || return 1
+  done
+}
+
+changed_paths() {
+  local worktree=$1 status first second
+  while IFS= read -r -d '' status; do
+    IFS= read -r -d '' first || fail "truncated Git path inventory"
+    [[ "$first" != *$'\n'* && "$first" != *$'\r'* && "$first" != *$'\t'* ]] ||
+      fail "Git paths with control characters are unsupported"
+    second=""
+    case "$status" in
+      R*|C*)
+        IFS= read -r -d '' second || fail "truncated Git rename/copy inventory"
+        [[ "$second" != *$'\n'* && "$second" != *$'\r'* && "$second" != *$'\t'* ]] ||
+          fail "Git paths with control characters are unsupported"
+        ;;
+    esac
+    case "$status" in
+      R*|C*) printf '%s\n%s\n' "$first" "$second" ;;
+      *) printf '%s\n' "$first" ;;
+    esac
+  done < <(git -C "$worktree" diff --name-status -z --find-renames --find-copies HEAD --)
+}
+
+prepare() {
+  [[ $# -eq 3 ]] || usage
+  local repo=$1 worktree=$2 requested=$3 base marker
+  [[ -d "$repo/.git" || -f "$repo/.git" ]] || fail "not a Git worktree: $repo"
+  [[ ! -e "$worktree" ]] || fail "worktree already exists: $worktree"
+  base=$(git -C "$repo" rev-parse --verify "$requested^{commit}") ||
+    fail "base is not a commit: $requested"
+  mkdir -p "$(dirname "$worktree")"
+  git -C "$repo" worktree add --detach "$worktree" "$base" >/dev/null
+  marker=$(git -C "$worktree" rev-parse --path-format=absolute --git-path dev-lane-base)
+  printf '%s\n' "$base" >"$marker"
+  chmod 0444 "$marker"
+  jq -n --arg schema dev-lane-prepare.v1 --arg state ready \
+    --arg base_sha "$base" --arg worktree "$worktree" \
+    '{schema:$schema,state:$state,base_sha:$base_sha,worktree:$worktree}'
+}
+
+publish() (
+  [[ $# -eq 8 ]] || usage
+  local worktree=$1 allow_file=$2 inbox=$3 job=$4 priority=$5 bead=$6 model=$7 effort=$8
+  local base marker changed allowed unexpected patch_tmp patch_final job_tmp job_final patch_sha changed_json
+  local claim published=false
+
+  [[ "$job" =~ ^[A-Za-z0-9._-]+$ ]] || fail "invalid job id: $job"
+  [[ "$priority" =~ ^P[0-4]$ ]] || fail "priority must be P0 through P4"
+  [[ "$bead" =~ ^sessionize-sched-killer-[A-Za-z0-9._-]+$ ]] || fail "invalid bead id"
+  [[ "$model" =~ ^[A-Za-z0-9._-]+$ ]] || fail "invalid producer model"
+  [[ "$effort" =~ ^(minimal|low|medium|high|xhigh)$ ]] || fail "invalid reasoning effort"
+  [[ -f "$allow_file" ]] || fail "allowed-path file is missing: $allow_file"
+  [[ -d "$worktree" ]] || fail "worktree is missing: $worktree"
+  marker=$(git -C "$worktree" rev-parse --path-format=absolute --git-path dev-lane-base)
+  [[ -f "$marker" ]] || fail "prepared-base marker is missing"
+  base=$(tr -d '\r\n' <"$marker")
+  [[ "$base" =~ ^[0-9a-f]{40}$ ]] || fail "prepared-base marker is invalid"
+  [[ "$(git -C "$worktree" rev-parse HEAD)" == "$base" ]] ||
+    fail "HEAD moved from prepared base; developer commits are not allowed"
+
+  mkdir -p "$inbox"
+  claim="$inbox/.claim-$job"
+  mkdir "$claim" 2>/dev/null || fail "job is already claimed or published: $job"
+  patch_final="$inbox/$job.patch"
+  job_final="$inbox/$job.job"
+  [[ ! -e "$patch_final" && ! -e "$job_final" ]] || fail "job already published: $job"
+
+  changed=$(mktemp)
+  allowed=$(mktemp)
+  unexpected=$(mktemp)
+  patch_tmp="$claim/$job.patch"
+  job_tmp="$claim/$job.job"
+  # Invoked by the EXIT trap below.
+  # shellcheck disable=SC2317
+  cleanup_publish() {
+    rm -f "$changed" "$allowed" "$unexpected"
+    if [[ "$published" != true ]]; then
+      if [[ ! -e "$job_final" && -f "$patch_final" && -f "$patch_tmp" ]] &&
+         cmp -s "$patch_final" "$patch_tmp"; then
+        rm -f "$patch_final"
+      fi
+      rm -rf "$claim"
+    fi
+  }
+  trap cleanup_publish EXIT
+  trap 'exit 130' HUP INT TERM
+
+  git -C "$worktree" add -N -- .
+  changed_paths "$worktree" | LC_ALL=C sort -u >"$changed"
+  [[ -s "$changed" ]] || fail "worktree has no changes"
+
+  while IFS= read -r path || [[ -n "$path" ]]; do
+    canonical_path "$path" || fail "non-canonical allowed path: $path"
+    printf '%s\n' "$path"
+  done <"$allow_file" | LC_ALL=C sort -u >"$allowed"
+  [[ -s "$allowed" ]] || fail "allowed-path file is empty"
+
+  comm -23 "$changed" "$allowed" >"$unexpected"
+  [[ ! -s "$unexpected" ]] ||
+    fail "changed paths escape the lane: $(paste -sd, "$unexpected")"
+
+  git -C "$worktree" diff --binary --full-index HEAD -- >"$patch_tmp"
+  [[ -s "$patch_tmp" ]] || fail "generated patch is empty"
+  patch_sha=$(sha256_file "$patch_tmp")
+  changed_json=$(jq -R -s 'split("\n") | map(select(length > 0))' <"$changed")
+
+  {
+    printf 'job: %s\n' "$job"
+    printf 'job_schema: dev-lane-job.v1\n'
+    printf 'priority: %s\n' "$priority"
+    printf 'bead: %s\n' "$bead"
+    printf 'base_sha: %s\n' "$base"
+    while IFS= read -r path; do
+      printf 'changed_path: %s\n' "$path"
+    done <"$changed"
+    printf 'verify: exact dev-lane path gate; merger full suite\n'
+    printf 'producer_model: %s\n' "$model"
+    printf 'producer_reasoning_effort: %s\n' "$effort"
+    printf 'patch_sha256: %s\n' "$patch_sha"
+  } >"$job_tmp"
+
+  chmod 0644 "$patch_tmp" "$job_tmp"
+  ln "$patch_tmp" "$patch_final"
+  [[ "${DEV_LANE_FAIL_AFTER_PATCH:-no}" != yes ]] || fail "injected failure after patch publication"
+  ln "$job_tmp" "$job_final"
+  jq -n --arg schema dev-lane-publish.v1 --arg state published \
+    --arg job "$job" --arg base_sha "$base" --arg patch_sha256 "$patch_sha" \
+    --argjson changed_paths "$changed_json" \
+    '{schema:$schema,state:$state,job:$job,base_sha:$base_sha,
+      patch_sha256:$patch_sha256,changed_paths:$changed_paths}' |
+    tee "$claim/receipt.json"
+  chmod 0644 "$claim/receipt.json"
+  published=true
+)
+
+recover() {
+  [[ $# -eq 2 ]] || usage
+  local inbox=$1 job=$2 claim patch job_file
+  [[ "$job" =~ ^[A-Za-z0-9._-]+$ ]] || fail "invalid job id: $job"
+  claim="$inbox/.claim-$job"
+  patch="$inbox/$job.patch"
+  job_file="$inbox/$job.job"
+  [[ -d "$claim" ]] || fail "no claim exists for: $job"
+  [[ ! -e "$job_file" ]] || fail "published job cannot be recovered: $job"
+  if [[ -f "$patch" && -f "$claim/$job.patch" ]]; then
+    cmp -s "$patch" "$claim/$job.patch" || fail "orphan patch differs from claimed bytes"
+    rm -f "$patch"
+  fi
+  rm -rf "$claim"
+  jq -n --arg schema dev-lane-recover.v1 --arg state recovered --arg job "$job" \
+    '{schema:$schema,state:$state,job:$job}'
+}
+
+case "${1:-}" in
+  prepare) shift; prepare "$@" ;;
+  publish) shift; publish "$@" ;;
+  recover) shift; recover "$@" ;;
+  *) usage ;;
+esac

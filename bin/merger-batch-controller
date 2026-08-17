@@ -1,0 +1,1394 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Deterministic control plane for the anvil merge queue. The model is never the
+# poller, log reader, test runner, or deployment waiter. A bounded reasoner hook
+# is called only for repeat conflicts or a red batch.
+
+COMMAND=${1:-status}
+INBOX=${MERGER_INBOX:-/tmp/merge-inbox}
+STATE=${MERGER_STATE_DIR:-/home/merger/.local/state/curtaincall-merger}
+REPO_URL=${MERGER_REPO_URL:-https://github.com/realgenekim/curtaincall-cfp.git}
+BRANCH=${MERGER_BRANCH:-staging}
+BATCH_SIZE=${MERGER_BATCH_SIZE:-10}
+POLL_SECONDS=${MERGER_POLL_SECONDS:-30}
+COMPILE_COMMAND=${MERGER_COMPILE_COMMAND:-make compile-check}
+TEST_COMMAND=${MERGER_TEST_COMMAND:-make runtests-once}
+REASONER=${MERGER_REASONER:-}
+PUSH_ENABLED=${MERGER_PUSH_ENABLED:-no}
+DEPLOY_REPO=${MERGER_DEPLOY_REPO:-realgenekim/curtaincall-cfp}
+DEPLOY_WORKFLOW=${MERGER_DEPLOY_WORKFLOW:-build-and-deploy.yml}
+DEPLOY_TIMEOUT=${MERGER_DEPLOY_TIMEOUT_SECONDS:-1200}
+DEPLOY_POLL_SECONDS=${MERGER_DEPLOY_POLL_SECONDS:-15}
+KENTBECK_QUEUE=${MERGER_KENTBECK_QUEUE:-$INBOX/kentbeck-queue}
+POISON_ROOT=${MERGER_POISON_ROOT:-$INBOX/poison}
+INTEGRATED_ROOT=${MERGER_INTEGRATED_ROOT:-$STATE/integrated}
+STAGING_MIRROR=${MERGER_STAGING_MIRROR:-/tmp/curtaincall-staging.git}
+
+log() {
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2
+}
+
+fail() {
+  log "ERROR $*"
+  exit 1
+}
+
+record_cycle_failure() {
+  local batch_dir=$1 batch_id=$2 step=$3 command=$4 output=$5 rc=$6
+  local receipt tail_text
+  [[ -n "$batch_dir" && -d "$batch_dir" ]] || {
+    log "cycle-failure batch=${batch_id:-unknown} step=$step rc=$rc command=$command"
+    return 0
+  }
+  receipt="$batch_dir/failure.json"
+  tail_text=$(tail -120 "$output" 2>/dev/null || true)
+  jq -n \
+    --arg schema merger-controller-failure.v1 \
+    --arg batch_id "${batch_id:-unknown}" \
+    --arg step "$step" --arg command "$command" \
+    --arg output "${output:-}" --arg stderr_tail "$tail_text" \
+    --arg observed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --argjson rc "$rc" \
+    '{schema:$schema,batch_id:$batch_id,step:$step,command:$command,rc:$rc,
+      output:$output,stderr_tail:$stderr_tail,observed_at:$observed_at}' >"$receipt" 2>/dev/null || true
+  log "cycle-failure batch=${batch_id:-unknown} step=$step rc=$rc command=$command output=${output:-none} receipt=$receipt"
+}
+
+require_tools() {
+  local tool
+  for tool in git jq; do
+    command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"
+  done
+}
+
+mtime() {
+  if stat -c %Y "$1" >/dev/null 2>&1; then
+    stat -c %Y "$1"
+  else
+    stat -f %m "$1"
+  fi
+}
+
+priority_number() {
+  local job=$1 raw
+  raw=$(awk -F: '/^priority:[[:space:]]*/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$job")
+  case "$raw" in
+    P[0-4]|p[0-4]) printf '%s\n' "${raw:1}" ;;
+    [0-4]) printf '%s\n' "$raw" ;;
+    *) printf '9\n' ;;
+  esac
+}
+
+job_value() {
+  local job=$1 key=$2
+  awk -F: -v key="$key" '
+    $1 == key {
+      sub(/^[^:]*:[[:space:]]*/, "")
+      sub(/[[:space:]]+$/, "")
+      print
+      exit
+    }
+  ' "$job"
+}
+
+job_value_any() {
+  local job=$1 key value
+  shift
+  for key in "$@"; do
+    value=$(job_value "$job" "$key")
+    if [[ -n "$value" ]]; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+  done
+  return 0
+}
+
+job_values() {
+  local job=$1 key=$2
+  awk -F: -v key="$key" '
+    $1 == key {
+      sub(/^[^:]*:[[:space:]]*/, "")
+      sub(/[[:space:]]+$/, "")
+      print
+    }
+  ' "$job"
+}
+
+git_changed_paths() {
+  local repo=$1 base=$2 status first second
+  while IFS= read -r -d '' status; do
+    IFS= read -r -d '' first || return 1
+    [[ "$first" != *$'\n'* && "$first" != *$'\r'* && "$first" != *$'\t'* ]] || return 1
+    second=''
+    case "$status" in
+      R*|C*)
+        IFS= read -r -d '' second || return 1
+        [[ "$second" != *$'\n'* && "$second" != *$'\r'* && "$second" != *$'\t'* ]] || return 1
+        ;;
+    esac
+    case "$status" in
+      R*|C*) printf '%s\n%s\n' "$first" "$second" ;;
+      *) printf '%s\n' "$first" ;;
+    esac
+  done < <(git -C "$repo" diff --cached --name-status -z --find-renames --find-copies "$base" --)
+}
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+path_uid() {
+  if stat -c %u "$1" >/dev/null 2>&1; then
+    stat -c %u "$1"
+  else
+    stat -f %u "$1"
+  fi
+}
+
+path_mode() {
+  if stat -c %a "$1" >/dev/null 2>&1; then
+    stat -c %a "$1"
+  else
+    stat -f %Lp "$1"
+  fi
+}
+
+trusted_approval_path() {
+  local approval=$1 parent uid mode euid
+  [[ -f "$approval" ]] || return 1
+  parent=${approval%/*}
+  euid=$(id -u)
+  for path in "$parent" "$approval"; do
+    uid=$(path_uid "$path") || return 1
+    mode=$(path_mode "$path") || return 1
+    [[ "$uid" == 0 || "$uid" == "$euid" ]] || return 1
+    (( (8#$mode & 0022) == 0 )) || return 1
+  done
+}
+
+core_path() {
+  case "$1" in
+    src/cfp_scheduler_killer/core.clj|\
+    src/cfp_scheduler_killer/server.clj|\
+    src/cfp_scheduler_killer/middleware.clj|\
+    src/cfp_scheduler_killer/sse.clj|\
+    src/cfp_scheduler_killer/ds.clj|\
+    src/cfp_scheduler_killer/store.clj|\
+    src/cfp_scheduler_killer/store_pg.clj|\
+    src/cfp_scheduler_killer/db.clj|\
+    src/cfp_scheduler_killer/folds.clj|\
+    src/cfp_scheduler_killer/events.clj|\
+    src/cfp_scheduler_killer/replay.clj|\
+    src/cfp_scheduler_killer/auth.clj|\
+    src/cfp_scheduler_killer/auth_google.clj|\
+    src/cfp_scheduler_killer/secrets.clj|\
+    src/cfp_scheduler_killer/sinks.clj|\
+    src/cfp_scheduler_killer/forms.clj|\
+    src/cfp_scheduler_killer/live_validation.clj|\
+    src/cfp_scheduler_killer/handlers/*|\
+    src/cfp_scheduler_killer/domain/*|\
+    src/cfp_scheduler_killer/views/shell.clj|\
+    src/cfp_scheduler_killer/views/organizer_layout.clj|\
+    src/cfp_scheduler_killer/views/form_builder.clj|\
+    src/cfp_scheduler_killer/views/form_controls.clj|\
+    src/cfp_scheduler_killer/views/public_cfp.clj|\
+    resources/public/css/app.css|\
+    resources/public/js/datastar-kit.js|\
+    deps.edn|Makefile|Dockerfile|bb.edn|.github/*|bin/*)
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+valid_sol_approval() {
+  local id=$1 patch_sha=$2 approval
+  approval=${3:-$INBOX/approvals/$id.json}
+  [[ -s "$approval" ]] || return 1
+  trusted_approval_path "$approval" || return 1
+  jq -e --arg sha "$patch_sha" '
+    .schema == "merger-patch-approval.v1" and
+    .decision == "approve" and .patch_sha256 == $sha and
+    ((.reviewer_model == "gpt-5.6-sol" and .reviewer_reasoning_effort == "high") or
+     .reviewer == "Gene")
+  ' "$approval" >/dev/null 2>&1
+}
+
+valid_hold_receipt() {
+  local id=$1 patch_sha=$2 receipt=$3
+  [[ -s "$receipt" ]] || return 1
+  jq -e --arg id "$id" --arg sha "$patch_sha" '
+    .schema == "merger-spark-core-hold.v1" and
+    .id == $id and .decision == "hold" and .patch_sha256 == $sha and
+    .required_review_tier == "gpt-5.6-sol-high-or-Gene"
+  ' "$receipt" >/dev/null 2>&1
+}
+
+valid_released_archive() {
+  local id=$1 archive=$2 patch job approval hold release
+  local patch_sha job_sha approval_sha
+  patch="$archive/$id.patch"
+  job="$archive/$id.job"
+  approval="$archive/approval.json"
+  hold="$archive/hold.json"
+  release="$archive/release.json"
+  [[ -s "$patch" && -s "$job" && -s "$approval" && -s "$hold" && -s "$release" ]] || return 1
+  patch_sha=$(sha256_file "$patch")
+  job_sha=$(sha256_file "$job")
+  approval_sha=$(sha256_file "$approval")
+  valid_hold_receipt "$id" "$patch_sha" "$hold" || return 1
+  valid_sol_approval "$id" "$patch_sha" "$approval" || return 1
+  jq -e --arg id "$id" --arg patch_sha "$patch_sha" \
+    --arg job_sha "$job_sha" --arg approval_sha "$approval_sha" '
+    .schema == "merger-patch-release.v1" and .id == $id and
+    .state == "released" and .patch_sha256 == $patch_sha and
+    .job_sha256 == $job_sha and .approval_sha256 == $approval_sha
+  ' "$release" >/dev/null 2>&1
+}
+
+# Print a hold receipt and return success when an untrusted patch must be held.
+# Return 1 when the patch may continue through the ordinary compile/test gate.
+spark_hold_receipt() {
+  local id=$1 job=$2 patch=$3 model effort declared_sha computed_sha trusted=false
+  local inventory summary paths blocked rules touched_json blocked_json rules_json
+  local parse_failed=false has_deletion=false has_rename=false unsafe_path=false path_count=0 path _added deleted
+
+  model=$(job_value_any "$job" producer_model producer-model)
+  effort=$(job_value_any "$job" producer_reasoning_effort producer-reasoning-effort)
+  declared_sha=$(job_value_any "$job" patch_sha256 patch-sha256 patch_sha patch-sha)
+  computed_sha=$(sha256_file "$patch")
+  if [[ "$model" == gpt-5.6-sol && "$effort" == high && "$declared_sha" == "$computed_sha" ]]; then
+    trusted=true
+  fi
+  local approval="$INBOX/approvals/$id.json"
+  [[ ! -s "$INBOX/held/released/$id/approval.json" ]] || \
+    approval="$INBOX/held/released/$id/approval.json"
+  if valid_sol_approval "$id" "$computed_sha" "$approval"; then
+    trusted=true
+  fi
+  [[ "$trusted" == false ]] || return 1
+
+  inventory=$(git apply --numstat "$patch" 2>/dev/null) || parse_failed=true
+  summary=$(git apply --summary "$patch" 2>/dev/null) || parse_failed=true
+  paths=""
+  blocked=""
+  rules=""
+  if [[ "$parse_failed" == true ]]; then
+    rules="patch-parse-failed"
+  else
+    while IFS=$'\t' read -r _added deleted path; do
+      [[ -n "$path" ]] || continue
+      path_count=$((path_count + 1))
+      paths+="$path"$'\n'
+      if core_path "$path"; then
+        blocked+="$path"$'\n'
+      fi
+      if [[ "$deleted" =~ ^[0-9]+$ ]] && (( deleted > 0 )); then
+        has_deletion=true
+      fi
+      case "$path" in /*|../*|*/../*) unsafe_path=true ;; esac
+    done <<<"$inventory"
+    [[ -z "$blocked" ]] || rules+="core-path"$'\n'
+    [[ "$has_deletion" == false ]] || rules+="deletes-existing-lines"$'\n'
+    if grep -Eq '^( rename| copy) ' <<<"$summary"; then
+      has_rename=true
+      rules+="rename-or-copy"$'\n'
+    fi
+    [[ "$unsafe_path" == false ]] || rules+="unsafe-path"$'\n'
+    (( path_count <= 8 )) || rules+="more-than-eight-files"$'\n'
+  fi
+  [[ -n "$declared_sha" && "$declared_sha" == "$computed_sha" ]] || rules+="missing-or-mismatched-patch-sha"$'\n'
+  [[ -n "$model" ]] || rules+="missing-producer-model"$'\n'
+  [[ -n "$effort" ]] || rules+="missing-producer-effort"$'\n'
+
+  # Missing provenance alone does not block a genuinely additive leaf patch.
+  # Core access, deletions, renames, unsafe paths, oversize patches, and parse
+  # failures do. The receipt still records all provenance defects.
+  if [[ "$parse_failed" == false && -z "$blocked" && "$has_deletion" == false \
+        && "$has_rename" == false && "$unsafe_path" == false && "$path_count" -le 8 ]]; then
+    return 1
+  fi
+
+  touched_json=$(printf '%s' "$paths" | jq -Rsc 'split("\n") | map(select(length > 0))')
+  blocked_json=$(printf '%s' "$blocked" | jq -Rsc 'split("\n") | map(select(length > 0))')
+  rules_json=$(printf '%s' "$rules" | jq -Rsc 'split("\n") | map(select(length > 0)) | unique')
+  jq -n \
+    --arg schema merger-spark-core-hold.v1 \
+    --arg id "$id" --arg patch_sha256 "$computed_sha" \
+    --arg producer_model "${model:-unknown}" \
+    --arg producer_reasoning_effort "${effort:-unknown}" \
+    --arg held_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg required_review_tier gpt-5.6-sol-high-or-Gene \
+    --argjson touched_paths "$touched_json" \
+    --argjson blocked_paths "$blocked_json" \
+    --argjson blocked_rules "$rules_json" \
+    '{schema:$schema,id:$id,decision:"hold",patch_sha256:$patch_sha256,
+      producer_model:$producer_model,producer_reasoning_effort:$producer_reasoning_effort,
+      touched_paths:$touched_paths,blocked_paths:$blocked_paths,blocked_rules:$blocked_rules,
+      held_at:$held_at,required_review_tier:$required_review_tier}'
+}
+
+hold_job() {
+  local id=$1 job=$2 patch=$3 receipt=$4 root temporary destination
+  [[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "unsafe job id: $id"
+  root="$INBOX/held/spark-core"
+  destination="$root/$id"
+  mkdir -p "$root" 2>/dev/null || fail "cannot create hold root: $root (pre-create it for the merger seat)"
+  [[ -w "$root" ]] || fail "hold root is not writable: $root (pre-create it for the merger seat)"
+  [[ ! -e "$destination" ]] || fail "hold destination already exists: $destination"
+  temporary=$(mktemp -d "$root/.$id.XXXXXX")
+  # /tmp/merge-inbox is sticky and producers own their ready artifacts. The
+  # merger may read those files but cannot unlink them, so preserve the source
+  # bytes and make the nested hold receipt the durable dequeue authority.
+  cp -- "$patch" "$temporary/$id.patch"
+  cp -- "$job" "$temporary/$id.job"
+  printf '%s\n' "$receipt" >"$temporary/hold.json"
+  chmod 0644 "$temporary/$id.patch" "$temporary/$id.job" "$temporary/hold.json"
+  mv "$temporary" "$destination"
+}
+
+release_held_job() (
+  set -euo pipefail
+  local id=$1 held_root held_dir released_root destination
+  local held_patch held_job ready_patch ready_job approval
+  local patch_sha held_job_sha ready_job_sha approval_sha receipt_tmp approval_tmp lock
+  [[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "unsafe job id: $id"
+
+  mkdir -p "$STATE/batches"
+  lock="$STATE/controller.lock"
+  if ! mkdir "$lock" 2>/dev/null; then
+    log "another controller owns $lock"
+    exit 75
+  fi
+  trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+
+  held_root="$INBOX/held/spark-core"
+  held_dir="$held_root/$id"
+  released_root="$INBOX/held/released"
+  destination="$released_root/$id"
+  held_patch="$held_dir/$id.patch"
+  held_job="$held_dir/$id.job"
+  ready_patch="$INBOX/$id.patch"
+  ready_job="$INBOX/$id.job"
+  approval="$INBOX/approvals/$id.json"
+
+  if [[ -d "$destination" ]]; then
+    valid_released_archive "$id" "$destination" || \
+      fail "existing released archive is invalid: $destination"
+    log "release-held id=$id already-released receipt=$destination/release.json"
+    return 0
+  fi
+
+  [[ -s "$held_dir/hold.json" && -s "$held_patch" && -s "$held_job" ]] || \
+    fail "held job is incomplete: $held_dir"
+  [[ -s "$ready_patch" && -s "$ready_job" ]] || \
+    fail "ready artifacts are missing for held job: $id"
+  cmp -s "$held_patch" "$ready_patch" || \
+    fail "ready patch changed after hold: $id"
+  cmp -s "$held_job" "$ready_job" || \
+    fail "ready job changed after hold: $id"
+
+  patch_sha=$(sha256_file "$held_patch")
+  held_job_sha=$(sha256_file "$held_job")
+  ready_job_sha=$(sha256_file "$ready_job")
+  [[ "$held_job_sha" == "$ready_job_sha" ]] || fail "ready job hash changed after hold: $id"
+  valid_hold_receipt "$id" "$patch_sha" "$held_dir/hold.json" || \
+    fail "held receipt does not bind the exact job and patch: $id"
+
+  approval_tmp="$held_dir/.approval.json.$$"
+  cp -- "$approval" "$approval_tmp" 2>/dev/null || \
+    fail "exact-SHA Sol-high or Gene approval required to release held job: $id"
+  chmod 0644 "$approval_tmp"
+  valid_sol_approval "$id" "$patch_sha" "$approval_tmp" || {
+    rm -f -- "$approval_tmp"
+    fail "exact-SHA Sol-high or Gene approval required to release held job: $id"
+  }
+  approval_sha=$(sha256_file "$approval_tmp")
+  mv "$approval_tmp" "$held_dir/approval.json"
+
+  mkdir -p "$released_root" 2>/dev/null || fail "cannot create released-hold root: $released_root"
+  [[ -w "$released_root" ]] || fail "released-hold root is not writable: $released_root"
+  [[ ! -e "$destination" ]] || fail "released-hold destination already exists: $destination"
+
+  receipt_tmp="$held_dir/.release.json.$$"
+  jq -n \
+    --arg schema merger-patch-release.v1 --arg id "$id" \
+    --arg patch_sha256 "$patch_sha" --arg job_sha256 "$held_job_sha" \
+    --arg approval_sha256 "$approval_sha" --arg approval "$approval" \
+    --arg released_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{schema:$schema,id:$id,state:"released",patch_sha256:$patch_sha256,
+      job_sha256:$job_sha256,approval_sha256:$approval_sha256,
+      approval:$approval,released_at:$released_at}' >"$receipt_tmp"
+  chmod 0644 "$receipt_tmp"
+  mv "$receipt_tmp" "$held_dir/release.json"
+  mv "$held_dir" "$destination"
+  log "release-held id=$id patch_sha256=$patch_sha receipt=$destination/release.json"
+)
+
+poisoned_job() {
+  local id=$1
+  [[ -f "$POISON_ROOT/$id.job" || -f "$POISON_ROOT/$id/quarantine.json" ]]
+}
+
+quarantine_job() {
+  local id=$1 job=$2 patch=$3 reason=$4 output=${5:-}
+  local destination temporary tail_text
+  [[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "unsafe job id: $id"
+  mkdir -p "$POISON_ROOT" 2>/dev/null || fail "cannot create poison root: $POISON_ROOT"
+  [[ -w "$POISON_ROOT" ]] || fail "poison root is not writable: $POISON_ROOT"
+  destination="$POISON_ROOT/$id"
+  [[ ! -e "$destination" ]] || return 0
+  temporary=$(mktemp -d "$POISON_ROOT/.$id.XXXXXX")
+  cp -- "$patch" "$temporary/$id.patch"
+  cp -- "$job" "$temporary/$id.job"
+  tail_text=$(tail -120 "$output" 2>/dev/null || true)
+  jq -n \
+    --arg schema merger-poison-quarantine.v1 --arg id "$id" \
+    --arg reason "$reason" --arg source_job "$job" --arg source_patch "$patch" \
+    --arg output "${output:-}" --arg output_tail "$tail_text" \
+    --arg quarantined_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{schema:$schema,id:$id,state:"quarantined",reason:$reason,
+      source_job:$source_job,source_patch:$source_patch,output:$output,
+      output_tail:$output_tail,quarantined_at:$quarantined_at}' >"$temporary/quarantine.json"
+  chmod 0644 "$temporary/$id.patch" "$temporary/$id.job" "$temporary/quarantine.json"
+  mv "$temporary" "$destination"
+  log "quarantine id=$id reason=$reason receipt=$destination/quarantine.json"
+}
+
+reset_job_apply() {
+  local repo=$1 before=$2
+  git -C "$repo" reset --hard --quiet "$before"
+  # The repo is a disposable per-batch clone. Remove only files introduced by
+  # the failed patch so the next queued job starts from the last committed tip.
+  git -C "$repo" clean -fdq
+}
+
+valid_batch_receipt() {
+  local receipt=$1 expected_batch state repo tip id job patch job_sha patch_sha
+  [[ -f "$receipt" && ! -L "$receipt" ]] || return 1
+  expected_batch=$(basename "${receipt%/batch.json}")
+  jq -e --arg expected_batch "$expected_batch" '
+    .schema == "merger-batch-controller-batch.v1" and
+    (.state | type == "string") and
+    (.state | IN("validated","quarantined","red","deploy-pending","push-pending",
+                 "integrated","shipped","deploy-failed","deploy-blocked","superseded")) and
+    (.batch_id == $expected_batch) and
+    (.batch_id | test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and
+    (.base_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+    (.tip_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+    (.job_ids | type == "array" and length > 0 and
+      all(.[]; type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and
+      (length == (unique | length))) and
+    (.compile_log | type == "string" and length > 0) and
+    (.test_log | type == "string" and length > 0) and
+    (if (.state | IN("deploy-pending","push-pending","integrated")) then
+       (. as $receipt |
+        .artifacts | type == "array" and length == ($receipt.job_ids | length) and
+         (map(.job_id) == $receipt.job_ids) and
+         all(.[];
+           (.job_id | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and
+           (.job_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+           (.patch_sha256 | type == "string" and test("^[0-9a-f]{64}$"))))
+     else true end)
+  ' "$receipt" >/dev/null 2>&1 || return 1
+  state=$(jq -r '.state' "$receipt")
+  case "$state" in
+    deploy-pending|push-pending|integrated)
+      repo="${receipt%/batch.json}/repo"
+      tip=$(jq -r '.tip_sha' "$receipt")
+      [[ -d "$repo/.git" && "$(git -C "$repo" rev-parse HEAD 2>/dev/null)" == "$tip" ]] || return 1
+      [[ -f "$(jq -r '.compile_log' "$receipt")" && -f "$(jq -r '.test_log' "$receipt")" ]] || return 1
+      while IFS= read -r id; do
+        job="${receipt%/batch.json}/ingest/$id/$id.job"
+        patch="${receipt%/batch.json}/ingest/$id/$id.patch"
+        [[ -f "$job" && ! -L "$job" && -f "$patch" && ! -L "$patch" ]] || return 1
+        job_sha=$(sha256_file "$job")
+        patch_sha=$(sha256_file "$patch")
+        jq -e --arg id "$id" --arg job_sha "$job_sha" --arg patch_sha "$patch_sha" '
+          any(.artifacts[];
+            .job_id == $id and .job_sha256 == $job_sha and .patch_sha256 == $patch_sha)
+        ' "$receipt" >/dev/null 2>&1 || return 1
+      done < <(jq -r '.job_ids[]' "$receipt")
+      ;;
+  esac
+}
+
+valid_integrated_receipt() {
+  local id=$1 receipt=$2 batch_id batch batch_dir job patch declared_patch
+  local job_sha patch_sha
+  [[ -f "$receipt" && ! -L "$receipt" ]] || return 1
+  jq -e --arg id "$id" '
+    .schema == "merger-integrated-receipt.v1" and .state == "integrated" and
+    .job_id == $id and (.batch_id | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and
+    (.base_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+    (.tip_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+    (.remote_head_observed | type == "string" and test("^[0-9a-f]{40}$")) and
+    (.job_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+    (.patch_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+    (.integrated_at | type == "string" and length > 0)
+  ' "$receipt" >/dev/null 2>&1 || return 1
+  batch_id=$(jq -r '.batch_id' "$receipt")
+  batch="$STATE/batches/$batch_id/batch.json"
+  valid_batch_receipt "$batch" || return 1
+  jq -e --arg id "$id" --arg base "$(jq -r '.base_sha' "$receipt")" \
+    --arg tip "$(jq -r '.tip_sha' "$receipt")" \
+    '(.state == "push-pending" or .state == "deploy-pending" or .state == "integrated") and
+     .base_sha == $base and .tip_sha == $tip and (.job_ids | index($id) != null)' \
+    "$batch" >/dev/null 2>&1 || return 1
+  batch_dir=${batch%/batch.json}
+  job="$batch_dir/ingest/$id/$id.job"
+  patch="$batch_dir/ingest/$id/$id.patch"
+  job_sha=$(sha256_file "$job")
+  patch_sha=$(sha256_file "$patch")
+  declared_patch=$(job_value_any "$job" patch_sha256 patch-sha256 patch_sha patch-sha)
+  git -C "$batch_dir/repo" cat-file -e "$(jq -r '.remote_head_observed' "$receipt")^{commit}" 2>/dev/null || return 1
+  git -C "$batch_dir/repo" merge-base --is-ancestor \
+    "$(jq -r '.tip_sha' "$receipt")" "$(jq -r '.remote_head_observed' "$receipt")" || return 1
+  [[ "$job_sha" == "$(jq -r '.job_sha256' "$receipt")" &&
+     "$patch_sha" == "$(jq -r '.patch_sha256' "$receipt")" &&
+     "$patch_sha" == "$declared_patch" ]]
+}
+
+pending_rows() {
+  local job id patch released integrated
+  shopt -s nullglob
+  # The loop intentionally runs on the left side of sort; its locals do not
+  # escape the function.
+  # shellcheck disable=SC2030,SC2031
+  for job in "$INBOX"/*.job "$INBOX"/held/released/*/*.job; do
+    id=${job##*/}
+    id=${id%.job}
+    released="$INBOX/held/released/$id"
+    case "$job" in
+      "$INBOX"/held/released/*/*.job)
+        if ! valid_released_archive "$id" "$released"; then
+          log "ERROR invalid released archive id=$id archive=$released"
+          return 1
+        fi
+        patch="$released/$id.patch"
+        ;;
+      *)
+        [[ ! -d "$released" ]] || continue
+        patch="$INBOX/$id.patch"
+        ;;
+    esac
+    [[ -f "$patch" ]] || continue
+    integrated="$INTEGRATED_ROOT/$id.json"
+    if [[ -e "$integrated" ]]; then
+      if ! valid_integrated_receipt "$id" "$integrated"; then
+        log "ERROR invalid integrated receipt id=$id receipt=$integrated"
+        return 1
+      fi
+      if [[ "$(sha256_file "$job")" != "$(jq -r '.job_sha256' "$integrated")" ||
+            "$(sha256_file "$patch")" != "$(jq -r '.patch_sha256' "$integrated")" ]]; then
+        log "ERROR job id reused with different artifacts id=$id receipt=$integrated"
+        return 1
+      fi
+      continue
+    fi
+    [[ -f "$INBOX/done/$id.job" ]] && continue
+    [[ -f "$INBOX/rejected/$id.job" ]] && continue
+    [[ -f "$INBOX/held/spark-core/$id/hold.json" ]] && continue
+    poisoned_job "$id" && continue
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$(priority_number "$job")" "$(mtime "$job")" "$id" "$job" "$patch"
+  done | LC_ALL=C sort -t $'\t' -k1,1n -k2,2n -k3,3 | awk -F '\t' '!seen[$3]++'
+}
+
+status_json() {
+  local rows ids count
+  rows=$(pending_rows)
+  if [[ -n "$rows" ]]; then
+    ids=$(printf '%s\n' "$rows" | awk -F '\t' '{print $3}' | jq -Rsc 'split("\n")[:-1]')
+    count=$(printf '%s\n' "$rows" | awk 'END {print NR}')
+  else
+    ids='[]'
+    count=0
+  fi
+  jq -n \
+    --arg schema merger-batch-controller-status.v1 \
+    --arg inbox "$INBOX" \
+    --arg branch "$BRANCH" \
+    --argjson ready_count "$count" \
+    --argjson ready_ids "$ids" \
+    --arg push_enabled "$PUSH_ENABLED" \
+    '{schema:$schema,inbox:$inbox,branch:$branch,ready_count:$ready_count,ready_ids:$ready_ids,push_enabled:($push_enabled=="yes")}'
+}
+
+increment_conflict_strike() {
+  local id=$1 file count=0
+  file="$STATE/conflicts/$id.count"
+  mkdir -p "$STATE/conflicts"
+  [[ -f "$file" ]] && read -r count <"$file"
+  count=$((count + 1))
+  printf '%s\n' "$count" >"$file"
+  printf '%s\n' "$count"
+}
+
+invoke_reasoner() {
+  local bundle=$1 output=$2
+  if [[ -z "$REASONER" ]]; then
+    log "reasoning required; bundle=$bundle (MERGER_REASONER is unset)"
+    return 0
+  fi
+  [[ -x "$REASONER" ]] || fail "MERGER_REASONER is not executable: $REASONER"
+  "$REASONER" "$bundle" >"$output" 2>&1
+}
+
+run_logged() {
+  local repo=$1 command=$2 output=$3 rc
+  set +e
+  (cd "$repo" && bash -lc "$command") >"$output" 2>&1
+  rc=$?
+  set -e
+  return "$rc"
+}
+
+test_summary() {
+  local log_file=$1 summary
+  summary=$(grep -E '[0-9]+ tests|[0-9]+ assertions|[0-9]+ failures|FAIL|ERROR' "$log_file" | tail -1 || true)
+  [[ -n "$summary" ]] || summary=$(tail -1 "$log_file" 2>/dev/null || true)
+  printf '%s\n' "${summary:-no summary emitted}"
+}
+
+bisect_red_batch() {
+  local repo=$1 base=$2 tip=$3 output=$4 bad rc
+  export MERGER_BISECT_REPO="$repo" MERGER_BISECT_COMPILE="$COMPILE_COMMAND" MERGER_BISECT_TEST="$TEST_COMMAND"
+  git -C "$repo" bisect start "$tip" "$base" >/dev/null
+  set +e
+  # Expansion belongs to the bisect child, from the exported bounded commands.
+  # shellcheck disable=SC2016
+  git -C "$repo" bisect run bash -c '
+    cd "$MERGER_BISECT_REPO" || exit 125
+    bash -lc "$MERGER_BISECT_COMPILE" >/dev/null 2>&1 || exit 1
+    bash -lc "$MERGER_BISECT_TEST" >/dev/null 2>&1
+  ' >"$output" 2>&1
+  rc=$?
+  set -e
+  bad=$(git -C "$repo" rev-parse refs/bisect/bad 2>/dev/null || true)
+  git -C "$repo" bisect reset >/dev/null || true
+  [[ "$rc" -eq 0 && -n "$bad" ]] || return 1
+  printf '%s\n' "$bad"
+}
+
+wait_for_deploy() {
+  local sha=$1 deadline run status conclusion
+  command -v gh >/dev/null 2>&1 || fail "gh is required to wait for deployment"
+  deadline=$(( $(date +%s) + DEPLOY_TIMEOUT ))
+  while (( $(date +%s) < deadline )); do
+    run=$(gh run list --repo "$DEPLOY_REPO" --workflow "$DEPLOY_WORKFLOW" \
+      --branch "$BRANCH" --commit "$sha" --limit 10 \
+      --json databaseId,headSha,status,conclusion,url |
+      jq -c --arg sha "$sha" '[.[] | select(.headSha==$sha)] | sort_by(.databaseId) | last // empty')
+    if [[ -n "$run" ]]; then
+      status=$(jq -r '.status' <<<"$run")
+      conclusion=$(jq -r '.conclusion // ""' <<<"$run")
+      if [[ "$status" == completed ]]; then
+        [[ "$conclusion" == success ]] || {
+          printf '%s\n' "$run"
+          return 1
+        }
+        printf '%s\n' "$run"
+        return 0
+      fi
+    fi
+    sleep "$DEPLOY_POLL_SECONDS"
+  done
+  return 124
+}
+
+deploy_status() (
+  set -euo pipefail
+  local desired runs tmp frontier='' frontier_run='{}' divergent=0 run sha last_successful_run
+  command -v gh >/dev/null 2>&1 || fail "gh is required for deploy-status"
+  desired=$(git ls-remote "$REPO_URL" "refs/heads/$BRANCH" | awk 'NR==1 {print $1}')
+  [[ "$desired" =~ ^[0-9a-f]{40}$ ]] || fail "cannot resolve desired $BRANCH SHA"
+  runs=$(gh run list --repo "$DEPLOY_REPO" --workflow "$DEPLOY_WORKFLOW" \
+    --branch "$BRANCH" --limit 100 \
+    --json databaseId,headSha,status,conclusion,url,createdAt,updatedAt)
+  jq -e '
+    type == "array" and all(.[];
+      (.databaseId | type == "number") and
+      (.headSha | type == "string" and test("^[0-9a-f]{40}$")) and
+      (.status | type == "string") and
+      ((.conclusion == null) or (.conclusion | type == "string")) and
+      (.url | type == "string"))
+  ' <<<"$runs" >/dev/null || fail "malformed GitHub Actions observation"
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+  git clone --quiet --single-branch --branch "$BRANCH" "$REPO_URL" "$tmp/repo"
+  while IFS= read -r run; do
+    sha=$(jq -r '.headSha' <<<"$run")
+    git -C "$tmp/repo" cat-file -e "$sha^{commit}" 2>/dev/null || continue
+    git -C "$tmp/repo" merge-base --is-ancestor "$sha" "$desired" || {
+      divergent=$((divergent + 1))
+      continue
+    }
+    if [[ -z "$frontier" ]]; then
+      frontier=$sha
+      frontier_run=$run
+    elif git -C "$tmp/repo" merge-base --is-ancestor "$frontier" "$sha"; then
+      frontier=$sha
+      frontier_run=$run
+    fi
+  done < <(jq -c '.[] | select(.status == "completed" and .conclusion == "success")' <<<"$runs")
+  last_successful_run=$(jq -c '
+    [.[] | select(.status == "completed" and .conclusion == "success")] |
+    sort_by(.updatedAt // .createdAt // "") | last // {}
+  ' <<<"$runs")
+  jq -n --arg schema merger-deploy-status.v1 --arg desired "$desired" \
+    --arg covered "$frontier" --argjson covered_run "$frontier_run" \
+    --argjson last_successful_run "$last_successful_run" \
+    --argjson active "$(jq -c --arg desired "$desired" \
+      '[.[] | select(.headSha == $desired and .status != "completed")]' <<<"$runs")" \
+    --argjson desired_failures "$(jq -c --arg desired "$desired" \
+      '[.[] | select(.headSha == $desired and .status == "completed" and .conclusion != "success")]' <<<"$runs")" \
+    --argjson divergent_successes "$divergent" \
+    '{schema:$schema,desired_sha:$desired,
+      covered_frontier_sha:(if $covered == "" then null else $covered end),
+      desired_is_covered:($desired == $covered),covered_by_run:$covered_run,
+      last_successful_run:$last_successful_run,
+      production_matches_covered_frontier:
+        ($covered != "" and (($last_successful_run.headSha // null) == $covered)),
+      observation_limit:100,observation_is_bounded:true,
+      desired_active:$active,desired_failures:$desired_failures,
+      divergent_successes:$divergent_successes}'
+)
+
+batch_artifacts_json() {
+  local batch_dir=$1 ids_json=$2 id job patch artifacts='[]'
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    job="$batch_dir/ingest/$id/$id.job"
+    patch="$batch_dir/ingest/$id/$id.patch"
+    [[ -f "$job" && ! -L "$job" && -f "$patch" && ! -L "$patch" ]] ||
+      fail "missing controller-owned artifact while writing batch receipt: $id"
+    artifacts=$(jq -c --arg id "$id" --arg job_sha "$(sha256_file "$job")" \
+      --arg patch_sha "$(sha256_file "$patch")" \
+      '. + [{job_id:$id,job_sha256:$job_sha,patch_sha256:$patch_sha}]' <<<"$artifacts")
+  done < <(jq -r '.[]' <<<"$ids_json")
+  printf '%s\n' "$artifacts"
+}
+
+write_batch_json() {
+  local path=$1 state=$2 batch_id=$3 base=$4 tip=$5 compile_log=$6 test_log=$7 ids_json=$8
+  local tmp artifacts_json='[]'
+  mkdir -p "$(dirname "$path")"
+  if [[ "$state" == deploy-pending || "$state" == push-pending || "$state" == integrated ]]; then
+    artifacts_json=$(batch_artifacts_json "$(dirname "$path")" "$ids_json")
+  fi
+  tmp=$(mktemp "$(dirname "$path")/.batch.json.XXXXXX")
+  jq -n \
+    --arg schema merger-batch-controller-batch.v1 \
+    --arg state "$state" \
+    --arg batch_id "$batch_id" \
+    --arg base_sha "$base" \
+    --arg tip_sha "$tip" \
+    --arg compile_log "$compile_log" \
+    --arg test_log "$test_log" \
+    --argjson job_ids "$ids_json" \
+    --argjson artifacts "$artifacts_json" \
+    '{schema:$schema,state:$state,batch_id:$batch_id,base_sha:$base_sha,tip_sha:$tip_sha,
+      job_ids:$job_ids,artifacts:$artifacts,compile_log:$compile_log,test_log:$test_log}' >"$tmp"
+  chmod 0644 "$tmp"
+  mv "$tmp" "$path"
+}
+
+write_done_receipt() {
+  local job=$1 id=$2 tip=$3 compile_log=$4 test_log=$5 deploy_json=$6 tmp
+  mkdir -p "$INBOX/done"
+  tmp=$(mktemp "$INBOX/done/.$id.job.XXXXXX")
+  cp "$job" "$tmp"
+  {
+    printf '\nresult: shipped\n'
+    printf 'pushed-sha: %s\n' "$tip"
+    printf 'compile-result: success (%s)\n' "$compile_log"
+    printf 'verify-result: %s (%s)\n' "$(test_summary "$test_log")" "$test_log"
+    printf 'deploy-run: %s\n' "$(jq -r '.url' <<<"$deploy_json")"
+    printf 'deploy-result: success\n'
+    printf 'queue-note: deterministic batch controller; full suite ran once on batch tip\n'
+  } >>"$tmp"
+  chmod 644 "$tmp"
+  mv "$tmp" "$INBOX/done/$id.job"
+}
+
+kentbeck_queue_dirs() {
+  mkdir -p "$KENTBECK_QUEUE/pending" "$KENTBECK_QUEUE/active" \
+    "$KENTBECK_QUEUE/done" "$KENTBECK_QUEUE/receipts"
+}
+
+safe_request_key() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "unsafe Kentbeck request key: $1"
+}
+
+patch_paths_json() {
+  local patch=$1 inventory
+  inventory=$(git apply --numstat "$patch" 2>/dev/null) || return 1
+  awk -F '\t' 'NF >= 3 {print $3}' <<<"$inventory" |
+    jq -Rsc 'split("\n") | map(select(length > 0)) | unique'
+}
+
+# Enqueue only an explicit, still-missing ratchet request. Absence means no
+# request: deterministic shell must not guess whether a behavior needs a test.
+enqueue_kentbeck_request() {
+  local job=$1 id=$2 tip=$3 batch_id=$4 patch=$5
+  local policy invariant key temporary destination paths_json now state receipt
+  policy=$(job_value_any "$job" ratchet ratchet-policy ratchet_policy)
+  [[ "$policy" == required ]] || return 10
+  invariant=$(job_value_any "$job" ratchet-invariant ratchet_invariant)
+  if [[ -z "$invariant" ]]; then
+    log "ratchet request ignored id=$id reason=missing-ratchet-invariant"
+    return 11
+  fi
+  [[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 12
+  [[ "$tip" =~ ^[0-9a-f]{40}$ ]] || return 12
+  key="$id--$tip"
+  safe_request_key "$key"
+  kentbeck_queue_dirs
+  for state in pending active "done"; do
+    [[ ! -e "$KENTBECK_QUEUE/$state/$key.json" ]] || return 10
+  done
+  paths_json=$(patch_paths_json "$patch") || paths_json='[]'
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  temporary=$(mktemp "$KENTBECK_QUEUE/.request.XXXXXX")
+  jq -n \
+    --arg schema kentbeck-ratchet-request.v1 \
+    --arg request_id "$key" --arg source_job "$id" --arg shipped_sha "$tip" \
+    --arg batch_id "$batch_id" --arg invariant "$invariant" \
+    --arg requested_at "$now" --arg source_job_file "$job" \
+    --arg source_patch_file "$patch" --argjson touched_paths "$paths_json" \
+    '{schema:$schema,request_id:$request_id,state:"pending",source_job:$source_job,
+      shipped_sha:$shipped_sha,batch_id:$batch_id,invariant:$invariant,
+      touched_paths:$touched_paths,source_job_file:$source_job_file,
+      source_patch_file:$source_patch_file,requested_at:$requested_at,
+      required_model:"gpt-5.6-sol",required_reasoning_effort:"high",
+      output_contract:{product_code:false,one_pin:true,
+        job_fields:{ratchet:"covered",ratchet_request:$request_id}}}' >"$temporary"
+  chmod 0644 "$temporary"
+  destination="$KENTBECK_QUEUE/pending/$key.json"
+  mv "$temporary" "$destination"
+  receipt="$KENTBECK_QUEUE/receipts/$key.json"
+  jq -n --arg schema kentbeck-ratchet-enqueue-receipt.v1 --arg request_id "$key" \
+    --arg state queued --arg request "$destination" --arg at "$now" \
+    '{schema:$schema,request_id:$request_id,state:$state,request:$request,at:$at}' >"$receipt.tmp"
+  mv "$receipt.tmp" "$receipt"
+  log "ratchet queued id=$id request=$key"
+}
+
+kentbeck_status() {
+  local pending active completed
+  kentbeck_queue_dirs
+  pending=$(find "$KENTBECK_QUEUE/pending" -maxdepth 1 -type f -name '*.json' | wc -l | tr -d ' ')
+  active=$(find "$KENTBECK_QUEUE/active" -maxdepth 1 -type f -name '*.json' | wc -l | tr -d ' ')
+  completed=$(find "$KENTBECK_QUEUE/done" -maxdepth 1 -type f -name '*.json' | wc -l | tr -d ' ')
+  jq -n --arg schema kentbeck-ratchet-queue-status.v1 --arg queue "$KENTBECK_QUEUE" \
+    --argjson pending "$pending" --argjson active "$active" --argjson completed "$completed" \
+    '{schema:$schema,queue:$queue,pending:$pending,active:$active,done:$completed}'
+}
+
+# Claim one request atomically. The Skiff dispatcher verifies the live TUI is
+# exact Sol-high before it calls this command, then submits exactly this file.
+kentbeck_claim() (
+  set -euo pipefail
+  local lock request key active temporary
+  kentbeck_queue_dirs
+  lock="$KENTBECK_QUEUE/.dispatch.lock"
+  mkdir "$lock" 2>/dev/null || exit 75
+  trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+  active=$(find "$KENTBECK_QUEUE/active" -maxdepth 1 -type f -name '*.json' -print -quit)
+  [[ -z "$active" ]] || exit 20
+  request=$(find "$KENTBECK_QUEUE/pending" -maxdepth 1 -type f -name '*.json' -print | LC_ALL=C sort | head -1)
+  [[ -n "$request" ]] || exit 10
+  key=${request##*/}
+  key=${key%.json}
+  safe_request_key "$key"
+  temporary="$KENTBECK_QUEUE/active/$key.json"
+  mv "$request" "$temporary"
+  jq --arg path "$temporary" --arg claimed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '.state="active" | .active_path=$path | .claimed_at=$claimed_at' "$temporary" >"$temporary.tmp"
+  mv "$temporary.tmp" "$temporary"
+  cat "$temporary"
+)
+
+kentbeck_requeue() {
+  local key=$1 active pending
+  safe_request_key "$key"
+  kentbeck_queue_dirs
+  active="$KENTBECK_QUEUE/active/$key.json"
+  pending="$KENTBECK_QUEUE/pending/$key.json"
+  [[ -f "$active" ]] || return 10
+  jq 'del(.active_path,.claimed_at) | .state="pending"' "$active" >"$active.tmp"
+  mv "$active.tmp" "$active"
+  mv "$active" "$pending"
+}
+
+kentbeck_dispatched() {
+  local key=$1 session=$2 active receipt now
+  safe_request_key "$key"
+  [[ "$session" =~ ^anvil-tmux-p[0-9]+$ ]] || fail "unsafe Kentbeck session: $session"
+  kentbeck_queue_dirs
+  active="$KENTBECK_QUEUE/active/$key.json"
+  [[ -f "$active" ]] || return 10
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  jq --arg session "$session" --arg dispatched_at "$now" \
+    '.dispatched_session=$session | .dispatched_at=$dispatched_at' "$active" >"$active.tmp"
+  mv "$active.tmp" "$active"
+  receipt="$KENTBECK_QUEUE/receipts/$key.json"
+  jq -n --arg schema kentbeck-ratchet-dispatch-receipt.v1 --arg request_id "$key" \
+    --arg state dispatched --arg session "$session" --arg at "$now" \
+    '{schema:$schema,request_id:$request_id,state:$state,session:$session,at:$at}' >"$receipt.tmp"
+  mv "$receipt.tmp" "$receipt"
+}
+
+complete_kentbeck_request() {
+  local job=$1 result_job=$2 shipped_sha=$3 key active completed now
+  key=$(job_value_any "$job" ratchet-request ratchet_request)
+  [[ -n "$key" ]] || return 10
+  safe_request_key "$key"
+  kentbeck_queue_dirs
+  active="$KENTBECK_QUEUE/active/$key.json"
+  completed="$KENTBECK_QUEUE/done/$key.json"
+  [[ ! -f "$completed" ]] || return 10
+  [[ -f "$active" ]] || {
+    log "ratchet completion ignored job=$result_job reason=active-request-not-found request=$key"
+    return 11
+  }
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  jq --arg result_job "$result_job" --arg result_sha "$shipped_sha" --arg completed_at "$now" \
+    'del(.active_path) | .state="done" | .result_job=$result_job |
+     .result_shipped_sha=$result_sha | .completed_at=$completed_at' "$active" >"$active.tmp"
+  mv "$active.tmp" "$active"
+  mv "$active" "$completed"
+  log "ratchet complete request=$key result_job=$result_job"
+}
+
+postship_kentbeck() (
+  set +e
+  local job=$1 id=$2 tip=$3 batch_id=$4 patch=$5 enqueue_rc
+  enqueue_kentbeck_request "$job" "$id" "$tip" "$batch_id" "$patch"
+  enqueue_rc=$?
+  if [[ "$enqueue_rc" -ne 0 && "$enqueue_rc" -ne 10 && "$enqueue_rc" -ne 11 ]]; then
+    log "ratchet enqueue failed id=$id rc=$enqueue_rc (deployment remains shipped)"
+  fi
+  complete_kentbeck_request "$job" "$id" "$tip" >/dev/null 2>&1
+  exit 0
+)
+
+pending_push_receipt() {
+  local receipt state found=''
+  shopt -s nullglob
+  for receipt in "$STATE"/batches/*/batch.json; do
+    if ! valid_batch_receipt "$receipt"; then
+      log "ERROR invalid batch receipt: $receipt"
+      return 1
+    fi
+    state=$(jq -r '.state' "$receipt")
+    case "$state" in
+      push-pending|deploy-pending)
+        [[ -z "$found" ]] || {
+          log "ERROR multiple unresolved push receipts: $found $receipt"
+          return 1
+        }
+        found=$receipt
+        ;;
+    esac
+  done
+  [[ -n "$found" ]] || return 10
+  printf '%s\n' "$found"
+}
+
+write_integrated_receipt() {
+  local id=$1 batch_id=$2 base=$3 tip=$4 remote_head=$5 batch_dir=$6 batch_receipt=$7
+  local job patch destination tmp job_sha patch_sha expected_job_sha expected_patch_sha now
+  destination="$INTEGRATED_ROOT/$id.json"
+  if [[ -e "$destination" ]]; then
+    valid_integrated_receipt "$id" "$destination" || fail "invalid existing integrated receipt: $destination"
+    return 0
+  fi
+  job="$batch_dir/ingest/$id/$id.job"
+  patch="$batch_dir/ingest/$id/$id.patch"
+  [[ -f "$job" && -f "$patch" ]] || fail "missing controller-owned ingest for integrated job: $id"
+  job_sha=$(sha256_file "$job")
+  patch_sha=$(sha256_file "$patch")
+  expected_job_sha=$(jq -r --arg id "$id" '.artifacts[] | select(.job_id == $id) | .job_sha256' "$batch_receipt")
+  expected_patch_sha=$(jq -r --arg id "$id" '.artifacts[] | select(.job_id == $id) | .patch_sha256' "$batch_receipt")
+  [[ -n "$expected_job_sha" && -n "$expected_patch_sha" &&
+     "$job_sha" == "$expected_job_sha" && "$patch_sha" == "$expected_patch_sha" ]] ||
+    fail "controller-owned ingest changed after local gate: $id"
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  mkdir -p "$INTEGRATED_ROOT"
+  tmp=$(mktemp "$INTEGRATED_ROOT/.$id.json.XXXXXX")
+  jq -n --arg schema merger-integrated-receipt.v1 --arg state integrated \
+    --arg job_id "$id" --arg batch_id "$batch_id" --arg base_sha "$base" \
+    --arg tip_sha "$tip" --arg remote_head_observed "$remote_head" \
+    --arg job_sha256 "$expected_job_sha" --arg patch_sha256 "$expected_patch_sha" \
+    --arg integrated_at "$now" \
+    '{schema:$schema,state:$state,job_id:$job_id,batch_id:$batch_id,
+      base_sha:$base_sha,tip_sha:$tip_sha,remote_head_observed:$remote_head_observed,
+      job_sha256:$job_sha256,patch_sha256:$patch_sha256,integrated_at:$integrated_at}' >"$tmp"
+  chmod 0644 "$tmp"
+  mv "$tmp" "$destination"
+}
+
+refresh_staging_mirror() {
+  local expected=$1 observed old_umask
+  [[ ! -L "$STAGING_MIRROR" ]] || fail "staging mirror must not be a symlink: $STAGING_MIRROR"
+  [[ ! -e "$STAGING_MIRROR" || -d "$STAGING_MIRROR" ]] ||
+    fail "staging mirror path is not a directory: $STAGING_MIRROR"
+  mkdir -p "$(dirname "$STAGING_MIRROR")"
+  old_umask=$(umask)
+  umask 022
+  if [[ ! -d "$STAGING_MIRROR" ]]; then
+    git init --quiet --bare --shared=all "$STAGING_MIRROR"
+  fi
+  git --git-dir="$STAGING_MIRROR" rev-parse --is-bare-repository 2>/dev/null | grep -qx true ||
+    fail "staging mirror is not a bare Git repository: $STAGING_MIRROR"
+  git --git-dir="$STAGING_MIRROR" fetch --quiet --force "$REPO_URL" \
+    "+refs/heads/$BRANCH:refs/heads/$BRANCH"
+  observed=$(git --git-dir="$STAGING_MIRROR" rev-parse "refs/heads/$BRANCH")
+  [[ "$observed" == "$expected" ]] || fail "staging mirror observed $observed, expected $expected"
+  chmod -R a+rX "$STAGING_MIRROR"
+  umask "$old_umask"
+}
+
+integrate_pending_push() {
+  local receipt=$1 batch_dir repo batch_id base tip compile_log test_log ids_json
+  local remote_head id job patch
+  valid_batch_receipt "$receipt" || fail "invalid pending push receipt: $receipt"
+  batch_dir=${receipt%/batch.json}
+  repo="$batch_dir/repo"
+  batch_id=$(jq -r '.batch_id' "$receipt")
+  base=$(jq -r '.base_sha' "$receipt")
+  tip=$(jq -r '.tip_sha' "$receipt")
+  compile_log=$(jq -r '.compile_log' "$receipt")
+  test_log=$(jq -r '.test_log' "$receipt")
+  ids_json=$(jq -c '.job_ids' "$receipt")
+  [[ -d "$repo/.git" && -f "$compile_log" && -f "$test_log" ]] ||
+    fail "push-pending batch is incomplete: $receipt"
+  git -C "$repo" cat-file -e "$tip^{commit}"
+
+  remote_head=$(git ls-remote "$REPO_URL" "refs/heads/$BRANCH" | awk 'NR==1 {print $1}')
+  [[ -n "$remote_head" ]] || fail "cannot resolve remote $BRANCH while resuming $batch_id"
+  # Prove the shared base path is writable and coherent before mutating the
+  # remote branch. A mirror permission error must never strand a pushed batch
+  # without its integration receipt.
+  refresh_staging_mirror "$remote_head"
+  if [[ "$remote_head" == "$base" ]]; then
+    git -C "$repo" push --quiet origin "$tip:refs/heads/$BRANCH"
+    remote_head=$(git ls-remote "$REPO_URL" "refs/heads/$BRANCH" | awk 'NR==1 {print $1}')
+  fi
+  if [[ "$remote_head" != "$tip" ]]; then
+    git -C "$repo" fetch --quiet origin "$BRANCH"
+    git -C "$repo" merge-base --is-ancestor "$tip" FETCH_HEAD ||
+      fail "remote $BRANCH diverged before pending tip $tip could integrate"
+  fi
+  refresh_staging_mirror "$remote_head"
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    job="$batch_dir/ingest/$id/$id.job"
+    patch="$batch_dir/ingest/$id/$id.patch"
+    [[ -f "$job" && -f "$patch" ]] || fail "missing controller-owned ingest while integrating: $id"
+    write_integrated_receipt "$id" "$batch_id" "$base" "$tip" "$remote_head" "$batch_dir" "$receipt"
+    postship_kentbeck "$job" "$id" "$tip" "$batch_id" "$patch"
+  done < <(jq -r '.[]' <<<"$ids_json")
+  write_batch_json "$receipt" integrated "$batch_id" "$base" "$tip" "$compile_log" "$test_log" "$ids_json"
+  log "integrated batch=$batch_id tip=$tip jobs=$(jq 'length' <<<"$ids_json") deploy=asynchronous"
+}
+
+run_once() (
+  # Keep ERR local to this orchestration frame. Helper functions deliberately
+  # use nonzero return codes for expected states (for example, "no ratchet").
+  set -euo pipefail
+  local rows lock batch_id batch_dir repo base tip
+  local _priority _epoch id job patch title apply_log strike before apply_rc
+  local ingest declared_sha computed_sha intake_log job_schema declared_base
+  local declared_paths actual_paths
+  local compile_log test_log ids_json bad_commit bad_id bundle hold_receipt push_receipt pending_rc
+  local failure_step=initialize failure_log='' failure_command=run_once
+  local -a ids=() jobs=() commits=()
+
+  trap 'rc=$?; trap - ERR; record_cycle_failure "${batch_dir:-}" "${batch_id:-}" "$failure_step" "${BASH_COMMAND:-$failure_command}" "$failure_log" "$rc"; exit "$rc"' ERR
+
+  failure_step='state-init'
+  failure_command="mkdir-state"
+  mkdir -p "$STATE/batches"
+  lock="$STATE/controller.lock"
+  if ! mkdir "$lock" 2>/dev/null; then
+    log "another controller owns $lock"
+    exit 75
+  fi
+  trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+
+  if push_receipt=$(pending_push_receipt); then
+    pending_rc=0
+  else
+    pending_rc=$?
+  fi
+  case "$pending_rc" in
+    0)
+      integrate_pending_push "$push_receipt"
+      exit $?
+      ;;
+    10) ;;
+    *) fail "cannot project pending push state" ;;
+  esac
+
+  rows=$(pending_rows)
+  [[ -n "$rows" ]] || exit 10
+
+  batch_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  batch_dir="$STATE/batches/$batch_id"
+  repo="$batch_dir/repo"
+  failure_step='batch-init'
+  failure_command="mkdir-batch"
+  mkdir -p "$batch_dir"
+  printf '%s\n' "$rows" >"$batch_dir/ready.tsv"
+  log "ready batch=$batch_id candidates=$(printf '%s\n' "$rows" | awk 'END {print NR}')"
+
+  failure_step=clone
+  failure_log="$batch_dir/clone.log"
+  failure_command="git-clone"
+  git clone --quiet --single-branch --branch "$BRANCH" "$REPO_URL" "$repo" >"$failure_log" 2>&1
+  base=$(git -C "$repo" rev-parse HEAD)
+
+  while IFS=$'\t' read -r _priority _epoch id job patch; do
+    [[ "${#ids[@]}" -lt "$BATCH_SIZE" ]] || break
+    ingest="$batch_dir/ingest/$id"
+    mkdir -p "$ingest"
+    cp -- "$job" "$ingest/$id.job"
+    cp -- "$patch" "$ingest/$id.patch"
+    # The pre-push batch receipt content-addresses these controller-owned
+    # snapshots. Make them read-only before the local gate so no producer can
+    # replace the bytes between test, push, and integration receipt.
+    chmod 0444 "$ingest/$id.job" "$ingest/$id.patch"
+    job="$ingest/$id.job"
+    patch="$ingest/$id.patch"
+    declared_sha=$(job_value_any "$job" patch_sha256 patch-sha256 patch_sha patch-sha)
+    computed_sha=$(sha256_file "$patch")
+    if [[ -z "$declared_sha" || "$declared_sha" != "$computed_sha" ]]; then
+      intake_log="$ingest/intake-error.log"
+      printf 'declared patch SHA-256: %s\ncomputed patch SHA-256: %s\n' \
+        "${declared_sha:-missing}" "$computed_sha" >"$intake_log"
+      quarantine_job "$id" "$job" "$patch" artifact-digest-mismatch "$intake_log"
+      continue
+    fi
+    job_schema=$(job_value "$job" job_schema)
+    if [[ -n "$job_schema" && "$job_schema" != dev-lane-job.v1 ]]; then
+      intake_log="$ingest/intake-error.log"
+      printf 'unsupported job schema: %s\n' "$job_schema" >"$intake_log"
+      quarantine_job "$id" "$job" "$patch" unsupported-job-schema "$intake_log"
+      continue
+    fi
+    if [[ -z "$job_schema" ]] &&
+       { [[ -d "$INBOX/.claim-$id" ]] || [[ -n "$(job_values "$job" changed_path)" ]]; }; then
+      intake_log="$ingest/intake-error.log"
+      printf 'dev-lane markers require job_schema: dev-lane-job.v1\n' >"$intake_log"
+      quarantine_job "$id" "$job" "$patch" missing-job-schema "$intake_log"
+      continue
+    fi
+    if [[ "$job_schema" == dev-lane-job.v1 ]]; then
+      declared_base=$(job_value "$job" base_sha)
+      if [[ ! "$declared_base" =~ ^[0-9a-f]{40}$ ]] ||
+         ! git -C "$repo" merge-base --is-ancestor "$declared_base" "$base"; then
+        intake_log="$ingest/intake-error.log"
+        printf 'declared base is not an ancestor of batch base\ndeclared: %s\nbatch: %s\n' \
+          "${declared_base:-missing}" "$base" >"$intake_log"
+        quarantine_job "$id" "$job" "$patch" lane-base-invalid "$intake_log"
+        continue
+      fi
+    fi
+    if hold_receipt=$(spark_hold_receipt "$id" "$job" "$patch"); then
+      hold_job "$id" "$job" "$patch" "$hold_receipt"
+      log "hold id=$id receipt=$INBOX/held/spark-core/$id/hold.json"
+      continue
+    fi
+    apply_log="$batch_dir/$id.apply.log"
+    before=$(git -C "$repo" rev-parse HEAD)
+    if ! git -C "$repo" apply --3way --check "$patch" >"$apply_log" 2>&1; then
+      strike=$(increment_conflict_strike "$id")
+      log "defer id=$id conflict_strike=$strike"
+      if (( strike >= 2 )); then
+        bundle="$batch_dir/$id.conflict.json"
+        jq -n --arg schema merger-reason-bundle.v1 --arg reason repeat-conflict \
+          --arg id "$id" --arg patch "$patch" --arg apply_log "$apply_log" \
+          '{schema:$schema,reason:$reason,id:$id,patch:$patch,apply_log:$apply_log}' >"$bundle"
+        invoke_reasoner "$bundle" "$batch_dir/$id.reasoner.log"
+        quarantine_job "$id" "$job" "$patch" repeat-conflict "$apply_log"
+      fi
+      continue
+    fi
+    failure_step=apply-job
+    failure_log="$apply_log"
+    failure_command="git-apply-$id"
+    if git -C "$repo" apply --3way "$patch" >>"$apply_log" 2>&1; then
+      apply_rc=0
+    else
+      apply_rc=$?
+    fi
+    if [[ "$apply_rc" -ne 0 ]] || [[ -n "$(git -C "$repo" diff --name-only --diff-filter=U)" ]]; then
+      quarantine_job "$id" "$job" "$patch" apply-left-unmerged "$apply_log"
+      reset_job_apply "$repo" "$before"
+      continue
+    fi
+    failure_step=stage-job
+    failure_log="$apply_log"
+    failure_command="git-add-$id"
+    git -C "$repo" add -A
+    if git -C "$repo" diff --cached --quiet; then
+      quarantine_job "$id" "$job" "$patch" empty-after-apply "$apply_log"
+      reset_job_apply "$repo" "$before"
+      continue
+    fi
+    if [[ "$job_schema" == dev-lane-job.v1 ]]; then
+      declared_paths="$ingest/declared-paths.txt"
+      actual_paths="$ingest/actual-paths.txt"
+      job_values "$job" changed_path | LC_ALL=C sort -u >"$declared_paths"
+      if ! git_changed_paths "$repo" "$before" | LC_ALL=C sort -u >"$actual_paths"; then
+        intake_log="$ingest/intake-error.log"
+        printf 'Git path inventory contains unsupported control characters\n' >"$intake_log"
+        quarantine_job "$id" "$job" "$patch" unsupported-lane-path "$intake_log"
+        reset_job_apply "$repo" "$before"
+        continue
+      fi
+      if [[ ! -s "$declared_paths" ]] || ! cmp -s "$declared_paths" "$actual_paths"; then
+        intake_log="$ingest/intake-error.log"
+        {
+          printf 'declared paths:\n'
+          sed 's/^/  /' "$declared_paths"
+          printf 'actual paths:\n'
+          sed 's/^/  /' "$actual_paths"
+        } >"$intake_log"
+        quarantine_job "$id" "$job" "$patch" lane-path-mismatch "$intake_log"
+        reset_job_apply "$repo" "$before"
+        continue
+      fi
+    fi
+    title=$(awk -F': ' '/^(job|summary):/ {print $2; exit}' "$job")
+    title=${title:-$id}
+    failure_step=commit-job
+    failure_command="git-commit-$id"
+    git -C "$repo" -c user.name='Curtain Call Merger' -c user.email='merger@curtaincall.invalid' \
+      commit --quiet -m "merge($id): $title"
+    ids+=("$id")
+    jobs+=("$job")
+    commits+=("$(git -C "$repo" rev-parse HEAD)")
+  done <<<"$rows"
+
+  [[ "${#ids[@]}" -gt 0 ]] || {
+    log "ready jobs exist but none assembled; no tests or model polling performed"
+    exit 20
+  }
+
+  tip=$(git -C "$repo" rev-parse HEAD)
+  ids_json=$(printf '%s\n' "${ids[@]}" | jq -Rsc 'split("\n")[:-1]')
+  compile_log="$batch_dir/compile.log"
+  test_log="$batch_dir/test.log"
+
+  failure_step=compile-and-test
+  failure_log="$test_log"
+  failure_command="compile-and-test"
+  if ! run_logged "$repo" "$COMPILE_COMMAND" "$compile_log" ||
+     ! run_logged "$repo" "$TEST_COMMAND" "$test_log"; then
+    bad_commit=$(bisect_red_batch "$repo" "$base" "$tip" "$batch_dir/bisect.log" || true)
+    bad_id=unknown
+    if [[ -n "$bad_commit" ]]; then
+      for i in "${!commits[@]}"; do
+        [[ "${commits[$i]}" == "$bad_commit" ]] && bad_id=${ids[$i]}
+      done
+    fi
+    bundle="$batch_dir/red-batch.json"
+    jq -n --arg schema merger-reason-bundle.v1 --arg reason red-batch \
+      --arg batch_id "$batch_id" --arg base_sha "$base" --arg tip_sha "$tip" \
+      --arg bad_commit "${bad_commit:-unknown}" --arg bad_id "$bad_id" \
+      --arg compile_log "$compile_log" --arg test_log "$test_log" \
+      --arg compile_tail "$(tail -80 "$compile_log" 2>/dev/null || true)" \
+      --arg test_tail "$(tail -120 "$test_log" 2>/dev/null || true)" \
+      --argjson job_ids "$ids_json" \
+      '{schema:$schema,reason:$reason,batch_id:$batch_id,base_sha:$base_sha,tip_sha:$tip_sha,job_ids:$job_ids,bad_commit:$bad_commit,bad_id:$bad_id,compile_log:$compile_log,test_log:$test_log,compile_tail:$compile_tail,test_tail:$test_tail}' >"$bundle"
+    invoke_reasoner "$bundle" "$batch_dir/reasoner.log"
+    if [[ "$bad_id" != unknown ]]; then
+      for i in "${!ids[@]}"; do
+        if [[ "${ids[$i]}" == "$bad_id" ]]; then
+          quarantine_job "$bad_id" "${jobs[$i]}" "${jobs[$i]%.job}.patch" red-batch "$bundle"
+          break
+        fi
+      done
+      write_batch_json "$batch_dir/batch.json" quarantined "$batch_id" "$base" "$tip" "$compile_log" "$test_log" "$ids_json"
+      log "red batch=$batch_id quarantined_bad_id=$bad_id bundle=$bundle; retrying remaining jobs"
+      exit 22
+    fi
+    write_batch_json "$batch_dir/batch.json" red "$batch_id" "$base" "$tip" "$compile_log" "$test_log" "$ids_json"
+    log "red batch=$batch_id bad_id=unknown bundle=$bundle"
+    exit 21
+  fi
+
+  if [[ "$PUSH_ENABLED" != yes ]]; then
+    write_batch_json "$batch_dir/batch.json" validated "$batch_id" "$base" "$tip" "$compile_log" "$test_log" "$ids_json"
+    log "validated batch=$batch_id tip=$tip push-disabled"
+    exit 0
+  fi
+  [[ "${GENE_APPROVED_MERGER_CONTROLLER:-}" == yes ]] || fail "push requires GENE_APPROVED_MERGER_CONTROLLER=yes"
+
+  # The merger's terminal fact is integration, not deployment. Persist the
+  # exact tested intent before push; restart then reconciles the remote branch
+  # and writes content-bound receipts without reapplying or retesting.
+  write_batch_json "$batch_dir/batch.json" push-pending "$batch_id" "$base" "$tip" "$compile_log" "$test_log" "$ids_json"
+  failure_step=integrate
+  failure_log="$batch_dir/push.log"
+  failure_command=integrate-pending-push
+  integrate_pending_push "$batch_dir/batch.json" >"$failure_log" 2>&1
+)
+
+loop() {
+  local rc
+  while true; do
+    set +e
+    run_once
+    rc=$?
+    set -e
+    case "$rc" in
+      0) ;;
+      22) log "poison job quarantined; retrying queue immediately" ;;
+      10|20|21|75) sleep "$POLL_SECONDS" ;;
+      *) log "controller cycle failed rc=$rc"; sleep "$POLL_SECONDS" ;;
+    esac
+  done
+}
+
+require_tools
+case "$COMMAND" in
+  status) status_json ;;
+  scan) pending_rows ;;
+  once) run_once ;;
+  loop) loop ;;
+  release-held)
+    [[ -n "${2:-}" ]] || fail "usage: $0 release-held <id>"
+    release_held_job "$2"
+    ;;
+  wait-deploy)
+    [[ -n "${2:-}" ]] || fail "usage: $0 wait-deploy <full-sha>"
+    wait_for_deploy "$2"
+    ;;
+  deploy-status) deploy_status ;;
+  kentbeck-status) kentbeck_status ;;
+  kentbeck-claim) kentbeck_claim ;;
+  kentbeck-requeue)
+    [[ -n "${2:-}" ]] || fail "usage: $0 kentbeck-requeue <request-id>"
+    kentbeck_requeue "$2"
+    ;;
+  kentbeck-dispatched)
+    [[ -n "${2:-}" && -n "${3:-}" ]] || fail "usage: $0 kentbeck-dispatched <request-id> <anvil-session>"
+    kentbeck_dispatched "$2" "$3"
+    ;;
+  kentbeck-enqueue)
+    [[ "$#" -eq 6 ]] || fail "usage: $0 kentbeck-enqueue <job> <id> <sha> <batch-id> <patch>"
+    enqueue_kentbeck_request "$2" "$3" "$4" "$5" "$6"
+    ;;
+  *) fail "usage: $0 {status|scan|once|loop|release-held <id>|wait-deploy <sha>|deploy-status|kentbeck-status|kentbeck-claim|kentbeck-requeue <id>|kentbeck-dispatched <id> <session>|kentbeck-enqueue <job> <id> <sha> <batch-id> <patch>}" ;;
+esac

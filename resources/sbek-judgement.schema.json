@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "verdict": {
+            "type": "string",
+            "enum": ["pass", "partial", "fail", "not_found", "cannot_judge"]
+          },
+          "confidence": {
+            "type": "string",
+            "enum": ["high", "medium", "low"]
+          },
+          "reasoning": { "type": "string" },
+          "evidence_refs": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        },
+        "required": ["id", "verdict", "confidence", "reasoning", "evidence_refs"]
+      }
+    },
+    "defects": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": ["critical", "major", "minor"]
+          },
+          "description": { "type": "string" },
+          "where": { "type": "string" }
+        },
+        "required": ["severity", "description", "where"]
+      }
+    },
+    "area_notes": { "type": "string" }
+  },
+  "required": ["items", "defects", "area_notes"]
+}

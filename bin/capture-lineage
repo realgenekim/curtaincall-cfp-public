@@ -1,0 +1,717 @@
+#!/usr/bin/env python3
+"""Create and verify immutable stateful-eval capture lineage receipts."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+OBJECT_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
+OUTCOMES = {"completed", "blocked", "feature_not_found", "agent_error"}
+TERMINAL_STATUSES = {"failed", "not-run"}
+TERMINAL_SCOPES = {"scenario-local", "slot-local", "run-global"}
+LINEAGE_LANES = {"CFP", "SPK"}
+PERSONA_EMAILS = {
+    "organizer": "swyx@ai.engineer",
+    "reviewer": "maya.lindholm@example.com",
+    "speaker": "amara.devlin+472@beaconloop.example.com",
+}
+LEGACY_EVENT_NAMES = {"devflow conf 2027"}
+LEGACY_EVENT_SLUGS = {"devflow-conf-2027"}
+LEGACY_SPEAKER_NAMES = {"priya raman"}
+TRAILING_URL_PUNCTUATION = ".,;:!?)]}'\""
+OBSERVED_EVENT_ROUTE = re.compile(
+    r"(?<![A-Za-z0-9._~/-])"
+    r"(?P<url>(?:https?://[^/\s]+)?/"
+    r"(?P<api>api(?:/v1)?/)?(?P<family>events|cfp)/(?P<slug>[^/?#\s]+))",
+    re.IGNORECASE,
+)
+INTERNAL_EVENT_ROUTES = {
+    ("", "events", "new"),
+    ("api/", "events", "archive"),
+    ("api/", "events", "create"),
+    ("api/", "events", "demo"),
+    ("api/", "events", "draft-pref"),
+    ("api/", "events", "preview"),
+    ("api/", "cfp", "live"),
+}
+INTERNAL_EVENT_ROUTE_TOKENS = {
+    "api", "archive", "add", "create", "demo", "draft-pref", "edit",
+    "live", "new", "preview", "settings",
+}
+SCENARIO_ACTORS = {
+    "CFP-S1": ["organizer"],
+    "CFP-S2": ["speaker"],
+    "CFP-S3": ["organizer", "reviewer"],
+    "CFP-S4": ["organizer", "speaker"],
+    "SPK-S1": ["organizer"],
+    "SPK-S2": ["speaker"],
+    "SPK-S3": ["organizer"],
+}
+
+
+class Refusal(Exception):
+    def __init__(self, code: str, detail: str):
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+
+
+def refuse(code: str, detail: str) -> None:
+    raise Refusal(code, detail)
+
+
+def canonical_bytes(value: Any) -> bytes:
+    try:
+        return (json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True,
+                           separators=(",", ":")) + "\n").encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as error:
+        refuse("invalid-json-domain", str(error))
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def body_id(body: dict[str, Any]) -> str:
+    return "sha256:" + sha256_bytes(canonical_bytes(body))
+
+
+def require_regular(path: Path, code: str) -> Path:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        refuse(code, f"cannot inspect {path}: {error}")
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        refuse(code, f"not a regular non-symlink file: {path}")
+    return path
+
+
+def read_bytes(path: Path, code: str) -> bytes:
+    try:
+        return require_regular(path, code).read_bytes()
+    except OSError as error:
+        refuse(code, f"cannot read {path}: {error}")
+
+
+def load_json(path: Path, code: str) -> dict[str, Any]:
+    try:
+        value = json.loads(read_bytes(path, code))
+    except (json.JSONDecodeError, UnicodeError) as error:
+        refuse(code, f"cannot parse {path}: {error}")
+    if not isinstance(value, dict):
+        refuse(code, f"expected JSON object: {path}")
+    return value
+
+
+def load_jsonl(path: Path) -> tuple[list[dict[str, Any]], bytes]:
+    raw = read_bytes(path, "invalid-store")
+    events: list[dict[str, Any]] = []
+    try:
+        for number, line in enumerate(raw.splitlines(), 1):
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                refuse("invalid-store", f"line {number} is not an object")
+            events.append(value)
+    except (json.JSONDecodeError, UnicodeError) as error:
+        refuse("invalid-store", f"cannot parse {path}: {error}")
+    if not events:
+        refuse("invalid-store", "event store is empty")
+    return events, raw
+
+
+def atomic_create_or_same(path: Path, data: bytes) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() or path.is_symlink():
+        if read_bytes(path, "receipt-collision") == data:
+            return "reused"
+        refuse("receipt-collision", f"different bytes already exist at {path}")
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if read_bytes(path, "receipt-collision") != data:
+                refuse("receipt-collision", f"concurrent different bytes at {path}")
+            return "reused"
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return "created"
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def exact_keys(value: Any, expected: set[str], code: str) -> None:
+    if not isinstance(value, dict):
+        refuse(code, "expected JSON object")
+    if set(value) != expected:
+        refuse(code, f"keys differ: expected={sorted(expected)} actual={sorted(value)}")
+
+
+def validate_lineage(value: dict[str, Any]) -> dict[str, Any]:
+    exact_keys(value, {"schema", "id", "product_sha", "harness_sha", "eval_kit_sha",
+                       "eval_config_sha256", "golden_sha256", "lane", "scenarios",
+                       "event", "personas"}, "invalid-lineage")
+    if (value["schema"] != "capture-lineage.v1" or
+            not isinstance(value["id"], str) or not OBJECT_ID.fullmatch(value["id"])):
+        refuse("invalid-lineage", "schema or id is invalid")
+    body = {key: item for key, item in value.items() if key != "id"}
+    if body_id(body) != value["id"]:
+        refuse("invalid-lineage", "lineage id does not match its canonical body")
+    if value["lane"] not in LINEAGE_LANES:
+        refuse("invalid-lineage", f"unsupported lane {value['lane']!r}")
+    scenarios = value["scenarios"]
+    if (not isinstance(scenarios, list) or not scenarios or
+            len(scenarios) != len(set(scenarios)) or
+            any(not isinstance(item, str) or item not in SCENARIO_ACTORS or
+                not item.startswith(value["lane"] + "-") for item in scenarios)):
+        refuse("invalid-lineage", "scenario sequence is invalid")
+    canonical_order = [scenario for scenario in SCENARIO_ACTORS
+                       if scenario.startswith(value["lane"] + "-")]
+    if scenarios != [scenario for scenario in canonical_order if scenario in scenarios]:
+        refuse("invalid-lineage", "scenario sequence is not in canonical lane order")
+    for field in ("product_sha", "harness_sha", "eval_kit_sha"):
+        if not isinstance(value[field], str) or not HEX40.fullmatch(value[field]):
+            refuse("invalid-lineage", f"{field} is not a 40-hex commit")
+    for field in ("eval_config_sha256", "golden_sha256"):
+        if not isinstance(value[field], str) or not HEX64.fullmatch(value[field]):
+            refuse("invalid-lineage", f"{field} is not a SHA-256")
+    event = value["event"]
+    if not isinstance(event, dict):
+        refuse("invalid-lineage", "event is not an object")
+    exact_keys(event, {"id", "slug", "name"}, "invalid-lineage")
+    if not all(isinstance(event.get(key), str) and event[key] for key in event):
+        refuse("invalid-lineage", "event identity is incomplete")
+    personas = value["personas"]
+    if not isinstance(personas, dict) or set(personas) != set(PERSONA_EMAILS):
+        refuse("invalid-lineage", "persona set is incomplete")
+    for role, expected_email in PERSONA_EMAILS.items():
+        persona = personas[role]
+        if not isinstance(persona, dict):
+            refuse("invalid-lineage", f"{role} persona is not an object")
+        exact_keys(persona, {"id", "email", "name"}, "invalid-lineage")
+        if (not all(isinstance(persona.get(key), str) and persona[key] for key in persona) or
+                persona["email"].casefold() != expected_email):
+            refuse("invalid-lineage", f"{role} persona identity is invalid")
+    return value
+
+
+def find_fixture(events: list[dict[str, Any]]) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+    created = [event.get("payload") for event in events if event.get("type") == "event.created"]
+    if len(created) != 1 or not isinstance(created[0], dict):
+        refuse("fixture-lineage-ambiguous", f"expected one fixture event; found {len(created)}")
+    event = {key: created[0].get(key) for key in ("id", "slug", "name")}
+    if not all(isinstance(item, str) and item for item in event.values()):
+        refuse("fixture-lineage-ambiguous", "fixture event identity is incomplete")
+    by_email: dict[str, list[dict[str, Any]]] = {}
+    for item in events:
+        payload = item.get("payload")
+        if item.get("type") != "person.created" or not isinstance(payload, dict):
+            continue
+        email = payload.get("email")
+        if isinstance(email, str):
+            by_email.setdefault(email.casefold(), []).append(payload)
+    personas: dict[str, dict[str, str]] = {}
+    for role, email in PERSONA_EMAILS.items():
+        matches = by_email.get(email, [])
+        if len(matches) != 1:
+            refuse("fixture-lineage-ambiguous",
+                   f"expected one {role} persona {email}; found {len(matches)}")
+        payload = matches[0]
+        persona = {key: payload.get(key) for key in ("id", "email", "name")}
+        if not all(isinstance(item, str) and item for item in persona.values()):
+            refuse("fixture-lineage-ambiguous", f"incomplete {role} persona")
+        personas[role] = persona
+    return event, personas
+
+
+def command_create_lane(args: argparse.Namespace) -> None:
+    golden_path = Path(args.golden)
+    store_path = Path(args.store)
+    golden_events, golden_raw = load_jsonl(golden_path)
+    store_events, store_raw = load_jsonl(store_path)
+    if sha256_bytes(golden_raw) != args.golden_sha256:
+        refuse("golden-digest-mismatch", "golden bytes do not match the declared SHA-256")
+    event, personas = find_fixture(golden_events)
+    if not store_raw.startswith(golden_raw):
+        refuse("store-prefix-mismatch", "fresh lane store does not preserve the exact golden fixture")
+    runtime_events = store_events[len(golden_events):]
+    expected_sessions = {
+        personas[role]["email"].casefold(): personas[role]["id"]
+        for role in ("organizer", "reviewer", "speaker")
+    }
+    observed_sessions: dict[str, str] = {}
+    for item in runtime_events:
+        payload = item.get("payload")
+        actor = item.get("actor")
+        if (item.get("type") != "auth.session-started" or
+                not isinstance(actor, str) or not isinstance(payload, dict) or
+                not isinstance(payload.get("person-id"), str)):
+            refuse("store-prefix-mismatch",
+                   "fresh lane store contains a non-authentication runtime event")
+        actor_key = actor.casefold()
+        if actor_key not in expected_sessions or actor_key in observed_sessions:
+            refuse("persona-lineage-mismatch",
+                   f"fresh lane store contains an unexpected or duplicate authenticated actor {actor}")
+        observed_sessions[actor_key] = payload["person-id"]
+    if observed_sessions != expected_sessions:
+        refuse("persona-lineage-mismatch",
+               "fresh lane store does not contain exactly the three pinned persona sessions")
+    scenarios = args.scenarios.split()
+    body = {
+        "schema": "capture-lineage.v1",
+        "product_sha": args.product_sha,
+        "harness_sha": args.harness_sha,
+        "eval_kit_sha": args.eval_kit_sha,
+        "eval_config_sha256": args.eval_config_sha256,
+        "golden_sha256": args.golden_sha256,
+        "lane": args.lane,
+        "scenarios": scenarios,
+        "event": event,
+        "personas": personas,
+    }
+    value = {**body, "id": body_id(body)}
+    validate_lineage(value)
+    state = atomic_create_or_same(Path(args.output), canonical_bytes(value))
+    print(json.dumps({"ok": True, "state": state, "lineage_id": value["id"]}, sort_keys=True))
+
+
+def parse_store_before(token: str) -> tuple[str, int]:
+    pieces = token.split(":")
+    if len(pieces) != 2 or not HEX64.fullmatch(pieces[0]) or not pieces[1].isdigit():
+        refuse("invalid-store-prefix", "store-before must be SHA256:BYTE_COUNT")
+    return pieces[0], int(pieces[1])
+
+
+def observed_evidence_strings(evidence: dict[str, Any]):
+    """Yield product observations while excluding instruction-only text.
+
+    Browser tool calls and their results are part of what the capture did and
+    saw.  Scenario briefs are instructions, not product facts.  Unknown kinds
+    refuse instead of becoming an unscanned channel for stale lineage.
+    """
+    for field in ("summary", "finalUrl"):
+        value = evidence.get(field)
+        if not isinstance(value, str):
+            refuse("invalid-evidence", f"{field} is not a string")
+        yield value
+    observations = evidence.get("observations")
+    if not isinstance(observations, list) or any(not isinstance(item, str)
+                                                 for item in observations):
+        refuse("invalid-evidence", "observations are not a string array")
+    yield from observations
+    transcript = evidence.get("transcript")
+    if not isinstance(transcript, list):
+        refuse("invalid-evidence", "transcript is not an array")
+    observed_kinds = {"tool_call", "tool_result"}
+    instruction_kinds = {
+        "system", "user", "assistant", "prompt", "instruction", "scenario",
+        "scenario_brief",
+    }
+    for entry in transcript:
+        if not isinstance(entry, dict):
+            refuse("invalid-evidence", "transcript entry is not an object")
+        kind = entry.get("kind")
+        detail = entry.get("detail")
+        if kind not in observed_kinds | instruction_kinds:
+            refuse("invalid-evidence", f"transcript kind {kind!r} is not recognized")
+        if not isinstance(detail, str):
+            refuse("invalid-evidence", "transcript detail is not a string")
+        if kind in observed_kinds:
+            yield detail
+    screenshots = evidence.get("screenshots")
+    if not isinstance(screenshots, list):
+        refuse("invalid-evidence", "screenshots are not an array")
+    for screenshot in screenshots:
+        if not isinstance(screenshot, dict):
+            refuse("invalid-evidence", "screenshot is not an object")
+        for field in ("label", "path"):
+            value = screenshot.get(field)
+            if not isinstance(value, str):
+                refuse("invalid-evidence", f"screenshot {field} is not a string")
+            yield value
+
+
+def validate_store(lineage: dict[str, Any], store_path: Path,
+                   before_token: str, scenario: str) -> tuple[dict[str, Any],
+                                                               list[dict[str, Any]],
+                                                               list[dict[str, str]]]:
+    events, raw = load_jsonl(store_path)
+    before_sha, before_size = parse_store_before(before_token)
+    if before_size > len(raw) or sha256_bytes(raw[:before_size]) != before_sha:
+        refuse("store-prefix-mismatch", "event store did not preserve the captured prefix")
+    before_events = len(raw[:before_size].splitlines())
+    created = [event.get("payload") for event in events if event.get("type") == "event.created"]
+    canonical_event = lineage["event"]
+    identities = [
+        {key: payload.get(key) for key in ("id", "slug", "name")}
+        for payload in created if isinstance(payload, dict)
+    ]
+    if not identities or identities[0] != canonical_event:
+        refuse("event-lineage-mismatch",
+               f"event inventory differs from pinned event {canonical_event['slug']}: {identities}")
+    auxiliary_events = identities[1:]
+    if auxiliary_events:
+        allowed = (scenario == "CFP-S1" and len(auxiliary_events) == 1 and
+                   auxiliary_events[0]["name"] == "Forward Summit 2028" and
+                   auxiliary_events[0]["slug"].startswith("forward-summit-2028"))
+        if not allowed:
+            refuse("event-lineage-mismatch",
+                   f"unauthorized auxiliary event inventory for {scenario}: {auxiliary_events}")
+        created_after_start = [
+            event.get("payload") for event in events[before_events:]
+            if event.get("type") == "event.created"
+        ]
+        if created_after_start != [created[-1]]:
+            refuse("event-lineage-mismatch",
+                   "auxiliary event was not created by the current scenario")
+    canonical_id = canonical_event["id"]
+    auxiliary_ids = {event["id"] for event in auxiliary_events}
+    for number, event in enumerate(events, 1):
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        referenced = [event.get("event-id"), payload.get("event-id")]
+        allowed_ids = {canonical_id}
+        if number > before_events:
+            allowed_ids |= auxiliary_ids
+        if any(item is not None and item not in allowed_ids for item in referenced):
+            refuse("event-lineage-mismatch", f"line {number} references a different event")
+        if event.get("type") == "person.created":
+            name = payload.get("name")
+            if isinstance(name, str) and name.casefold().strip() in LEGACY_SPEAKER_NAMES:
+                refuse("persona-lineage-mismatch", f"line {number} creates legacy speaker {name}")
+    return ({"sha256": before_sha, "bytes": before_size}, events, auxiliary_events)
+
+
+def validate_evidence(lineage: dict[str, Any], evidence_path: Path,
+                      auxiliary_events: list[dict[str, str]]) -> tuple[dict[str, Any], bytes]:
+    raw = read_bytes(evidence_path, "invalid-evidence")
+    try:
+        evidence = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeError) as error:
+        refuse("invalid-evidence", str(error))
+    if not isinstance(evidence, dict):
+        refuse("invalid-evidence", "evidence is not an object")
+    scenario = evidence.get("scenarioId")
+    if scenario not in lineage["scenarios"]:
+        refuse("invalid-evidence", f"scenario {scenario!r} is outside the lineage")
+    if evidence.get("outcome") not in OUTCOMES:
+        refuse("invalid-evidence", "outcome is invalid")
+    allowed_slugs = {lineage["event"]["slug"].casefold(), "new"}
+    allowed_slugs |= {event["slug"].casefold() for event in auxiliary_events}
+    for text in observed_evidence_strings(evidence):
+        lowered = text.casefold()
+        if any(name in lowered for name in LEGACY_EVENT_NAMES):
+            refuse("event-lineage-mismatch", "evidence names the legacy DevFlow event")
+        if any(name in lowered for name in LEGACY_SPEAKER_NAMES):
+            refuse("persona-lineage-mismatch", "evidence names the legacy Priya persona")
+        for match in OBSERVED_EVENT_ROUTE.finditer(text):
+            raw_slug = match.group("slug")
+            slug = raw_slug.rstrip(TRAILING_URL_PUNCTUATION)
+            if not slug:
+                refuse("event-lineage-mismatch",
+                       f"evidence URL has no event slug: {raw_slug}")
+            if "…" in raw_slug or "…" in match.group("url"):
+                refuse("event-lineage-mismatch",
+                       f"evidence URL contains U+2026/ellipsis: {match.group('url')}")
+            route_identity = (
+                (match.group("api") or "").casefold(),
+                match.group("family").casefold(),
+                slug.casefold(),
+            )
+            if (route_identity in INTERNAL_EVENT_ROUTES or
+                    (match.group("family").casefold() == "events" and
+                     slug.casefold() in INTERNAL_EVENT_ROUTE_TOKENS)):
+                continue
+            if slug.casefold() not in allowed_slugs:
+                refuse("event-lineage-mismatch",
+                       f"evidence URL {match.group('url')} names event slug {slug}")
+    return evidence, raw
+
+
+def validate_auth(path: Path) -> bytes:
+    raw = read_bytes(path, "invalid-auth-proof")
+    try:
+        text = raw.decode("utf-8").strip()
+    except UnicodeError as error:
+        refuse("invalid-auth-proof", str(error))
+    if text != "personas=organizer,reviewer,speaker cookies=verified":
+        refuse("invalid-auth-proof", "persona session proof is incomplete")
+    return raw
+
+
+def validate_receipt(value: dict[str, Any]) -> dict[str, Any]:
+    exact_keys(value, {"schema", "id", "lineage_id", "lineage", "scenario_id", "actors", "outcome",
+                       "evidence_sha256", "auth_proof_sha256", "store_before", "store_after",
+                       "predecessor_receipt_sha256", "captured_at"}, "invalid-capture-receipt")
+    if value.get("schema") != "capture-evidence-receipt.v1" or not OBJECT_ID.fullmatch(str(value.get("id"))):
+        refuse("invalid-capture-receipt", "schema or id is invalid")
+    body = {key: item for key, item in value.items() if key != "id"}
+    if body_id(body) != value["id"]:
+        refuse("invalid-capture-receipt", "receipt id does not match its canonical body")
+    if not OBJECT_ID.fullmatch(str(value.get("lineage_id"))):
+        refuse("invalid-capture-receipt", "lineage id is invalid")
+    lineage = validate_lineage(value.get("lineage"))
+    if lineage["id"] != value["lineage_id"]:
+        refuse("invalid-capture-receipt", "embedded lineage does not match lineage id")
+    scenario = value.get("scenario_id")
+    if scenario not in SCENARIO_ACTORS or value.get("actors") != SCENARIO_ACTORS[scenario]:
+        refuse("invalid-capture-receipt", "scenario actors are invalid")
+    if value.get("outcome") not in OUTCOMES:
+        refuse("invalid-capture-receipt", "outcome is invalid")
+    for field in ("evidence_sha256", "auth_proof_sha256"):
+        if not HEX64.fullmatch(str(value.get(field))):
+            refuse("invalid-capture-receipt", f"{field} is invalid")
+    predecessor = value.get("predecessor_receipt_sha256")
+    if predecessor is not None and not HEX64.fullmatch(str(predecessor)):
+        refuse("invalid-capture-receipt", "predecessor digest is invalid")
+    for field in ("store_before", "store_after"):
+        item = value.get(field)
+        if (not isinstance(item, dict) or set(item) != {"sha256", "bytes", "lines"} or
+                not HEX64.fullmatch(str(item.get("sha256"))) or
+                not isinstance(item.get("bytes"), int) or item["bytes"] < 1 or
+                not isinstance(item.get("lines"), int) or item["lines"] < 1):
+            refuse("invalid-capture-receipt", f"{field} is invalid")
+    if value["store_after"]["bytes"] < value["store_before"]["bytes"]:
+        refuse("invalid-capture-receipt", "store shrank")
+    if not isinstance(value.get("captured_at"), str) or not value["captured_at"]:
+        refuse("invalid-capture-receipt", "captured_at is invalid")
+    return value
+
+
+def command_record(args: argparse.Namespace) -> None:
+    lineage = validate_lineage(load_json(Path(args.lineage), "invalid-lineage"))
+    evidence_value = load_json(Path(args.evidence), "invalid-evidence")
+    scenario = evidence_value.get("scenarioId")
+    if scenario not in lineage["scenarios"]:
+        refuse("invalid-evidence", f"scenario {scenario!r} is outside the lineage")
+    auth_raw = validate_auth(Path(args.auth_proof))
+    before, events, auxiliary_events = validate_store(
+        lineage, Path(args.store), args.store_before, scenario)
+    evidence, evidence_raw = validate_evidence(
+        lineage, Path(args.evidence), auxiliary_events)
+    _, store_raw = load_jsonl(Path(args.store))
+    before["lines"] = len(store_raw[:before["bytes"]].splitlines())
+    predecessor_sha: str | None = None
+    scenario_index = lineage["scenarios"].index(scenario)
+    if scenario_index == 0:
+        if args.predecessor != "-":
+            refuse("capture-receipt-chain-mismatch", "first scenario cannot have a predecessor")
+    else:
+        if args.predecessor == "-":
+            refuse("capture-receipt-chain-mismatch", "later scenario requires predecessor")
+        predecessor_path = Path(args.predecessor)
+        predecessor_raw = read_bytes(predecessor_path, "capture-receipt-chain-mismatch")
+        predecessor = validate_receipt(load_json(predecessor_path, "capture-receipt-chain-mismatch"))
+        expected_scenario = lineage["scenarios"][scenario_index - 1]
+        if predecessor["lineage_id"] != lineage["id"] or predecessor["scenario_id"] != expected_scenario:
+            refuse("capture-receipt-chain-mismatch", "predecessor is from a different lineage position")
+        predecessor_sha = sha256_bytes(predecessor_raw)
+        if predecessor["store_after"]["sha256"] != before["sha256"] or predecessor["store_after"]["bytes"] != before["bytes"]:
+            refuse("capture-receipt-chain-mismatch", "store prefix does not continue predecessor")
+    body = {
+        "schema": "capture-evidence-receipt.v1",
+        "lineage_id": lineage["id"],
+        "lineage": lineage,
+        "scenario_id": scenario,
+        "actors": SCENARIO_ACTORS[scenario],
+        "outcome": evidence["outcome"],
+        "evidence_sha256": sha256_bytes(evidence_raw),
+        "auth_proof_sha256": sha256_bytes(auth_raw),
+        "store_before": before,
+        "store_after": {"sha256": sha256_bytes(store_raw), "bytes": len(store_raw), "lines": len(events)},
+        "predecessor_receipt_sha256": predecessor_sha,
+        "captured_at": evidence.get("finishedAt"),
+    }
+    value = {**body, "id": body_id(body)}
+    validate_receipt(value)
+    state = atomic_create_or_same(Path(args.output), canonical_bytes(value))
+    print(json.dumps({"ok": True, "state": state, "receipt_id": value["id"]}, sort_keys=True))
+
+
+def manifest_lineage_fields(manifest: dict[str, Any]) -> dict[str, Any]:
+    fields = {
+        "product_sha": manifest.get("code_sha"),
+        "harness_sha": manifest.get("harness_sha"),
+        "eval_kit_sha": manifest.get("eval_kit_sha"),
+        "eval_config_sha256": manifest.get("eval_config_sha256"),
+        "golden_sha256": manifest.get("golden_fixture_sha256"),
+    }
+    return fields
+
+
+def command_verify_receipt(args: argparse.Namespace) -> None:
+    receipt_path = Path(args.receipt)
+    raw = read_bytes(receipt_path, "invalid-capture-receipt")
+    receipt = validate_receipt(load_json(receipt_path, "invalid-capture-receipt"))
+    evidence_path = Path(args.evidence)
+    if receipt["scenario_id"] != args.scenario:
+        refuse("invalid-capture-receipt", "receipt scenario differs from request")
+    if receipt["evidence_sha256"] != sha256_bytes(read_bytes(evidence_path, "invalid-evidence")):
+        refuse("invalid-capture-receipt", "receipt does not bind evidence bytes")
+    if args.lineage:
+        lineage = validate_lineage(load_json(Path(args.lineage), "invalid-lineage"))
+        if receipt["lineage_id"] != lineage["id"] or receipt["lineage"] != lineage:
+            refuse("invalid-capture-receipt", "receipt differs from lane lineage")
+    if args.predecessor == "-":
+        if receipt["predecessor_receipt_sha256"] is not None:
+            refuse("capture-receipt-chain-mismatch", "first scenario has a predecessor")
+    else:
+        predecessor_path = Path(args.predecessor)
+        predecessor_raw = read_bytes(predecessor_path, "capture-receipt-chain-mismatch")
+        predecessor = validate_receipt(load_json(predecessor_path, "capture-receipt-chain-mismatch"))
+        if (receipt["predecessor_receipt_sha256"] != sha256_bytes(predecessor_raw) or
+                receipt["lineage_id"] != predecessor["lineage_id"] or
+                receipt["store_before"]["sha256"] != predecessor["store_after"]["sha256"] or
+                receipt["store_before"]["bytes"] != predecessor["store_after"]["bytes"]):
+            refuse("capture-receipt-chain-mismatch", "receipt does not continue predecessor")
+    print(json.dumps({"ok": True, "receipt_id": receipt["id"],
+                      "receipt_sha256": sha256_bytes(raw)}, sort_keys=True))
+
+
+def command_verify_run(args: argparse.Namespace) -> None:
+    root = Path(args.run).resolve(strict=True)
+    manifest = load_json(Path(args.manifest), "invalid-manifest")
+    scenarios = manifest.get("scenarios")
+    lanes = manifest.get("stateful_area_lanes")
+    if manifest.get("capture_lineage_schema") != "capture-lineage.v1":
+        refuse("invalid-manifest", "capture lineage schema is missing or unsupported")
+    if (not isinstance(scenarios, list) or not isinstance(lanes, list) or
+            any(not isinstance(item, str) for item in scenarios + lanes)):
+        refuse("invalid-manifest", "scenario/lane inventory is invalid")
+    verified = 0
+    for lane in lanes:
+        if lane not in LINEAGE_LANES:
+            continue
+        lane_scenarios = [scenario for scenario in scenarios if scenario.startswith(lane + "-")]
+        prior_raw: bytes | None = None
+        prior: dict[str, Any] | None = None
+        lineage_id: str | None = None
+        for index, scenario in enumerate(lane_scenarios):
+            matches = sorted(root.rglob(f"{scenario}/capture-receipt.json"))
+            if len(matches) != 1:
+                refuse("missing-capture-receipt", f"expected one receipt for {scenario}; found {len(matches)}")
+            receipt_path = matches[0]
+            if root not in receipt_path.resolve().parents:
+                refuse("invalid-capture-receipt", f"receipt escapes run root: {receipt_path}")
+            raw = read_bytes(receipt_path, "invalid-capture-receipt")
+            receipt = validate_receipt(load_json(receipt_path, "invalid-capture-receipt"))
+            evidence_path = receipt_path.with_name("evidence.json")
+            if receipt["scenario_id"] != scenario or receipt["evidence_sha256"] != sha256_bytes(read_bytes(evidence_path, "invalid-evidence")):
+                refuse("invalid-capture-receipt", f"receipt does not bind {scenario} evidence")
+            if index == 0:
+                if receipt["predecessor_receipt_sha256"] is not None:
+                    refuse("capture-receipt-chain-mismatch", f"{scenario} has unexpected predecessor")
+                lineage_id = receipt["lineage_id"]
+            else:
+                assert prior_raw is not None and prior is not None
+                if (receipt["lineage_id"] != lineage_id or
+                        receipt["predecessor_receipt_sha256"] != sha256_bytes(prior_raw) or
+                        receipt["store_before"]["sha256"] != prior["store_after"]["sha256"] or
+                        receipt["store_before"]["bytes"] != prior["store_after"]["bytes"]):
+                    refuse("capture-receipt-chain-mismatch", f"{scenario} does not continue prior receipt")
+            lineage = receipt["lineage"]
+            if lineage["lane"] != lane or lineage["scenarios"] != lane_scenarios:
+                refuse("invalid-lineage", f"lineage scenario inventory differs for {lane}")
+            for key, expected in manifest_lineage_fields(manifest).items():
+                if lineage[key] != expected:
+                    refuse("invalid-lineage", f"lineage {key} differs from manifest")
+            prior_raw, prior = raw, receipt
+            verified += 1
+    print(json.dumps({"ok": True, "schema": "capture-lineage-verification.v1",
+                      "verified_receipts": verified}, sort_keys=True))
+
+
+def command_verify_disposition(args: argparse.Namespace) -> None:
+    path = require_regular(Path(args.path), "invalid-terminal-disposition")
+    value = load_json(path, "invalid-terminal-disposition")
+    if not isinstance(value, dict):
+        refuse("invalid-terminal-disposition", "disposition must be an object")
+    required = {"schema", "recorded_at", "scenario", "status", "cause", "owner", "scope"}
+    allowed = required | {"predecessor"}
+    keys = set(value)
+    if keys != required and keys != allowed:
+        refuse("invalid-terminal-disposition", "disposition keys differ from v2 schema")
+    if value.get("schema") != "hill-climb-scenario-terminal.v2":
+        refuse("invalid-terminal-disposition", "only terminal disposition v2 is accepted")
+    if value.get("scenario") != args.scenario:
+        refuse("invalid-terminal-disposition", "scenario does not match its owner path")
+    if value.get("status") not in TERMINAL_STATUSES:
+        refuse("invalid-terminal-disposition", "status is unsupported")
+    if value.get("scope") not in TERMINAL_SCOPES:
+        refuse("invalid-terminal-disposition", "scope is unsupported")
+    for field in ("recorded_at", "cause", "owner"):
+        if not isinstance(value.get(field), str) or not value[field]:
+            refuse("invalid-terminal-disposition", f"{field} must be a non-empty string")
+    if "predecessor" in value and (not isinstance(value["predecessor"], str)
+                                   or not value["predecessor"]):
+        refuse("invalid-terminal-disposition", "predecessor must be a non-empty string")
+    print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(prog="capture-lineage")
+    subparsers = result.add_subparsers(dest="command", required=True)
+    create = subparsers.add_parser("create-lane")
+    for name in ("golden", "store", "output", "lane", "scenarios", "product-sha",
+                 "harness-sha", "eval-kit-sha", "eval-config-sha256", "golden-sha256"):
+        create.add_argument("--" + name, required=True)
+    create.set_defaults(handler=command_create_lane)
+    record = subparsers.add_parser("record")
+    for name in ("lineage", "store", "store-before", "evidence", "auth-proof",
+                 "predecessor", "output"):
+        record.add_argument("--" + name, required=True)
+    record.set_defaults(handler=command_record)
+    verify = subparsers.add_parser("verify-run")
+    verify.add_argument("--run", required=True)
+    verify.add_argument("--manifest", required=True)
+    verify.set_defaults(handler=command_verify_run)
+
+    verify_receipt = subparsers.add_parser("verify-receipt")
+    for name in ("receipt", "evidence", "scenario", "predecessor"):
+        verify_receipt.add_argument(f"--{name}", required=True)
+    verify_receipt.add_argument("--lineage")
+    verify_receipt.set_defaults(handler=command_verify_receipt)
+    verify_disposition = subparsers.add_parser("verify-disposition")
+    verify_disposition.add_argument("--path", required=True)
+    verify_disposition.add_argument("--scenario", required=True)
+    verify_disposition.set_defaults(handler=command_verify_disposition)
+    return result
+
+
+def main() -> int:
+    try:
+        args = parser().parse_args()
+        args.handler(args)
+        return 0
+    except Refusal as error:
+        print(f"ERROR capture-lineage: {error.code}: {error.detail}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError) as error:
+        print(f"ERROR capture-lineage: unexpected-io: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

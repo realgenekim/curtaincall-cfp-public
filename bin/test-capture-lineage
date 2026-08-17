@@ -1,0 +1,406 @@
+#!/usr/bin/env bash
+# Hermetic contract tests for stateful CFP/Speaker capture lineage.
+set -euo pipefail
+
+repo_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+tool="$repo_root/bin/capture-lineage"
+test_root="$(mktemp -d "${TMPDIR:-/tmp}/capture-lineage-test.XXXXXX")"
+trap 'rm -rf -- "$test_root"' EXIT
+
+sha_a=1111111111111111111111111111111111111111
+sha_b=2222222222222222222222222222222222222222
+sha_d=4444444444444444444444444444444444444444444444444444444444444444
+event_id=18948e7a-8966-4c92-a153-40c93a78feea
+speaker_id=d4fed260-30ff-4023-b4f3-5d34881a4349
+
+golden="$test_root/golden.jsonl"
+cat >"$golden" <<JSONL
+{"at":"2026-07-20T12:00:00Z","actor":"judge-sandbox","type":"event.created","payload":{"id":"$event_id","slug":"enterprise-ai-summit-charlotte-2026","name":"Enterprise AI Summit"}}
+{"at":"2026-07-20T12:00:00Z","actor":"judge-sandbox","type":"person.created","event-id":"$event_id","payload":{"id":"org-1","email":"swyx@ai.engineer","name":"swyx"}}
+{"at":"2026-07-20T12:00:00Z","actor":"judge-sandbox","type":"person.created","event-id":"$event_id","payload":{"id":"reviewer-1","email":"maya.lindholm@example.com","name":"Maya Lindholm"}}
+{"at":"2026-07-20T12:00:00Z","actor":"judge-sandbox","type":"person.created","event-id":"$event_id","payload":{"id":"$speaker_id","email":"amara.devlin+472@beaconloop.example.com","name":"Amara Devlin"}}
+JSONL
+golden_sha="$(shasum -a 256 "$golden" | awk '{print $1}')"
+
+make_lane() {
+  local root=$1 lane=$2 scenarios=$3
+  mkdir -p "$root"
+  cp "$golden" "$root/events.jsonl"
+  cat >>"$root/events.jsonl" <<JSONL
+{"at":"2026-08-15T00:00:00Z","actor":"swyx@ai.engineer","type":"auth.session-started","payload":{"id":"session-org","person-id":"org-1","created-at":"2026-08-15T00:00:00Z"}}
+{"at":"2026-08-15T00:00:00Z","actor":"maya.lindholm@example.com","type":"auth.session-started","payload":{"id":"session-reviewer","person-id":"reviewer-1","created-at":"2026-08-15T00:00:00Z"}}
+{"at":"2026-08-15T00:00:00Z","actor":"amara.devlin+472@beaconloop.example.com","type":"auth.session-started","payload":{"id":"session-speaker","person-id":"$speaker_id","created-at":"2026-08-15T00:00:00Z"}}
+JSONL
+  "$tool" create-lane \
+    --golden "$golden" --store "$root/events.jsonl" \
+    --output "$root/capture-lineage.json" --lane "$lane" \
+    --scenarios "$scenarios" --product-sha "$sha_a" --harness-sha "$sha_a" \
+    --eval-kit-sha "$sha_b" --eval-config-sha256 "$sha_d" \
+    --golden-sha256 "$golden_sha"
+}
+
+# A fresh store must be the exact golden prefix followed only by one session
+# for each pinned persona. Extra product events and mismatched identities fail
+# before any scenario capture starts.
+bad_boot="$test_root/bad-boot"
+mkdir -p "$bad_boot"
+cp "$golden" "$bad_boot/events.jsonl"
+cat >>"$bad_boot/events.jsonl" <<JSONL
+{"at":"2026-08-15T00:00:00Z","actor":"swyx@ai.engineer","type":"auth.session-started","payload":{"id":"session-org","person-id":"org-1","created-at":"2026-08-15T00:00:00Z"}}
+{"at":"2026-08-15T00:00:00Z","actor":"maya.lindholm@example.com","type":"auth.session-started","payload":{"id":"session-reviewer","person-id":"reviewer-1","created-at":"2026-08-15T00:00:00Z"}}
+{"at":"2026-08-15T00:00:00Z","actor":"amara.devlin+472@beaconloop.example.com","type":"auth.session-started","payload":{"id":"session-speaker","person-id":"wrong-speaker","created-at":"2026-08-15T00:00:00Z"}}
+JSONL
+if "$tool" create-lane --golden "$golden" --store "$bad_boot/events.jsonl" \
+    --output "$bad_boot/capture-lineage.json" --lane CFP \
+    --scenarios 'CFP-S1 CFP-S2' --product-sha "$sha_a" --harness-sha "$sha_a" \
+    --eval-kit-sha "$sha_b" --eval-config-sha256 "$sha_d" \
+    --golden-sha256 "$golden_sha" >"$bad_boot/out" 2>"$bad_boot/err"; then
+  echo 'FAIL: mismatched authenticated persona produced a lineage' >&2
+  exit 1
+fi
+grep -q 'exactly the three pinned persona sessions' "$bad_boot/err"
+
+extra_boot="$test_root/extra-boot"
+make_lane "$extra_boot" CFP 'CFP-S1 CFP-S2'
+rm "$extra_boot/capture-lineage.json"
+printf '{"at":"2026-08-15T00:00:01Z","type":"cfp.updated","payload":{}}\n' >>"$extra_boot/events.jsonl"
+if "$tool" create-lane --golden "$golden" --store "$extra_boot/events.jsonl" \
+    --output "$extra_boot/capture-lineage.json" --lane CFP \
+    --scenarios 'CFP-S1 CFP-S2' --product-sha "$sha_a" --harness-sha "$sha_a" \
+    --eval-kit-sha "$sha_b" --eval-config-sha256 "$sha_d" \
+    --golden-sha256 "$golden_sha" >"$extra_boot/out" 2>"$extra_boot/err"; then
+  echo 'FAIL: non-authentication runtime event produced a lineage' >&2
+  exit 1
+fi
+grep -q 'non-authentication runtime event' "$extra_boot/err"
+
+write_evidence() {
+  local path=$1 scenario=$2 outcome=${3:-completed}
+  mkdir -p "$(dirname "$path")/screenshots"
+  printf 'image\n' >"$(dirname "$path")/screenshots/001-lineage.jpg"
+  cat >"$path" <<JSON
+{"scenarioId":"$scenario","scenarioName":"fixture","outcome":"$outcome","summary":"Captured the pinned Enterprise AI Summit lineage as Amara Devlin.","observations":["Enterprise AI Summit remained selected","Amara Devlin was the speaker subject"],"transcript":[{"turn":1,"kind":"tool_result","detail":"http://example.test/events/enterprise-ai-summit-charlotte-2026"}],"screenshots":[{"path":"screenshots/001-lineage.jpg","label":"lineage","turn":1}],"startedAt":"2026-08-15T00:00:00Z","finishedAt":"2026-08-15T00:01:00Z","finalUrl":"http://example.test/events/enterprise-ai-summit-charlotte-2026","turns":1}
+JSON
+}
+
+record() {
+  local lane_root=$1 scenario=$2 before=$3 predecessor=${4:--}
+  local scenario_root="$lane_root/run/$scenario"
+  "$tool" record \
+    --lineage "$lane_root/capture-lineage.json" \
+    --store "$lane_root/events.jsonl" --store-before "$before" \
+    --evidence "$scenario_root/evidence.json" \
+    --auth-proof "$lane_root/$scenario.auth" \
+    --predecessor "$predecessor" \
+    --output "$scenario_root/capture-receipt.json"
+}
+
+# A clean CFP lane is content-addressed, append-only, chained, and replay-safe.
+cfp="$test_root/cfp"
+make_lane "$cfp" CFP 'CFP-S1 CFP-S2'
+if make_lane "$test_root/out-of-order" CFP 'CFP-S2 CFP-S1' \
+    >"$test_root/order.out" 2>"$test_root/order.err"; then
+  echo 'FAIL: noncanonical scenario order produced a lineage' >&2
+  exit 1
+fi
+grep -q 'scenario sequence is not in canonical lane order' "$test_root/order.err"
+jq -e --arg event "$event_id" --arg speaker "$speaker_id" '
+  .schema == "capture-lineage.v1" and .event.id == $event and
+  .personas.speaker.id == $speaker and (.id | test("^sha256:[0-9a-f]{64}$"))
+' "$cfp/capture-lineage.json" >/dev/null
+
+printf 'personas=organizer,reviewer,speaker cookies=verified\n' >"$cfp/CFP-S1.auth"
+write_evidence "$cfp/run/CFP-S1/evidence.json" CFP-S1
+before_1="$(shasum -a 256 "$cfp/events.jsonl" | awk '{print $1}'):$(wc -c <"$cfp/events.jsonl" | tr -d ' ')"
+printf '{"at":"2026-08-15T00:00:30Z","type":"cfp.updated","event-id":"%s","payload":{"event-id":"%s"}}\n' "$event_id" "$event_id" >>"$cfp/events.jsonl"
+record "$cfp" CFP-S1 "$before_1"
+receipt_1="$cfp/run/CFP-S1/capture-receipt.json"
+receipt_1_hash="$(shasum -a 256 "$receipt_1" | awk '{print $1}')"
+cp "$receipt_1" "$test_root/receipt-before-replay.json"
+record "$cfp" CFP-S1 "$before_1"
+cmp "$receipt_1" "$test_root/receipt-before-replay.json"
+
+# Browser evidence often puts a canonical URL at the end of prose. Sentence
+# punctuation is not part of the route slug, while a dotted suffix remains a
+# distinct and therefore forbidden slug.
+punctuation="$test_root/url-punctuation"
+make_lane "$punctuation" CFP 'CFP-S1'
+printf 'personas=organizer,reviewer,speaker cookies=verified\n' >"$punctuation/CFP-S1.auth"
+write_evidence "$punctuation/run/CFP-S1/evidence.json" CFP-S1
+python3 - "$punctuation/run/CFP-S1/evidence.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    evidence = json.load(stream)
+evidence["observations"].extend([
+    "Opened /events/enterprise-ai-summit-charlotte-2026.",
+    "Returned through /cfp/enterprise-ai-summit-charlotte-2026...",
+])
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(evidence, stream, sort_keys=True, separators=(",", ":"))
+    stream.write("\n")
+PY
+punctuation_before="$(shasum -a 256 "$punctuation/events.jsonl" | awk '{print $1}'):$(wc -c <"$punctuation/events.jsonl" | tr -d ' ')"
+record "$punctuation" CFP-S1 "$punctuation_before"
+
+# Internal route tokens are actions, not event identities.  This is the exact
+# counterexample that quarantined CFP-S1 in the 20260817T084856Z fleet run.
+internal_routes="$test_root/internal-routes"
+make_lane "$internal_routes" CFP 'CFP-S1'
+printf 'personas=organizer,reviewer,speaker cookies=verified\n' >"$internal_routes/CFP-S1.auth"
+write_evidence "$internal_routes/run/CFP-S1/evidence.json" CFP-S1
+python3 - "$internal_routes/run/CFP-S1/evidence.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    evidence = json.load(stream)
+evidence["observations"].extend([
+    "The organizer briefly opened /events/create while the pinned event remained selected.",
+    "Choosing presenter visibility changed the address bar to /api/events/create.",
+    "The organizer later opened /events/new before returning to the pinned event.",
+    "A person association used /api/people/person-1/events/add.",
+    "URL: http://example.test/events/enterprise-ai-summit-charlotte-2026/form\nNEW OR CHANGED INTERACTIVE ELEMENTS: … (truncated)",
+])
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(evidence, stream, sort_keys=True, separators=(",", ":"))
+    stream.write("\n")
+PY
+internal_routes_before="$(shasum -a 256 "$internal_routes/events.jsonl" | awk '{print $1}'):$(wc -c <"$internal_routes/events.jsonl" | tr -d ' ')"
+record "$internal_routes" CFP-S1 "$internal_routes_before"
+
+ellipsis_url="$test_root/url-ellipsis"
+make_lane "$ellipsis_url" CFP 'CFP-S1'
+printf 'personas=organizer,reviewer,speaker cookies=verified\n' >"$ellipsis_url/CFP-S1.auth"
+write_evidence "$ellipsis_url/run/CFP-S1/evidence.json" CFP-S1
+python3 - "$ellipsis_url/run/CFP-S1/evidence.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    evidence = json.load(stream)
+evidence["observations"].append(
+    "The worker wrote /events/enterprise-ai-summit-… to its evidence URL."
+)
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(evidence, stream, sort_keys=True, separators=(",", ":"))
+    stream.write("\n")
+PY
+ellipsis_before="$(shasum -a 256 "$ellipsis_url/events.jsonl" | awk '{print $1}'):$(wc -c <"$ellipsis_url/events.jsonl" | tr -d ' ')"
+if record "$ellipsis_url" CFP-S1 "$ellipsis_before" \
+    >"$test_root/ellipsis.out" 2>"$test_root/ellipsis.err"; then
+  echo 'FAIL: ellipsis event URL produced a receipt' >&2
+  exit 1
+fi
+grep -q 'event-lineage-mismatch' "$test_root/ellipsis.err"
+grep -q 'U+2026/ellipsis:.*enterprise-ai-summit-…' "$test_root/ellipsis.err"
+
+dotted_suffix="$test_root/url-dotted-suffix"
+make_lane "$dotted_suffix" CFP 'CFP-S1'
+printf 'personas=organizer,reviewer,speaker cookies=verified\n' >"$dotted_suffix/CFP-S1.auth"
+write_evidence "$dotted_suffix/run/CFP-S1/evidence.json" CFP-S1
+python3 - "$dotted_suffix/run/CFP-S1/evidence.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    evidence = json.load(stream)
+evidence["observations"].append(
+    "Opened /events/enterprise-ai-summit-charlotte-2026.evil"
+)
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(evidence, stream, sort_keys=True, separators=(",", ":"))
+    stream.write("\n")
+PY
+dotted_before="$(shasum -a 256 "$dotted_suffix/events.jsonl" | awk '{print $1}'):$(wc -c <"$dotted_suffix/events.jsonl" | tr -d ' ')"
+if record "$dotted_suffix" CFP-S1 "$dotted_before" \
+    >"$test_root/dotted.out" 2>"$test_root/dotted.err"; then
+  echo 'FAIL: dotted event-slug suffix produced a receipt' >&2
+  exit 1
+fi
+grep -q 'event-lineage-mismatch' "$test_root/dotted.err"
+grep -q 'evidence URL /events/enterprise-ai-summit-charlotte-2026.evil names event slug enterprise-ai-summit-charlotte-2026.evil' \
+  "$test_root/dotted.err"
+
+printf 'personas=organizer,reviewer,speaker cookies=verified\n' >"$cfp/CFP-S2.auth"
+write_evidence "$cfp/run/CFP-S2/evidence.json" CFP-S2 blocked
+before_2="$(shasum -a 256 "$cfp/events.jsonl" | awk '{print $1}'):$(wc -c <"$cfp/events.jsonl" | tr -d ' ')"
+printf '{"at":"2026-08-15T00:01:30Z","type":"submission.draft-saved","event-id":"%s","payload":{"event-id":"%s","person-id":"%s"}}\n' "$event_id" "$event_id" "$speaker_id" >>"$cfp/events.jsonl"
+record "$cfp" CFP-S2 "$before_2" "$receipt_1"
+jq -e --arg predecessor "$receipt_1_hash" '
+  .schema == "capture-evidence-receipt.v1" and
+  .scenario_id == "CFP-S2" and .predecessor_receipt_sha256 == $predecessor and
+  .outcome == "blocked"
+' "$cfp/run/CFP-S2/capture-receipt.json" >/dev/null
+
+# CFP-S1 is explicitly allowed to create one auxiliary Forward Summit event as
+# its cross-event negative control.  The stale evaluator brief remains in the
+# transcript but is instruction text, not observed product state.
+aux="$test_root/auxiliary-event"
+make_lane "$aux" CFP 'CFP-S1'
+printf 'personas=organizer,reviewer,speaker cookies=verified\n' >"$aux/CFP-S1.auth"
+write_evidence "$aux/run/CFP-S1/evidence.json" CFP-S1
+python3 - "$aux/run/CFP-S1/evidence.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    evidence = json.load(stream)
+evidence["finalUrl"] = "http://example.test/events/forward-summit-2028-2028/board"
+evidence["observations"].append("Forward Summit 2028 was empty beside Enterprise AI Summit")
+evidence["transcript"] = [{
+    "turn": 0,
+    "kind": "scenario_brief",
+    "detail": "Create DevFlow Conf 2027 and add Priya Raman",
+}]
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(evidence, stream, sort_keys=True, separators=(",", ":"))
+    stream.write("\n")
+PY
+aux_before="$(shasum -a 256 "$aux/events.jsonl" | awk '{print $1}'):$(wc -c <"$aux/events.jsonl" | tr -d ' ')"
+cat >>"$aux/events.jsonl" <<'JSONL'
+{"at":"2026-08-15T00:02:00Z","type":"event.created","payload":{"id":"event-forward","slug":"forward-summit-2028-2028","name":"Forward Summit 2028"}}
+{"at":"2026-08-15T00:02:01Z","type":"event.updated","event-id":"event-forward","payload":{"event-id":"event-forward","changed":["cfp"]}}
+JSONL
+record "$aux" CFP-S1 "$aux_before"
+jq -e '.scenario_id == "CFP-S1" and .outcome == "completed"' \
+  "$aux/run/CFP-S1/capture-receipt.json" >/dev/null
+
+# Exact historical event-lineage bug: a worker creates DevFlow beside Enterprise AI.
+devflow="$test_root/devflow"
+make_lane "$devflow" CFP 'CFP-S4'
+printf 'personas=organizer,reviewer,speaker cookies=verified\n' >"$devflow/CFP-S4.auth"
+write_evidence "$devflow/run/CFP-S4/evidence.json" CFP-S4
+devflow_before="$(shasum -a 256 "$devflow/events.jsonl" | awk '{print $1}'):$(wc -c <"$devflow/events.jsonl" | tr -d ' ')"
+printf '{"at":"2026-08-15T00:02:00Z","type":"event.created","payload":{"id":"event-devflow","slug":"devflow-conf-2027","name":"DevFlow Conf 2027"}}\n' >>"$devflow/events.jsonl"
+if record "$devflow" CFP-S4 "$devflow_before" >"$test_root/devflow.out" 2>"$test_root/devflow.err"; then
+  echo 'FAIL: Enterprise-AI-vs-DevFlow mismatch produced a receipt' >&2
+  exit 1
+fi
+grep -q 'event-lineage-mismatch' "$test_root/devflow.err"
+[ ! -e "$devflow/run/CFP-S4/capture-receipt.json" ]
+
+# Exact historical persona bug: organizer work creates Priya while the portal is Amara.
+priya="$test_root/priya"
+make_lane "$priya" SPK 'SPK-S1 SPK-S2 SPK-S3'
+printf 'personas=organizer,reviewer,speaker cookies=verified\n' >"$priya/SPK-S1.auth"
+write_evidence "$priya/run/SPK-S1/evidence.json" SPK-S1
+priya_before="$(shasum -a 256 "$priya/events.jsonl" | awk '{print $1}'):$(wc -c <"$priya/events.jsonl" | tr -d ' ')"
+printf '{"at":"2026-08-15T00:03:00Z","type":"person.created","event-id":"%s","payload":{"id":"person-priya","email":"priya@example.test","name":"Priya Raman"}}\n' "$event_id" >>"$priya/events.jsonl"
+if record "$priya" SPK-S1 "$priya_before" >"$test_root/priya.out" 2>"$test_root/priya.err"; then
+  echo 'FAIL: Priya-vs-Amara mismatch produced a receipt' >&2
+  exit 1
+fi
+grep -q 'persona-lineage-mismatch' "$test_root/priya.err"
+[ ! -e "$priya/run/SPK-S1/capture-receipt.json" ]
+
+# Browser/tool-result transcript entries are observed evidence, not harmless
+# prompt text.  Legacy lineage hidden there must refuse before judging.
+transcript_contamination="$test_root/transcript-contamination"
+make_lane "$transcript_contamination" CFP 'CFP-S1'
+printf 'personas=organizer,reviewer,speaker cookies=verified\n' \
+  >"$transcript_contamination/CFP-S1.auth"
+write_evidence "$transcript_contamination/run/CFP-S1/evidence.json" CFP-S1
+python3 - "$transcript_contamination/run/CFP-S1/evidence.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    evidence = json.load(stream)
+evidence["transcript"].append({
+    "turn": 2,
+    "kind": "tool_result",
+    "detail": "Opened /cfp/devflow-conf-2027 and saw the legacy board",
+})
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(evidence, stream, sort_keys=True, separators=(",", ":"))
+    stream.write("\n")
+PY
+transcript_before="$(shasum -a 256 "$transcript_contamination/events.jsonl" | awk '{print $1}'):$(wc -c <"$transcript_contamination/events.jsonl" | tr -d ' ')"
+if record "$transcript_contamination" CFP-S1 "$transcript_before" \
+    >"$test_root/transcript.out" 2>"$test_root/transcript.err"; then
+  echo 'FAIL: legacy event in observed transcript produced a receipt' >&2
+  exit 1
+fi
+grep -q 'event-lineage-mismatch' "$test_root/transcript.err"
+[ ! -e "$transcript_contamination/run/CFP-S1/capture-receipt.json" ]
+
+# A run cannot reach judging with missing, divergent, or unchained receipts.
+manifest="$test_root/manifest.json"
+cat >"$manifest" <<JSON
+{"schema":"hill-climb-fleet-manifest.v1","capture_lineage_schema":"capture-lineage.v1","code_sha":"$sha_a","harness_sha":"$sha_a","eval_kit_sha":"$sha_b","eval_config_sha256":"$sha_d","golden_fixture_sha256":"$golden_sha","scenarios":["CFP-S1","CFP-S2"],"stateful_area_lanes":["CFP"]}
+JSON
+"$tool" verify-run --run "$cfp" --manifest "$manifest" >/dev/null
+cp "$cfp/run/CFP-S2/capture-receipt.json" "$test_root/receipt-2.json"
+python3 - "$test_root/receipt-2.json" "$cfp/run/CFP-S2/capture-receipt.json" <<'PY'
+import hashlib
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    receipt = json.load(stream)
+receipt["predecessor_receipt_sha256"] = "f" * 64
+body = {key: value for key, value in receipt.items() if key != "id"}
+encoded = json.dumps(body, ensure_ascii=False, allow_nan=False, sort_keys=True,
+                     separators=(",", ":")).encode("utf-8") + b"\n"
+receipt["id"] = "sha256:" + hashlib.sha256(encoded).hexdigest()
+with open(sys.argv[2], "w", encoding="utf-8") as stream:
+    json.dump(receipt, stream, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    stream.write("\n")
+PY
+if "$tool" verify-run --run "$cfp" --manifest "$manifest" >"$test_root/chain.out" 2>"$test_root/chain.err"; then
+  echo 'FAIL: broken predecessor chain verified' >&2
+  exit 1
+fi
+grep -q 'capture-receipt-chain-mismatch' "$test_root/chain.err"
+mv "$test_root/receipt-2.json" "$cfp/run/CFP-S2/capture-receipt.json"
+"$tool" verify-run --run "$cfp" --manifest "$manifest" >/dev/null
+
+cp "$cfp/run/CFP-S2/capture-receipt.json" "$test_root/receipt-2.json"
+python3 - "$cfp/run/CFP-S2/capture-receipt.json" <<'PY'
+import hashlib
+import json
+import sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    receipt = json.load(stream)
+receipt["lineage"] = None
+body = {key: value for key, value in receipt.items() if key != "id"}
+encoded = json.dumps(body, ensure_ascii=False, allow_nan=False, sort_keys=True,
+                     separators=(",", ":")).encode("utf-8") + b"\n"
+receipt["id"] = "sha256:" + hashlib.sha256(encoded).hexdigest()
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(receipt, stream, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    stream.write("\n")
+PY
+if "$tool" verify-run --run "$cfp" --manifest "$manifest" \
+    >"$test_root/domain.out" 2>"$test_root/domain.err"; then
+  echo 'FAIL: malformed embedded lineage verified' >&2
+  exit 1
+fi
+grep -q 'invalid-lineage' "$test_root/domain.err"
+if grep -q 'Traceback' "$test_root/domain.err"; then
+  echo 'FAIL: malformed receipt escaped as a traceback' >&2
+  exit 1
+fi
+mv "$test_root/receipt-2.json" "$cfp/run/CFP-S2/capture-receipt.json"
+
+terminal="$test_root/terminal-disposition.json"
+printf '%s\n' '{"schema":"hill-climb-scenario-terminal.v2","recorded_at":"2026-08-16T00:00:00+00:00","scenario":"CFP-S1","status":"not-run","cause":"fixture-refused","owner":"capture-validator","scope":"scenario-local"}' >"$terminal"
+"$tool" verify-disposition --path "$terminal" --scenario CFP-S1 >/dev/null
+printf '%s\n' '{"scenario":"CFP-S1","status":"not-run","cause":"fixture-refused","owner":"capture-validator","scope":"scenario-local"}' >"$terminal"
+if "$tool" verify-disposition --path "$terminal" --scenario CFP-S1 \
+    >"$test_root/disposition.out" 2>"$test_root/disposition.err"; then
+  echo 'FAIL: schemaless terminal disposition verified' >&2
+  exit 1
+fi
+grep -q 'invalid-terminal-disposition' "$test_root/disposition.err"
+
+echo 'PASS capture lineage: event/persona drift fails before judging and receipts chain immutably'

@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# End-to-end contract test for append-only N-sample consolidation.
+set -euo pipefail
+
+repo_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+script="$repo_root/bin/consolidate-hill-climb"
+test_root="$(mktemp -d "${TMPDIR:-/tmp}/fleet-sampling-test.XXXXXX")"
+trap '[ "${KEEP_FLEET_SAMPLING_TEST:-false}" = true ] || rm -rf -- "$test_root"' EXIT
+
+base_kit="$test_root/base-kit"
+run_dir="$test_root/run"
+fake_bin="$test_root/bin"
+mkdir -p "$base_kit/node_modules" "$run_dir/inputs" "$run_dir/app/bin" \
+  "$run_dir/app/resources" "$run_dir/slots" "$fake_bin"
+
+cp "$repo_root/bin/hill-climb-judgement-fold" "$run_dir/app/bin/hill-climb-judgement-fold"
+cp "$repo_root/resources/hill-climb-predicate-registry.json" \
+  "$run_dir/app/resources/hill-climb-predicate-registry.json"
+cp "$repo_root/resources/sbek-judgement.schema.json" \
+  "$run_dir/app/resources/sbek-judgement.schema.json"
+
+cat > "$run_dir/app/bin/capture-lineage" <<'SH'
+#!/usr/bin/env bash
+printf '{"schema":"fixture-lineage.v1","status":"verified"}\n'
+SH
+chmod +x "$run_dir/app/bin/capture-lineage"
+
+cat > "$base_kit/package.json" <<'JSON'
+{"private":true,"scripts":{"sbek":"node fake-sbek.mjs"}}
+JSON
+cat > "$base_kit/fake-sbek.mjs" <<'JS'
+import fs from "node:fs";
+import path from "node:path";
+
+const args = process.argv.slice(2).filter((arg) => arg !== "--");
+const command = args[0];
+const value = (flag) => {
+  const index = args.indexOf(flag);
+  return index < 0 ? undefined : args[index + 1];
+};
+const ids = {
+  "call-for-papers": ["CFP-01", "CFP-16"],
+  "abstract-management": ["ABS-01", "ABS-02"],
+  "speaker-management": ["SPK-01", "SPK-11"],
+  "content-management": ["CNT-01", "CNT-14"],
+  "ai-agenda": ["AIA-04", "AIA-05"],
+  "public-widgets": ["EMB-01", "EMB-02"],
+};
+if (command === "judge-brief") {
+  const area = value("--area");
+  for (const id of ids[area]) console.log(`- ${id} (weight 1): fixture criterion`);
+  process.exit(0);
+}
+if (command !== "score") process.exit(2);
+const run = value("--run");
+const only = value("--areas");
+const areas = only ? [only] : Object.keys(ids);
+const rows = [];
+for (const area of areas) {
+  const judgementPath = path.join(run, "judgements", `${area}.json`);
+  const judgement = JSON.parse(fs.readFileSync(judgementPath, "utf8"));
+  const match = judgement.area_notes.match(/sample (\d+)/);
+  const scoreBySample = {1: 90, 2: 20, 3: 60};
+  const pct = match ? scoreBySample[Number(match[1])] : 60;
+  rows.push({area, areaWeight: 1, pct, coveragePct: 100,
+             items: judgement.items, defects: judgement.defects,
+             notes: judgement.area_notes});
+}
+const report = {overallPct: 60, overallCoveragePct: 100, scoreWithheld: false,
+                areas: rows, byType: {}, manualPending: 0,
+                models: {agent:"fixture",judge:"fixture"}};
+fs.writeFileSync(path.join(run, "report.json"), JSON.stringify(report, null, 2) + "\n");
+fs.writeFileSync(path.join(run, "report.html"), "<html>fixture</html>\n");
+fs.writeFileSync(path.join(run, "manual-checklist.md"), "fixture\n");
+JS
+printf '{}\n' > "$base_kit/evalconfig.json"
+git init -q "$base_kit"
+git -C "$base_kit" config user.name fixture
+git -C "$base_kit" config user.email fixture@example.com
+git -C "$base_kit" add package.json fake-sbek.mjs
+git -C "$base_kit" commit -qm fixture-kit
+eval_kit_sha=$(git -C "$base_kit" rev-parse HEAD)
+install -m 0400 "$base_kit/evalconfig.json" "$run_dir/inputs/evalconfig.json"
+eval_config_sha=$(sha256sum "$run_dir/inputs/evalconfig.json" | awk '{print $1}')
+
+areas=(CFP ABS SPK CNT AIA EMB)
+scenarios=()
+slot=0
+for prefix in "${areas[@]}"; do
+  scenario="$prefix-S1"
+  scenarios+=("$scenario")
+  scenario_dir="$run_dir/slots/slot-$slot/$prefix/kit/runs/fixture/$scenario"
+  mkdir -p "$scenario_dir/screenshots"
+  printf '{"scenarioId":"%s","outcome":"completed"}\n' "$scenario" \
+    > "$scenario_dir/evidence.json"
+  printf 'image %s\n' "$scenario" > "$scenario_dir/screenshots/one.jpg"
+  slot=$((slot + 1))
+done
+python3 - "$run_dir/manifest.json" "$eval_kit_sha" "$eval_config_sha" \
+  "${scenarios[@]}" <<'PY'
+import json
+import sys
+
+path, kit_sha, config_sha, *scenarios = sys.argv[1:]
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump({"scenarios": scenarios,
+               "stateful_area_lanes": [scenario.split("-")[0] for scenario in scenarios],
+               "capture_lineage_schema": "capture-lineage.v1",
+               "eval_kit_sha": kit_sha,
+               "eval_kit_archive_sha256": "a" * 64,
+               "eval_config_sha256": config_sha}, stream)
+PY
+
+cat > "$fake_bin/npx" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
+  shift
+done
+[ "$#" -gt 0 ] && shift
+exec node fake-sbek.mjs "$@"
+SH
+chmod +x "$fake_bin/npx"
+
+cat > "$fake_bin/codex" <<'PY'
+#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import re
+import sys
+
+if sys.argv[1:3] == ["login", "status"]:
+    print("Logged in using ChatGPT")
+    raise SystemExit(0)
+args = sys.argv[1:]
+output = pathlib.Path(args[args.index("--output-last-message") + 1])
+prompt = args[-1]
+match = re.search(r"rubric area ([a-z-]+)\.", prompt)
+if not match:
+    raise SystemExit("area missing from prompt")
+area = match.group(1)
+ids = {
+    "call-for-papers": ["CFP-01", "CFP-16"],
+    "abstract-management": ["ABS-01", "ABS-02"],
+    "speaker-management": ["SPK-01", "SPK-11"],
+    "content-management": ["CNT-01", "CNT-14"],
+    "ai-agenda": ["AIA-04", "AIA-05"],
+    "public-widgets": ["EMB-01", "EMB-02"],
+}[area]
+counter_root = pathlib.Path(os.environ["FAKE_COUNTER_ROOT"])
+invocation = json.loads((output.parent / "invocation.json").read_text())
+sample = invocation["sample"]
+(counter_root / f"{area}-{output.parent.name}").write_text(str(sample))
+reserved = set(re.search(r"controlled rubric IDs are: ([^.]+)\.", prompt).group(1).split())
+items = []
+for rubric_id in ids:
+    controlled = rubric_id in reserved
+    items.append({"id": rubric_id,
+                  "verdict": ["pass","fail","partial"][sample-1],
+                  "confidence": "high",
+                  "reasoning": f"residual sample {sample}" if controlled else f"sample {sample}",
+                  "evidence_refs": ["fixture:evidence"]})
+output.write_text(json.dumps({"items": items, "defects": [],
+                              "area_notes": f"sample {sample}"}, indent=2) + "\n")
+print(json.dumps({"type":"turn.completed","sample":sample,"area":area}))
+PY
+chmod +x "$fake_bin/codex"
+mkdir "$test_root/counters"
+
+PATH="$fake_bin:$PATH" FAKE_COUNTER_ROOT="$test_root/counters" \
+  FLEET_EVAL_KIT="$base_kit" FLEET_JUDGE_SAMPLE_COUNT=3 \
+  FLEET_JUDGE_CONCURRENCY=3 FLEET_JUDGE_MODEL=fixture-model \
+  FLEET_JUDGE_REASONING_EFFORT=high "$script" "$run_dir"
+
+[ "$(find "$run_dir/judgement-candidates" -name candidate.json | wc -l | tr -d ' ')" = 18 ]
+[ "$(find "$run_dir/judgement-folds" -name '*.json' | wc -l | tr -d ' ')" = 6 ]
+for area in call-for-papers abstract-management speaker-management content-management ai-agenda public-widgets; do
+  jq -e '.selected_sample == 3 and .scores_pct == [90,20,60] and
+         .noise_calibration.status == "insufficient" and .fold_status == "complete"' \
+    "$run_dir/judgement-folds/$area.json" >/dev/null
+  [ "$(find "$test_root/counters" -name "$area-*" | wc -l | tr -d ' ')" = 3 ]
+done
+jq -e '.items[] | select(.id == "CFP-16") |
+       .verdict == "partial" and (.reasoning | contains("sample 3"))' \
+  "$run_dir/consolidated-kit/runs/fleet-consolidated/judgements/call-for-papers.json" >/dev/null
+jq -e '.items[] | select(.id == "AIA-04") |
+       .verdict == "partial" and (.evidence_refs[0] == "fixture:evidence")' \
+  "$run_dir/consolidated-kit/runs/fleet-consolidated/judgements/ai-agenda.json" >/dev/null
+
+before=$(find "$run_dir/judgement-candidates" "$run_dir/judgement-folds" \
+  -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')
+PATH="$fake_bin:$PATH" FAKE_COUNTER_ROOT="$test_root/counters" \
+  FLEET_EVAL_KIT="$base_kit" FLEET_JUDGE_SAMPLE_COUNT=3 \
+  FLEET_JUDGE_CONCURRENCY=3 FLEET_JUDGE_MODEL=fixture-model \
+  FLEET_JUDGE_REASONING_EFFORT=high FLEET_CONSOLIDATE_RESUME=true \
+  "$script" "$run_dir"
+after=$(find "$run_dir/judgement-candidates" "$run_dir/judgement-folds" \
+  -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')
+[ "$before" = "$after" ]
+for area in call-for-papers abstract-management speaker-management content-management ai-agenda public-widgets; do
+  [ "$(find "$test_root/counters" -name "$area-*" | wc -l | tr -d ' ')" = 3 ]
+done
+
+echo "PASS sampling consolidation: 18 immutable candidates, six median folds, staged predicates retain model authority"

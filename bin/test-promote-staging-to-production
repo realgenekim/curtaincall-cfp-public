@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "$0")/.." && pwd)
+tool="$repo_root/bin/promote-staging-to-production"
+temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/promotion-test.XXXXXX")
+trap 'rm -rf "$temp_dir"' EXIT
+fake_bin="$temp_dir/bin"
+state="$temp_dir/state"
+mkdir -p "$fake_bin" "$state"
+
+short_sha=$(git -C "$repo_root" rev-parse --short=7 HEAD)
+
+for service in swyx-cfp-saas-killer curtaincallcfp; do
+  printf '%s\n' "${service}-staging-rev" > "$state/$service.staging"
+  printf '%s\n' "${service}-production-rev" > "$state/$service.production"
+done
+
+cat > "$fake_bin/gcloud" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+service=${4:-}
+state=${PROMOTION_TEST_STATE:?}
+args="$*"
+if [[ "$args" == *"services describe"* ]]; then
+  if [[ "$args" == *"tag='staging'"* && "$args" == *"revisionName"* ]]; then
+    cat "$state/$service.staging"
+  elif [[ "$args" == *"tag='staging'"* && "$args" == *"extract(url)"* ]]; then
+    printf 'https://staging---%s-test.a.run.app\n' "$service"
+  elif [[ "$args" == *"percent=100"* ]]; then
+    cat "$state/$service.production"
+  elif [[ "$args" == *"status.url"* ]]; then
+    printf 'https://%s-test.a.run.app\n' "$service"
+  else
+    echo "unexpected describe: $args" >&2
+    exit 1
+  fi
+elif [[ "$args" == *"services update-traffic"* ]]; then
+  if [ "${PROMOTION_TEST_FAIL_SERVICE:-}" = "$service" ]; then
+    echo "injected update failure for $service" >&2
+    exit 1
+  fi
+  revision=''
+  for arg in "$@"; do
+    case "$arg" in --to-revisions=*) revision=${arg#--to-revisions=} ; revision=${revision%=100} ;; esac
+  done
+  test -n "$revision"
+  printf '%s\n' "$revision" > "$state/$service.production"
+  printf '%s\t%s\n' "$service" "$revision" >> "$state/updates.tsv"
+else
+  echo "unexpected gcloud call: $args" >&2
+  exit 1
+fi
+EOF
+
+cat > "$fake_bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+url=${!#}
+sha=${PROMOTION_TEST_SHA:?}
+case "$url" in
+  */ping) printf 'pong' ;;
+  */cfp/*|*/program/*) : ;;
+  */) printf '<footer class="build-identity" data-build-sha="%s" data-build-time="2026-08-16T23:00:00Z"></footer>' "$sha" ;;
+  *) echo "unexpected curl URL: $url" >&2; exit 1 ;;
+esac
+EOF
+
+chmod +x "$fake_bin/gcloud" "$fake_bin/curl"
+
+run_tool() {
+  PATH="$fake_bin:$PATH" \
+    PROMOTION_TEST_STATE="$state" \
+    PROMOTION_TEST_SHA="$short_sha" \
+    PROMOTION_RECEIPT_DIR="$temp_dir/receipts" \
+    "$tool" "$@"
+}
+
+run_tool verify HEAD > "$temp_dir/verify.out"
+test ! -e "$state/updates.tsv"
+grep -q 'verification only; production traffic was not changed' "$temp_dir/verify.out"
+
+if PATH="$fake_bin:$PATH" PROMOTION_TEST_STATE="$state" \
+  PROMOTION_TEST_SHA=badc0de PROMOTION_RECEIPT_DIR="$temp_dir/receipts" \
+  "$tool" verify HEAD > "$temp_dir/mismatch.out" 2>&1; then
+  echo "expected SHA mismatch to fail" >&2
+  exit 1
+fi
+grep -q 'staging serves badc0de' "$temp_dir/mismatch.out"
+
+if run_tool promote HEAD > "$temp_dir/unconfirmed.out" 2>&1; then
+  echo "expected unconfirmed promotion to fail" >&2
+  exit 1
+fi
+grep -q 'promotion refused' "$temp_dir/unconfirmed.out"
+
+PROMOTE=YES run_tool promote HEAD > "$temp_dir/promote.out"
+grep -q 'production now serves build' "$temp_dir/promote.out"
+test "$(cat "$state/swyx-cfp-saas-killer.production")" = "swyx-cfp-saas-killer-staging-rev"
+test "$(cat "$state/curtaincallcfp.production")" = "curtaincallcfp-staging-rev"
+test "$(cat "$temp_dir/receipts/latest/status.txt")" = complete
+
+printf '%s\n' swyx-old > "$state/swyx-cfp-saas-killer.production"
+printf '%s\n' curtain-old > "$state/curtaincallcfp.production"
+: > "$state/updates.tsv"
+if PATH="$fake_bin:$PATH" PROMOTION_TEST_STATE="$state" PROMOTION_TEST_SHA="$short_sha" \
+  PROMOTION_TEST_FAIL_SERVICE=curtaincallcfp PROMOTION_RECEIPT_DIR="$temp_dir/failure-receipts" \
+  PROMOTE=YES "$tool" promote HEAD > "$temp_dir/failure.out" 2>&1; then
+  echo "expected injected partial failure" >&2
+  exit 1
+fi
+test "$(cat "$state/swyx-cfp-saas-killer.production")" = swyx-old
+test "$(cat "$state/curtaincallcfp.production")" = curtain-old
+grep -q 'restoring services already moved' "$temp_dir/failure.out"
+
+echo "PASS: guarded promotion verifies identity, requires intent, promotes both, and rolls back partial failure"

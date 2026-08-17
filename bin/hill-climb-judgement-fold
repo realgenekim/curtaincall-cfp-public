@@ -1,0 +1,601 @@
+#!/usr/bin/env python3
+"""Fold immutable LLM candidates and deterministic predicate receipts.
+
+The launcher, judge wrapper, scorer, and predicate runner own their receipts.
+This program owns only the fold receipt and the one-time final judgement
+projection. Existing outputs are verified byte-for-byte and never replaced.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import re
+import statistics
+import sys
+from typing import Any
+
+
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+VERDICTS = {"pass", "partial", "fail", "not_found", "cannot_judge"}
+CONFIDENCE = {"high", "medium", "low"}
+PREDICATE_OUTCOMES = {
+    "pass": "pass",
+    "fail": "fail",
+    "unverified": "cannot_judge",
+    "not_applicable": "cannot_judge",
+}
+
+
+class ContractError(RuntimeError):
+    pass
+
+
+def digest_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def digest_file(path: pathlib.Path) -> str:
+    try:
+        return digest_bytes(path.read_bytes())
+    except OSError as error:
+        raise ContractError(f"cannot read artifact {path}: {error}") from error
+
+
+def load_json(path: pathlib.Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ContractError(f"cannot read JSON {path}: {error}") from error
+    if not isinstance(payload, dict):
+        raise ContractError(f"JSON object required: {path}")
+    return payload
+
+
+def require_sha(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not SHA256.fullmatch(value):
+        raise ContractError(f"{label} must be a lowercase SHA-256")
+    return value
+
+
+def require_int(value: Any, label: str, minimum: int = 0) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        raise ContractError(f"{label} must be an integer >= {minimum}")
+    return value
+
+
+def require_number(value: Any, label: str) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ContractError(f"{label} must be numeric")
+    return float(value)
+
+
+def safe_relative(root: pathlib.Path, raw: Any, label: str) -> pathlib.Path:
+    if not isinstance(raw, str) or not raw or pathlib.PurePosixPath(raw).is_absolute():
+        raise ContractError(f"{label} must be a non-empty relative path")
+    path = (root / raw).resolve()
+    try:
+        path.relative_to(root.resolve())
+    except ValueError as error:
+        raise ContractError(f"{label} escapes candidate root") from error
+    return path
+
+
+def validate_judgement(payload: dict[str, Any], area: str) -> list[str]:
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        raise ContractError(f"{area} judgement requires non-empty items")
+    ids: list[str] = []
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            raise ContractError(f"{area} judgement has invalid item")
+        if item.get("verdict") not in VERDICTS:
+            raise ContractError(f"{area} judgement has invalid verdict for {item.get('id')}")
+        if item.get("confidence") not in CONFIDENCE:
+            raise ContractError(f"{area} judgement has invalid confidence for {item.get('id')}")
+        if not isinstance(item.get("reasoning"), str):
+            raise ContractError(f"{area} judgement has invalid reasoning for {item.get('id')}")
+        if not isinstance(item.get("evidence_refs"), list) or not all(
+            isinstance(ref, str) for ref in item["evidence_refs"]
+        ):
+            raise ContractError(f"{area} judgement has invalid evidence refs for {item.get('id')}")
+        ids.append(item["id"])
+    if len(ids) != len(set(ids)):
+        raise ContractError(f"{area} judgement has duplicate rubric IDs")
+    defects = payload.get("defects")
+    if not isinstance(defects, list) or not isinstance(payload.get("area_notes"), str):
+        raise ContractError(f"{area} judgement has invalid envelope")
+    return ids
+
+
+def validate_component_receipt(
+    attempt: pathlib.Path,
+    filename: str,
+    schema: str,
+) -> tuple[dict[str, Any], str]:
+    path = attempt / filename
+    payload = load_json(path)
+    if payload.get("schema") != schema:
+        raise ContractError(f"wrong schema in {path}")
+    return payload, digest_file(path)
+
+
+def validate_candidate(
+    candidate_root: pathlib.Path,
+    candidate_path: pathlib.Path,
+    area: str,
+) -> dict[str, Any]:
+    candidate = load_json(candidate_path)
+    if candidate.get("schema") != "hill-climb-judgement-candidate.v1":
+        raise ContractError(f"wrong candidate schema: {candidate_path}")
+    if candidate.get("status") != "enrolled" or candidate.get("area") != area:
+        raise ContractError(f"candidate is not enrolled for {area}: {candidate_path}")
+    sample = require_int(candidate.get("sample"), "candidate sample", 1)
+    attempt = safe_relative(candidate_root, candidate.get("attempt"), "candidate attempt")
+    if attempt != candidate_path.parent.resolve():
+        raise ContractError(f"candidate attempt does not own receipt: {candidate_path}")
+
+    invocation, invocation_sha = validate_component_receipt(
+        attempt, "invocation.json", "hill-climb-judge-invocation.v1"
+    )
+    judgement_receipt, judgement_receipt_sha = validate_component_receipt(
+        attempt, "judgement-receipt.json", "hill-climb-judge-output.v1"
+    )
+    score_receipt, score_receipt_sha = validate_component_receipt(
+        attempt, "score-receipt.json", "hill-climb-candidate-score.v1"
+    )
+    declared = candidate.get("receipts")
+    if not isinstance(declared, dict) or declared != {
+        "invocation_sha256": invocation_sha,
+        "judgement_sha256": judgement_receipt_sha,
+        "score_sha256": score_receipt_sha,
+    }:
+        raise ContractError(f"candidate component receipt hashes disagree: {candidate_path}")
+
+    if invocation.get("area") != area or invocation.get("sample") != sample:
+        raise ContractError(f"invocation tuple disagrees with candidate: {candidate_path}")
+    tuple_fields = (
+        "executor",
+        "model",
+        "reasoning_effort",
+        "prompt_sha256",
+        "input_sha256",
+        "rubric_sha256",
+        "eval_kit_archive_sha256",
+        "eval_config_sha256",
+    )
+    invocation_tuple = {field: invocation.get(field) for field in tuple_fields}
+    for field in ("prompt_sha256", "input_sha256", "rubric_sha256",
+                  "eval_kit_archive_sha256", "eval_config_sha256"):
+        require_sha(invocation_tuple[field], f"invocation {field}")
+    for field in ("executor", "model", "reasoning_effort"):
+        if not isinstance(invocation_tuple[field], str) or not invocation_tuple[field]:
+            raise ContractError(f"invocation {field} must be non-empty")
+    prompt_path = attempt / "prompt.txt"
+    if digest_file(prompt_path) != invocation_tuple["prompt_sha256"]:
+        raise ContractError(f"invocation prompt hash changed: {prompt_path}")
+    run_root = candidate_root.parent.parent
+    input_root = run_root / "judgement-inputs" / area
+    if digest_file(input_root / "input.sha256") != invocation_tuple["input_sha256"]:
+        raise ContractError(f"invocation input manifest hash changed: {input_root}")
+    if digest_file(input_root / "brief.txt") != invocation_tuple["rubric_sha256"]:
+        raise ContractError(f"invocation rubric brief hash changed: {input_root}")
+
+    judgement_path = safe_relative(attempt, judgement_receipt.get("path"), "judgement path")
+    declared_judgement_sha = judgement_receipt.get("sha256")
+    refused = not isinstance(declared_judgement_sha, str) or not SHA256.fullmatch(
+        declared_judgement_sha
+    )
+    if refused:
+        refusal_reason = "judge-receipt-malformed: judgement output sha256 is not a lowercase SHA-256"
+        judgement_sha = digest_file(judgement_path)
+    else:
+        refusal_reason = None
+        judgement_sha = declared_judgement_sha
+        if digest_file(judgement_path) != judgement_sha:
+            raise ContractError(f"judgement output hash changed: {judgement_path}")
+    if judgement_receipt.get("area") != area or judgement_receipt.get("sample") != sample:
+        raise ContractError(f"judgement receipt tuple disagrees: {judgement_path}")
+    judgement = load_json(judgement_path)
+    ids = validate_judgement(judgement, area)
+
+    if score_receipt.get("area") != area or score_receipt.get("sample") != sample:
+        raise ContractError(f"score receipt tuple disagrees: {attempt}")
+    if not refused and score_receipt.get("judgement_sha256") != judgement_sha:
+        raise ContractError(f"score receipt is not bound to judgement: {attempt}")
+    computed_score = require_number(
+        score_receipt.get("computed_score_pct"), "candidate computed score"
+    )
+    coverage = require_number(score_receipt.get("coverage_pct"), "candidate coverage")
+    score = score_receipt.get("score_pct")
+    if refused:
+        computed_score = 0.0
+        coverage = 100.0
+        score = 0.0
+    if not (0 <= computed_score <= 100 and 0 <= coverage <= 100):
+        raise ContractError(f"candidate score/coverage is outside 0..100: {attempt}")
+    if coverage < 60:
+        if score is not None:
+            raise ContractError(f"below-gate candidate score must be null: {attempt}")
+    else:
+        score = require_number(score, "candidate eligible score")
+        if score != computed_score:
+            raise ContractError(f"eligible and computed scores disagree: {attempt}")
+    require_sha(score_receipt.get("report_sha256"), "candidate report sha256")
+    if digest_file(attempt / "candidate-report.json") != score_receipt["report_sha256"]:
+        raise ContractError(f"candidate score report hash changed: {attempt}")
+    if score_receipt.get("score_code_sha256") != invocation_tuple["eval_kit_archive_sha256"]:
+        raise ContractError(f"score receipt code identity disagrees: {attempt}")
+    if score_receipt.get("eval_config_sha256") != invocation_tuple["eval_config_sha256"]:
+        raise ContractError(f"score receipt config identity disagrees: {attempt}")
+
+    return {
+        "sample": sample,
+        "candidate_path": candidate_path,
+        "candidate_sha256": digest_file(candidate_path),
+        "attempt": attempt,
+        "invocation_tuple": invocation_tuple,
+        "judgement_path": judgement_path,
+        "judgement_sha256": judgement_sha,
+        "judgement": judgement,
+        "rubric_ids": ids,
+        "score_pct": score,
+        "computed_score_pct": computed_score,
+        "coverage_pct": coverage,
+        "component_receipts": declared,
+        "refused": refused,
+        "refusal_reason": refusal_reason,
+    }
+
+
+def predicate_ids(registry: dict[str, Any], area: str) -> list[str]:
+    if registry.get("schema") != "hill-climb-predicate-registry.v1":
+        raise ContractError("wrong predicate registry schema")
+    criteria = registry.get("criteria")
+    if not isinstance(criteria, dict):
+        raise ContractError("predicate registry criteria must be an object")
+    for rubric_id, entry in criteria.items():
+        if (not isinstance(rubric_id, str) or not rubric_id or
+                not isinstance(entry, dict) or
+                not isinstance(entry.get("area"), str) or not entry["area"] or
+                entry.get("status") not in {"candidate", "active"} or
+                not isinstance(entry.get("predicate"), str) or not entry["predicate"] or
+                not isinstance(entry.get("rubric_clause_id"), str) or
+                not entry["rubric_clause_id"] or
+                not isinstance(entry.get("residual_model_required"), bool)):
+            raise ContractError(f"predicate registry entry is invalid: {rubric_id}")
+    return sorted(
+        rubric_id
+        for rubric_id, entry in criteria.items()
+        if (isinstance(entry, dict) and entry.get("area") == area
+            and entry.get("status") == "active")
+    )
+
+
+def predicate_item(
+    rubric_id: str,
+    rubric_clause_id: str,
+    results_root: pathlib.Path,
+    rubric_sha256: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    path = results_root / f"{rubric_id}.json"
+    if not path.exists():
+        return (
+            {
+                "id": rubric_id,
+                "verdict": "cannot_judge",
+                "confidence": "low",
+                "reasoning": "Deterministic predicate receipt is missing; model fallback is forbidden.",
+                "evidence_refs": [f"predicate:{rubric_id}:missing"],
+            },
+            {"rubric_id": rubric_id, "status": "unverified", "reason": "receipt-missing"},
+        )
+    receipt = load_json(path)
+    receipt_sha = digest_file(path)
+    if receipt.get("schema") != "hill-climb-predicate-verdict.v1":
+        raise ContractError(f"wrong predicate receipt schema: {path}")
+    if receipt.get("rubric_id") != rubric_id:
+        raise ContractError(f"predicate receipt rubric mismatch: {path}")
+    if receipt.get("rubric_clause_id") != rubric_clause_id:
+        raise ContractError(f"predicate receipt clause mismatch: {path}")
+    if receipt.get("rubric_spec_sha256") != rubric_sha256:
+        raise ContractError(f"predicate receipt rubric hash mismatch: {path}")
+    outcome = receipt.get("outcome")
+    if outcome not in PREDICATE_OUTCOMES:
+        raise ContractError(f"predicate receipt outcome is invalid: {path}")
+    facts = receipt.get("fact_receipts")
+    if not isinstance(facts, list):
+        raise ContractError(f"predicate fact receipts must be a list: {path}")
+    for index, fact in enumerate(facts):
+        if not isinstance(fact, dict):
+            raise ContractError(f"predicate fact receipt {index} is invalid: {path}")
+        require_sha(fact.get("sha256"), f"predicate fact {index} sha256")
+        require_int(fact.get("byte_count"), f"predicate fact {index} byte_count")
+        if not isinstance(fact.get("locator"), str) or not fact["locator"]:
+            raise ContractError(f"predicate fact {index} locator is invalid: {path}")
+    test = receipt.get("test")
+    if not isinstance(test, dict):
+        raise ContractError(f"predicate test receipt is missing: {path}")
+    require_sha(test.get("predicate_code_sha256"), "predicate code sha256")
+    require_sha(test.get("test_sha256"), "predicate test sha256")
+    if not isinstance(test.get("case"), str) or not test["case"]:
+        raise ContractError(f"predicate test case is invalid: {path}")
+    reason_code = receipt.get("reason_code")
+    if not isinstance(reason_code, str) or not reason_code:
+        raise ContractError(f"predicate reason code is invalid: {path}")
+    verdict = PREDICATE_OUTCOMES[outcome]
+    confidence = "high" if outcome in {"pass", "fail"} else "low"
+    return (
+        {
+            "id": rubric_id,
+            "verdict": verdict,
+            "confidence": confidence,
+            "reasoning": f"Deterministic predicate outcome {outcome}: {reason_code}.",
+            "evidence_refs": [f"predicate-receipt:sha256:{receipt_sha}"],
+        },
+        {
+            "rubric_id": rubric_id,
+            "status": outcome,
+            "receipt_sha256": receipt_sha,
+            "fact_receipt_count": len(facts),
+        },
+    )
+
+
+def exclusive_write(path: pathlib.Path, value: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(value)
+    except BaseException:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def canonical_json(payload: dict[str, Any]) -> bytes:
+    return (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def verify_existing(
+    output: pathlib.Path,
+    receipt_path: pathlib.Path,
+    area: str,
+    sample_count: int,
+    candidate_root: pathlib.Path,
+    registry_path: pathlib.Path,
+    predicate_results_root: pathlib.Path,
+) -> None:
+    if not output.exists() or not receipt_path.exists():
+        raise ContractError("fold output and receipt must either both exist or both be absent")
+    receipt = load_json(receipt_path)
+    if receipt.get("schema") != "hill-climb-judgement-fold.v1":
+        raise ContractError("existing fold receipt has wrong schema")
+    if (receipt.get("area") != area or receipt.get("requested_n") != sample_count or
+            receipt.get("enrolled_n") != sample_count):
+        raise ContractError("existing fold receipt tuple changed")
+    if receipt.get("output_sha256") != digest_file(output):
+        raise ContractError("existing fold output does not match its receipt")
+    candidates = [
+        validate_candidate(candidate_root, path, area)
+        for path in sorted(candidate_root.glob("attempt-*/candidate.json"))
+    ]
+    if (len(candidates) != sample_count or
+            sorted(candidate["sample"] for candidate in candidates) !=
+            list(range(1, sample_count + 1))):
+        raise ContractError("existing fold candidate set changed")
+    expected_rows = [
+        {
+            "sample": candidate["sample"],
+            "candidate_sha256": candidate["candidate_sha256"],
+            **candidate["component_receipts"],
+        }
+        for candidate in sorted(candidates, key=lambda row: row["sample"])
+    ]
+    if receipt.get("candidate_receipts") != expected_rows:
+        raise ContractError("existing fold candidate receipt binding changed")
+    if any(candidate["invocation_tuple"] != receipt.get("invocation_tuple")
+           for candidate in candidates):
+        raise ContractError("existing fold invocation tuple changed")
+    registry = load_json(registry_path)
+    expected_predicates = predicate_ids(registry, area)
+    predicate_rows = receipt.get("predicate_results")
+    if (not isinstance(predicate_rows, list) or
+            sorted(row.get("rubric_id") for row in predicate_rows if isinstance(row, dict)) !=
+            expected_predicates):
+        raise ContractError("existing fold predicate set changed")
+    for row in predicate_rows:
+        path = predicate_results_root / f"{row['rubric_id']}.json"
+        if row.get("status") == "unverified" and row.get("reason") == "receipt-missing":
+            if path.exists():
+                raise ContractError("predicate receipt appeared after immutable fold")
+        elif row.get("receipt_sha256") != digest_file(path):
+            raise ContractError("existing fold predicate receipt changed")
+    print(json.dumps(receipt, sort_keys=True))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--area", required=True)
+    parser.add_argument("--sample-count", required=True, type=int)
+    parser.add_argument("--candidates", required=True, type=pathlib.Path)
+    parser.add_argument("--predicate-registry", required=True, type=pathlib.Path)
+    parser.add_argument("--predicate-results", required=True, type=pathlib.Path)
+    parser.add_argument("--output", required=True, type=pathlib.Path)
+    parser.add_argument("--receipt", required=True, type=pathlib.Path)
+    args = parser.parse_args()
+
+    if args.sample_count < 3 or args.sample_count % 2 != 1:
+        raise ContractError("sample count must be odd and >= 3")
+    if args.output.exists() or args.receipt.exists():
+        verify_existing(
+            args.output, args.receipt, args.area, args.sample_count,
+            args.candidates, args.predicate_registry, args.predicate_results,
+        )
+        return 0
+    if not args.candidates.is_dir():
+        raise ContractError("candidate directory is missing")
+
+    candidate_paths = sorted(args.candidates.glob("attempt-*/candidate.json"))
+    candidates = [validate_candidate(args.candidates, path, args.area) for path in candidate_paths]
+    if len(candidates) != args.sample_count:
+        raise ContractError(
+            f"expected exactly {args.sample_count} enrolled candidates for {args.area}; "
+            f"found {len(candidates)}"
+        )
+    if sorted(candidate["sample"] for candidate in candidates) != list(
+        range(1, args.sample_count + 1)
+    ):
+        raise ContractError("candidate sample ordinals must be contiguous from 1")
+    tuple0 = candidates[0]["invocation_tuple"]
+    rubric_ids0 = candidates[0]["rubric_ids"]
+    for candidate in candidates[1:]:
+        if candidate["invocation_tuple"] != tuple0:
+            raise ContractError("candidate invocation tuples differ")
+        if candidate["rubric_ids"] != rubric_ids0:
+            raise ContractError("candidate rubric item order differs")
+
+    coverage_failures = [
+        candidate["sample"] for candidate in candidates if candidate["coverage_pct"] < 60
+    ]
+    ranked = sorted(
+        candidates,
+        key=lambda row: (row["computed_score_pct"], row["judgement_sha256"]),
+    )
+    selected = ranked[len(ranked) // 2]
+    folded = json.loads(json.dumps(selected["judgement"]))
+    if selected["refused"]:
+        for item in folded["items"]:
+            item["verdict"] = "cannot_judge"
+            item["confidence"] = "low"
+            item["reasoning"] = (
+                f"{item['reasoning']} {selected['refusal_reason']}."
+            )
+            item["evidence_refs"] = list(dict.fromkeys(
+                item["evidence_refs"] +
+                [f"judge-refusal:sample-{selected['sample']}"]
+            ))
+    item_by_id = {item["id"]: item for item in folded["items"]}
+    registry = load_json(args.predicate_registry)
+    predicate_rows: list[dict[str, Any]] = []
+    for rubric_id in predicate_ids(registry, args.area):
+        if rubric_id not in item_by_id:
+            raise ContractError(f"predicate-controlled rubric ID absent from candidates: {rubric_id}")
+        entry = registry["criteria"][rubric_id]
+        clause_id = entry.get("rubric_clause_id")
+        residual_required = entry.get("residual_model_required")
+        if (not isinstance(clause_id, str) or not clause_id or
+                not isinstance(residual_required, bool)):
+            raise ContractError(f"predicate registry authority is invalid for {rubric_id}")
+        replacement, row = predicate_item(
+            rubric_id, clause_id, args.predicate_results, tuple0["rubric_sha256"]
+        )
+        row["rubric_clause_id"] = clause_id
+        row["residual_model_required"] = residual_required
+        if residual_required and row["status"] == "pass":
+            residual = json.loads(json.dumps(item_by_id[rubric_id]))
+            residual["reasoning"] = (
+                f"{residual['reasoning']} Deterministic required clause passed: {clause_id}."
+            )
+            residual["evidence_refs"] = list(dict.fromkeys(
+                residual["evidence_refs"] + replacement["evidence_refs"]
+            ))
+            replacement = residual
+        item_by_id[rubric_id] = replacement
+        predicate_rows.append(row)
+    folded["items"] = [item_by_id[rubric_id] for rubric_id in rubric_ids0]
+    validate_judgement(folded, args.area)
+
+    output_bytes = canonical_json(folded)
+    fold_status = "coverage-withheld" if coverage_failures else "complete"
+    scores = [candidate["score_pct"] for candidate in candidates]
+    computed_scores = [candidate["computed_score_pct"] for candidate in candidates]
+    if coverage_failures:
+        median_pct = q1 = q3 = mad_pct = None
+        dispersion_status = "withheld-coverage"
+    else:
+        sorted_scores = sorted(scores)
+        median_pct = statistics.median(sorted_scores)
+        midpoint = len(sorted_scores) // 2
+        q1 = statistics.median(sorted_scores[:midpoint])
+        q3 = statistics.median(sorted_scores[midpoint + 1:])
+        mad_pct = statistics.median(abs(score - median_pct) for score in sorted_scores)
+        dispersion_status = "descriptive-only"
+    receipt = {
+        "schema": "hill-climb-judgement-fold.v1",
+        "area": args.area,
+        "fold": "median-candidate-by-area-score",
+        "fold_status": fold_status,
+        "requested_n": args.sample_count,
+        "enrolled_n": len(candidates),
+        "valid_score_n": len(candidates) - len(coverage_failures),
+        "refused_sample_n": sum(candidate["refused"] for candidate in candidates),
+        "refused_samples": [
+            {"sample": candidate["sample"], "reason": candidate["refusal_reason"]}
+            for candidate in sorted(candidates, key=lambda row: row["sample"])
+            if candidate["refused"]
+        ],
+        "coverage_gate_failures": coverage_failures,
+        "invocation_tuple": tuple0,
+        "scores_pct": scores,
+        "computed_scores_pct": computed_scores,
+        "coverage_pct": [candidate["coverage_pct"] for candidate in candidates],
+        "selected_sample": None if coverage_failures else selected["sample"],
+        "selected_judgement_sha256": (
+            None if coverage_failures else selected["judgement_sha256"]
+        ),
+        "withheld_projection_sample": selected["sample"] if coverage_failures else None,
+        "candidate_receipts": [
+            {
+                "sample": candidate["sample"],
+                "candidate_sha256": candidate["candidate_sha256"],
+                **candidate["component_receipts"],
+            }
+            for candidate in sorted(candidates, key=lambda row: row["sample"])
+        ],
+        "predicate_results": predicate_rows,
+        "dispersion": {
+            "status": dispersion_status,
+            "median_pct": median_pct,
+            "coverage_min_pct": min(candidate["coverage_pct"] for candidate in candidates),
+            "mad_pct": mad_pct,
+            "scaled_mad_pct": None if mad_pct is None else mad_pct * 1.4826,
+            "iqr_pct": None if q1 is None else q3 - q1,
+            "min_pct": None if coverage_failures else min(sorted_scores),
+            "max_pct": None if coverage_failures else max(sorted_scores),
+        },
+        "noise_calibration": {
+            "status": "insufficient",
+            "estimator_basis": f"n{args.sample_count}-n{args.sample_count}",
+            "calibration_id": None,
+            "capture_strata": 0,
+            "independent_samples": 0,
+            "calibrated_bound_pct": None,
+            "uncertainty": None,
+            "delta_render": "variance-uncalibrated",
+        },
+        "output_sha256": digest_bytes(output_bytes),
+    }
+    receipt_bytes = canonical_json(receipt)
+    exclusive_write(args.output, output_bytes)
+    try:
+        exclusive_write(args.receipt, receipt_bytes)
+    except BaseException:
+        args.output.unlink()
+        raise
+    print(json.dumps(receipt, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except ContractError as error:
+        print(f"ERROR hill-climb-judgement-fold: {error}", file=sys.stderr)
+        raise SystemExit(1)

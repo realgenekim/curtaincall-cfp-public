@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Welcome page treatments — main column</title>
+<style>
+  :root {
+    --paper:#FAF7F2; --paper-deep:#F1EADD; --card:#FFFFFF;
+    --ink:#221E17; --ink-soft:#3B342A; --muted:#7C7264; --muted-2:#948A7B;
+    --kicker:#9C9284; --line:#E9E1D5; --line-soft:#EFE8DC;
+    --link:#1E62A8; --go:#1B7A4B; --highlight:#FFF1B8; --focus-line:#B9924A;
+    --radius:7px; --radius-lg:12px;
+    --font-display:'Fraunces','Iowan Old Style','Palatino Linotype',Georgia,serif;
+    --font-ui:'Source Sans 3',system-ui,'Seravek','Avenir Next','Segoe UI',sans-serif;
+  }
+  @font-face { font-family:'Fraunces';
+    src:url('http://localhost:20501/vendor/fraunces-latin.woff2') format('woff2');
+    font-weight:100 900; font-style:normal; font-display:swap; }
+  @font-face { font-family:'Source Sans 3';
+    src:url('http://localhost:20501/vendor/source-sans-3-latin.woff2') format('woff2');
+    font-weight:200 900; font-style:normal; font-display:swap; }
+
+  * { box-sizing:border-box; margin:0; }
+  body { background:#EDE7DC; font-family:var(--font-ui); color:var(--ink); padding:28px; }
+  h1 { font-family:var(--font-display); font-size:26px; margin-bottom:4px; }
+  .sub { color:var(--muted); margin-bottom:24px; font-size:14.5px; max-width:72ch; }
+  .lbl { font-family:var(--font-display); font-weight:700; font-size:17px; margin:34px 0 3px; }
+  .why { color:var(--muted); font-size:12.5px; margin-bottom:12px; max-width:660px; }
+  a { color:var(--link); text-decoration:none; }
+  .kick { font-size:11.5px; letter-spacing:.1em; text-transform:uppercase;
+          color:var(--kicker); font-weight:600; }
+  .btn { display:inline-block; border-radius:var(--radius); font-weight:600;
+         font-size:15px; padding:9px 16px; border:none; background:var(--link); color:#fff; }
+
+  /* page frame = the main column only (rail omitted on purpose) */
+  .page { background:var(--paper); border:1px solid var(--line); border-radius:14px;
+          max-width:760px; padding:20px 30px 30px; }
+  .whoami { display:flex; justify-content:flex-end; align-items:center; gap:10px;
+            font-size:13px; color:var(--muted); margin-bottom:14px; }
+  .whoami b { color:var(--ink); }
+  .whoami .out { border:1px solid var(--line); border-radius:var(--radius);
+                 padding:4px 12px; font-size:12.5px; color:var(--ink-soft); background:var(--card); }
+  .greet { font-family:var(--font-display); font-size:27px; margin-bottom:5px; }
+  .thesis { color:var(--muted); font-size:15px; margin-bottom:18px; max-width:46ch; }
+
+  .door { background:var(--card); border:1px solid var(--line); border-radius:var(--radius-lg);
+          padding:15px 18px; margin-bottom:12px; }
+  .door .kick { display:block; margin-bottom:5px; }
+  .door p { color:var(--ink-soft); font-size:14.5px; line-height:1.5; margin-bottom:9px; max-width:56ch; }
+  .door .doors { display:flex; flex-direction:column; gap:4px; font-size:14.5px; }
+
+  .promise { margin-top:14px; border-left:3px solid var(--focus-line); padding-left:13px; }
+  .promise .kick { display:block; margin-bottom:3px; }
+  .promise p { font-family:var(--font-display); font-size:15px; line-height:1.45;
+               color:var(--ink-soft); max-width:44ch; }
+
+  /* W1: proof strip — compact live-event cards in a row */
+  .strip { display:flex; gap:12px; margin:6px 0 4px; }
+  .live-card { flex:1; background:var(--card); border:1px solid var(--line);
+               border-radius:var(--radius-lg); padding:13px 15px; }
+  .live-card h4 { font-family:var(--font-display); font-size:15.5px; line-height:1.25;
+                  margin-bottom:6px; }
+  .live-card .n { font-size:20px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .live-card .nl { color:var(--muted); font-size:12.5px; margin-bottom:8px; }
+  .live-card a { font-size:13px; }
+
+  /* W2: quiet ticker rows */
+  .ticker { margin:4px 0 2px; }
+  .trow { display:flex; align-items:baseline; gap:10px; padding:7px 2px;
+          border-top:1px solid var(--line-soft); font-size:14.5px; }
+  .trow:first-of-type { border-top:none; }
+  .trow b { font-family:var(--font-display); }
+  .trow .dots { flex:1; border-bottom:1.5px dotted var(--line); }
+  .trow .n { font-variant-numeric:tabular-nums; color:var(--ink-soft); white-space:nowrap; }
+  .trow a { font-size:13px; white-space:nowrap; }
+</style>
+</head>
+<body>
+<h1>Welcome page — main-column treatments</h1>
+<p class="sub">All three: the "Events / Every event you run…" header, "Start AIE replay demo", and top "Create event" button are GONE (the door cards and rail already carry those acts). "signed in as … Log out" stays. The lonely right column is replaced by live proof — submissions only, no ratings, no coverage (insider metrics a newcomer can't parse; a big number + a real agenda link is proof anyone gets).</p>
+
+<p class="lbl">W1 — Doors, then a proof strip</p>
+<p class="why">Single column. After the three doors: "Live on Curtain Call right now" as a row of compact cards — works for two or three events, never looks lonely. My recommendation: calmest reading order — who you are, what you can do, proof it's real, why we built it.</p>
+<div class="page">
+  <div class="whoami">signed in as <b>Marvin Openclaw</b> <span class="out">Log out</span></div>
+  <div class="greet">Welcome, Marvin 👋</div>
+  <p class="thesis">Whether you're an organizer, a speaker, or a reviewer — we're glad you're here.</p>
+  <div class="door"><span class="kick">🎪 Running an event?</span>
+    <p>Create it here and you get a Program Committee, a seeded CFP form, and a
+      public call-for-speakers URL — live in minutes, not days.</p>
+    <span class="btn">Create your first event →</span></div>
+  <div class="door"><span class="kick">🎤 Speaking at one?</span>
+    <p>One profile, every conference — your bio, headshot, and links follow you.</p>
+    <div class="doors"><a href="#">Update your speaker profile →</a>
+      <a href="#">Your submissions &amp; their statuses →</a></div></div>
+  <div class="door"><span class="kick">🧐 Reviewing for a committee?</span>
+    <p>Organizers invite you — one click from the invite email lands you on the
+      shared board. Want to feel it first?</p>
+    <div class="doors"><a href="#">See a live review board →</a></div></div>
+  <span class="kick" style="display:block; margin:16px 0 8px;">Live on Curtain Call right now</span>
+  <div class="strip">
+    <div class="live-card"><h4>AI Engineer Code Summit</h4>
+      <div class="n">502</div><div class="nl">submissions</div>
+      <a href="#">See its public agenda →</a></div>
+    <div class="live-card"><h4>Enterprise AI Summit</h4>
+      <div class="n">81</div><div class="nl">submissions</div>
+      <a href="#">See its public agenda →</a></div>
+  </div>
+  <div class="promise"><span class="kick">Why we built this</span>
+    <p>24 conferences, 12 years, five tools we hated. This is the one we always
+      wanted. <a href="#">Read the whole story →</a></p></div>
+  <div class="promise"><span class="kick">Our promise to you</span>
+    <p>Nothing you write here is ever lost, and nothing is ever deleted.</p></div>
+</div>
+
+<p class="lbl">W2 — Doors, then a quiet ticker</p>
+<p class="why">Same order, but the proof is playbill-style dotted rows — the lightest touch; scales to any number of events.</p>
+<div class="page">
+  <div class="whoami">signed in as <b>Marvin Openclaw</b> <span class="out">Log out</span></div>
+  <div class="greet">Welcome, Marvin 👋</div>
+  <p class="thesis">Whether you're an organizer, a speaker, or a reviewer — we're glad you're here.</p>
+  <div class="door"><span class="kick">🎪 Running an event?</span>
+    <p>Create it here and you get a Program Committee, a seeded CFP form, and a
+      public call-for-speakers URL — live in minutes, not days.</p>
+    <span class="btn">Create your first event →</span></div>
+  <div class="door"><span class="kick">🎤 Speaking at one?</span>
+    <p>One profile, every conference — your bio, headshot, and links follow you.</p>
+    <div class="doors"><a href="#">Update your speaker profile →</a>
+      <a href="#">Your submissions &amp; their statuses →</a></div></div>
+  <div class="door"><span class="kick">🧐 Reviewing for a committee?</span>
+    <p>Organizers invite you — one click lands you on the shared board.</p>
+    <div class="doors"><a href="#">See a live review board →</a></div></div>
+  <span class="kick" style="display:block; margin:16px 0 4px;">Live on Curtain Call right now</span>
+  <div class="ticker">
+    <div class="trow"><b>AI Engineer Code Summit</b><span class="dots"></span>
+      <span class="n">502 submissions</span><a href="#">agenda →</a></div>
+    <div class="trow"><b>Enterprise AI Summit</b><span class="dots"></span>
+      <span class="n">81 submissions</span><a href="#">agenda →</a></div>
+  </div>
+  <div class="promise" style="margin-top:18px;"><span class="kick">Why we built this</span>
+    <p>24 conferences, 12 years, five tools we hated. This is the one we always
+      wanted. <a href="#">Read the whole story →</a></p></div>
+  <div class="promise"><span class="kick">Our promise to you</span>
+    <p>Nothing you write here is ever lost, and nothing is ever deleted.</p></div>
+</div>
+
+<p class="lbl">W3 — Proof first</p>
+<p class="why">The live strip leads — social proof before the ask. Strongest for a skeptical judge; slightly buries the doors.</p>
+<div class="page">
+  <div class="whoami">signed in as <b>Marvin Openclaw</b> <span class="out">Log out</span></div>
+  <div class="greet">Welcome, Marvin 👋</div>
+  <p class="thesis">Whether you're an organizer, a speaker, or a reviewer — we're glad you're here.</p>
+  <span class="kick" style="display:block; margin:2px 0 8px;">Live on Curtain Call right now</span>
+  <div class="strip" style="margin-bottom:16px;">
+    <div class="live-card"><h4>AI Engineer Code Summit</h4>
+      <div class="n">502</div><div class="nl">submissions</div>
+      <a href="#">See its public agenda →</a></div>
+    <div class="live-card"><h4>Enterprise AI Summit</h4>
+      <div class="n">81</div><div class="nl">submissions</div>
+      <a href="#">See its public agenda →</a></div>
+  </div>
+  <div class="door"><span class="kick">🎪 Running an event?</span>
+    <p>Create it here and you get a Program Committee, a seeded CFP form, and a
+      public call-for-speakers URL — live in minutes, not days.</p>
+    <span class="btn">Create your first event →</span></div>
+  <div class="door"><span class="kick">🎤 Speaking at one?</span>
+    <p>One profile, every conference — your bio, headshot, and links follow you.</p>
+    <div class="doors"><a href="#">Update your speaker profile →</a>
+      <a href="#">Your submissions &amp; their statuses →</a></div></div>
+  <div class="door"><span class="kick">🧐 Reviewing for a committee?</span>
+    <p>Organizers invite you — one click lands you on the shared board.</p>
+    <div class="doors"><a href="#">See a live review board →</a></div></div>
+  <div class="promise"><span class="kick">Why we built this</span>
+    <p>24 conferences, 12 years, five tools we hated. This is the one we always
+      wanted. <a href="#">Read the whole story →</a></p></div>
+  <div class="promise"><span class="kick">Our promise to you</span>
+    <p>Nothing you write here is ever lost, and nothing is ever deleted.</p></div>
+</div>
+
+</body>
+</html>

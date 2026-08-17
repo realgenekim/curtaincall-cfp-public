@@ -1,0 +1,2846 @@
+#!/usr/bin/env bash
+# Run on tester@anvil. Build isolated SUTs from one verified deployed commit,
+# authenticate every judge persona, and run every scenario through score.
+set -euo pipefail
+
+runtime_bin="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+capture_lineage_tool="$runtime_bin/capture-lineage"
+source_repo="${FLEET_SOURCE_REPO:-$HOME/src/curtaincall-cfp}"
+base_kit="${FLEET_EVAL_KIT:-$HOME/killmysaas-evals-coding-agent}"
+state_root="${FLEET_STATE_ROOT:-$HOME/fleet-runs}"
+current_link="$state_root/current"
+base_port="${FLEET_BASE_PORT:-20700}"
+slot_count="${FLEET_SLOTS:-8}"
+ready_timeout="${FLEET_READY_TIMEOUT_SECONDS:-600}"
+worker_timeout="${FLEET_WORKER_TIMEOUT_SECONDS:-2400}"
+fleet_executor="${FLEET_EXECUTOR:-codex}"
+worker_executor="${FLEET_WORKER_EXECUTOR:-$fleet_executor}"
+judge_executor="${FLEET_JUDGE_EXECUTOR:-$fleet_executor}"
+worker_model="${FLEET_WORKER_MODEL:-}"
+judge_model="${FLEET_JUDGE_MODEL:-}"
+worker_reasoning_effort="${FLEET_WORKER_REASONING_EFFORT:-}"
+judge_reasoning_effort="${FLEET_JUDGE_REASONING_EFFORT:-}"
+case "$worker_executor" in
+  codex) default_scenario_turn_budget=240 ;;
+  claude) default_scenario_turn_budget=120 ;;
+  *) default_scenario_turn_budget=120 ;;
+esac
+scenario_turn_budget="${FLEET_MAX_TURNS_PER_SCENARIO:-$default_scenario_turn_budget}"
+jvm_max_heap="${FLEET_JVM_MAX_HEAP:-512m}"
+deployment_sha="${FLEET_SHA:-}"
+harness_sha="${FLEET_HARNESS_SHA:-$deployment_sha}"
+deployment_run_url="${FLEET_DEPLOYMENT_RUN_URL:-}"
+# The pin as RECEIVED from the control plane, captured before any run-scoped
+# state can touch the working variables above. Nothing may overwrite these.
+received_deployment_sha="$deployment_sha"
+received_harness_sha="$harness_sha"
+received_deployment_run_url="$deployment_run_url"
+pin_source="${FLEET_PIN_SOURCE:-unspecified}"
+install_receipt_operation_sha256="${FLEET_INSTALL_RECEIPT_OPERATION_SHA256:-}"
+install_receipt_harness_sha="${FLEET_INSTALL_RECEIPT_HARNESS_SHA:-}"
+install_receipt_installer_sha="${FLEET_INSTALL_RECEIPT_INSTALLER_SHA:-}"
+stop_legacy="${FLEET_STOP_LEGACY:-true}"
+evidence_only="${FLEET_CONSOLIDATE_EVIDENCE_ONLY:-false}"
+eval_config_path="${FLEET_EVAL_CONFIG:-$base_kit/evalconfig.json}"
+expected_eval_config_sha256="${FLEET_EVAL_CONFIG_SHA256:-}"
+eval_config_sha256=""
+run_dir=""
+scenarios=()
+lane_prefixes=()
+
+default_scenarios=(
+  CFP-S1 CFP-S2 CFP-S3 CFP-S4
+  ABS-S1 ABS-S2 ABS-S3
+  SPK-S1 SPK-S2 SPK-S3
+  CNT-S1 CNT-S2 CNT-S3
+  AIA-S1 AIA-S2
+  EMB-S1 EMB-S2 EMB-S3
+)
+
+select_scenarios_and_lanes() {
+  local scenario prefix known lane
+  if [ -n "${FLEET_SCENARIOS:-}" ]; then
+    IFS=', ' read -r -a scenarios <<< "$FLEET_SCENARIOS"
+  else
+    scenarios=("${default_scenarios[@]}")
+  fi
+  [ "${#scenarios[@]}" -gt 0 ] || fail "no scenarios requested"
+
+  lane_prefixes=()
+  for scenario in "${scenarios[@]}"; do
+    prefix="${scenario%%-*}"
+    known=false
+    for lane in "${lane_prefixes[@]:-}"; do
+      [ "$lane" = "$prefix" ] && known=true
+    done
+    [ "$known" = "true" ] || lane_prefixes+=("$prefix")
+  done
+  if [ "$slot_count" -lt "${#lane_prefixes[@]}" ]; then
+    fail "FLEET_SLOTS=$slot_count cannot preserve ${#lane_prefixes[@]} stateful area lanes"
+  fi
+  slot_count="${#lane_prefixes[@]}"
+}
+
+fail() {
+  echo "ERROR hill-climb-fleet: $*" >&2
+  if [ -n "${run_dir:-}" ] && [ -d "$run_dir" ]; then
+    write_state "$run_dir/state.json" failed "$*" 2>/dev/null || true
+  fi
+  exit 1
+}
+
+run_with_runtime_lease() {
+  [ "$#" -ge 1 ] || fail "runtime lease command is missing"
+  local authority_root expected_uid expected_gid runtime_lock
+  if [ "$(id -un)" = tester ]; then
+    authority_root=/var/lib/eval-harness-install
+    expected_uid=0
+    expected_gid="$(id -g)"
+  else
+    authority_root="${FLEET_INSTALL_AUTHORITY_ROOT:-}"
+    [ -n "$authority_root" ] || fail "non-production runtime lock requires FLEET_INSTALL_AUTHORITY_ROOT"
+    expected_uid="$(id -u)"
+    expected_gid="$(id -g)"
+  fi
+  runtime_lock="$authority_root/runtime.lock"
+  python3 - "$authority_root" "$runtime_lock" "$expected_uid" "$expected_gid" <<'PY'
+import os
+import stat
+import sys
+root, lock, expected_uid, expected_gid = sys.argv[1:]
+expected_uid = int(expected_uid)
+expected_gid = int(expected_gid)
+root_meta = os.lstat(root)
+lock_meta = os.lstat(lock)
+if not stat.S_ISDIR(root_meta.st_mode) or root_meta.st_uid != expected_uid \
+        or root_meta.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+    raise SystemExit('runtime lock authority directory is not trusted')
+if not stat.S_ISREG(lock_meta.st_mode) or lock_meta.st_uid != expected_uid \
+        or lock_meta.st_gid != expected_gid or stat.S_IMODE(lock_meta.st_mode) != 0o660:
+    raise SystemExit('runtime lock is not an authority-owned regular 0660 file')
+PY
+  # A dedicated parent and its backup watchdog own the flock; the operation
+  # process group owns none of its descriptors. The lease is released only
+  # after that whole group is terminated, including when either the runner or
+  # the primary holder is killed.
+  exec python3 - "$runtime_lock" "$0" "$@" <<'PY'
+import fcntl
+import ctypes
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+
+lock_path, script, *command = sys.argv[1:]
+descriptor = os.open(lock_path, os.O_WRONLY)
+try:
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print('ERROR hill-climb-fleet: capture or installer owns the runtime lock', file=sys.stderr)
+    raise SystemExit(1)
+os.set_inheritable(descriptor, False)
+environment = os.environ.copy()
+environment['FLEET_RUNTIME_LOCK_CHILD'] = '1'
+environment['FLEET_RUNTIME_LOCK_PATH'] = lock_path
+environment['FLEET_RUNTIME_LOCK_PARENT_PID'] = str(os.getpid())
+subtree_state_dir = tempfile.mkdtemp(prefix='eval-runtime-subtrees.')
+environment['EVAL_RUNTIME_SUBTREE_STATE_DIR'] = subtree_state_dir
+holder_pid = os.getpid()
+
+def die_with_lock_holder():
+    if sys.platform.startswith('linux'):
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(1, signal.SIGKILL) != 0:
+            raise OSError(ctypes.get_errno(), 'prctl(PR_SET_PDEATHSIG) failed')
+        if os.getppid() != holder_pid:
+            os.kill(os.getpid(), signal.SIGKILL)
+
+def group_exists(group):
+    try:
+        os.killpg(group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+def active_subtrees():
+    try:
+        return bool(os.listdir(subtree_state_dir))
+    except FileNotFoundError:
+        return False
+
+def cleanup_subtree_state_dir():
+    try:
+        os.rmdir(subtree_state_dir)
+    except (FileNotFoundError, OSError):
+        pass
+
+def terminate_group(group):
+    try:
+        os.killpg(group, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = __import__('time').monotonic() + 2.0
+    while __import__('time').monotonic() < deadline:
+        if not group_exists(group) and not active_subtrees():
+            cleanup_subtree_state_dir()
+            return
+        __import__('time').sleep(0.02)
+    if active_subtrees():
+        print(f'ERROR hill-climb-fleet: registered deadline subtree is quarantined; '
+              'runtime lock remains held until its supervisor clears it', file=sys.stderr, flush=True)
+    while active_subtrees():
+        __import__('time').sleep(0.1)
+    if group_exists(group):
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    deadline = __import__('time').monotonic() + 5.0
+    while __import__('time').monotonic() < deadline:
+        if not group_exists(group):
+            cleanup_subtree_state_dir()
+            return
+        __import__('time').sleep(0.02)
+    if group_exists(group) or active_subtrees():
+        print(f'ERROR hill-climb-fleet: operation process group {group} is quarantined; '
+              'runtime lock remains held until it disappears', file=sys.stderr, flush=True)
+    while group_exists(group) or active_subtrees():
+        __import__('time').sleep(1.0)
+    cleanup_subtree_state_dir()
+
+# The operation begins behind a pipe gate. The primary holder creates and
+# receives an acknowledgement from the backup watchdog before it releases
+# even the first byte of runner code. A primary SIGKILL before that point
+# therefore either kills the blocked gate process or leaves the watchdog
+# holding the lease while it cleans the still-blocked group.
+gate_code = r'''\
+import os
+import sys
+gate = int(sys.argv[1])
+command = sys.argv[2:]
+message = os.read(gate, 1)
+os.close(gate)
+if message != b'G':
+    raise SystemExit(125)
+os.execvpe(command[0], command, os.environ)
+'''
+gate_read, gate_write = os.pipe()
+watch_read, watch_write = os.pipe()
+ready_read, ready_write = os.pipe()
+child = subprocess.Popen([sys.executable, '-c', gate_code, str(gate_read),
+                          script, '_runtime-lock-child', *command],
+                         close_fds=True, pass_fds=(gate_read,), env=environment,
+                         preexec_fn=die_with_lock_holder, start_new_session=True)
+operation_group = child.pid
+os.close(gate_read)
+
+# A backup watchdog intentionally shares only the lock fd. If this primary
+# holder is SIGKILLed, EOF on the pipe makes the watchdog terminate the whole
+# operation group before releasing its copy of the lease.
+watchdog_pid = os.fork()
+if watchdog_pid == 0:
+    os.close(watch_write)
+    os.close(gate_write)
+    os.close(ready_read)
+    try:
+        os.write(ready_write, b'R')
+        os.close(ready_write)
+        message = os.read(watch_read, 1)
+        if message != b'D':
+            terminate_group(operation_group)
+    finally:
+        os.close(watch_read)
+        cleanup_subtree_state_dir()
+    os._exit(0)
+os.close(watch_read)
+os.close(ready_write)
+watchdog_ready = os.read(ready_read, 1)
+os.close(ready_read)
+if watchdog_ready != b'R':
+    os.close(gate_write)
+    terminate_group(operation_group)
+    raise RuntimeError('backup watchdog did not acknowledge before operation release')
+if command and command[0] == '_test-runtime-lock-pregate':
+    if len(command) != 5:
+        raise RuntimeError('pre-gate test requires READY HOLDER_PID CHILD_PID EXECUTED')
+    _, ready_path, holder_path, child_path, _executed_path = command
+    pathlib = __import__('pathlib')
+    pathlib.Path(holder_path).write_text(f'{os.getpid()}\n', encoding='utf-8')
+    pathlib.Path(child_path).write_text(f'{operation_group}\n', encoding='utf-8')
+    pathlib.Path(ready_path).write_text('ready\n', encoding='utf-8')
+    while True:
+        __import__('time').sleep(1.0)
+os.write(gate_write, b'G')
+os.close(gate_write)
+
+def forward(signum, _frame):
+    try:
+        os.killpg(operation_group, signum)
+    except ProcessLookupError:
+        pass
+
+for watched in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(watched, forward)
+status = 1
+try:
+    status = child.wait()
+finally:
+    terminate_group(operation_group)
+    try:
+        os.write(watch_write, b'D')
+    except BrokenPipeError:
+        pass
+    os.close(watch_write)
+    try:
+        os.waitpid(watchdog_pid, 0)
+    except ChildProcessError:
+        pass
+    cleanup_subtree_state_dir()
+raise SystemExit(status)
+PY
+}
+
+runtime_lock_foreground_for_test() {
+  [ "$#" -eq 3 ] \
+    || fail "usage: hill-climb-fleet _test-runtime-lock-foreground READY RUNNER_PID CHILD_PID"
+  printf '%s\n' "$$" > "$2"
+  python3 - "$1" "$3" "$FLEET_RUNTIME_LOCK_PATH" <<'PY'
+import os
+import pathlib
+import signal
+import sys
+import time
+ready, child_pid, lock_path = sys.argv[1:]
+lock = os.stat(lock_path)
+for descriptor in range(3, 1024):
+    try:
+        candidate = os.fstat(descriptor)
+    except OSError:
+        continue
+    if (candidate.st_dev, candidate.st_ino) == (lock.st_dev, lock.st_ino):
+        raise SystemExit(f'foreground child inherited runtime lock fd {descriptor}')
+pathlib.Path(child_pid).write_text(f'{os.getpid()}\n', encoding='utf-8')
+pathlib.Path(ready).write_text('ready\n', encoding='utf-8')
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+time.sleep(30)
+PY
+}
+
+runtime_lock_timeout_tree_for_test() {
+  [ "$#" -eq 4 ] \
+    || fail "usage: hill-climb-fleet _test-runtime-lock-timeout-tree READY RUNNER_PID TIMEOUT_PID CHILD_PID"
+  printf '%s\n' "$$" > "$2"
+  run_with_deadline 30 python3 - "$1" "$4" <<'PY' &
+import os
+import pathlib
+import signal
+import sys
+import time
+ready, child_pid = sys.argv[1:]
+os.setsid()
+pathlib.Path(child_pid).write_text(f'{os.getpid()}\n', encoding='utf-8')
+pathlib.Path(ready).write_text('ready\n', encoding='utf-8')
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+time.sleep(30)
+PY
+  timeout_pid=$!
+  printf '%s\n' "$timeout_pid" > "$3"
+  wait "$timeout_pid"
+}
+
+# Bound a command's entire descendant tree without creating a nested process
+# group that could escape the outer fleet lease. On Linux, subreaper adoption
+# closes the double-fork/reparenting hole; the process census registers the
+# tree before signalling it and does not return until every registered member
+# is gone. This replaces GNU timeout, whose default and --foreground modes can
+# each satisfy only one half of that contract.
+run_with_deadline() {
+  [ "$#" -ge 2 ] || fail "run_with_deadline requires SECONDS COMMAND [ARG...]"
+  python3 -c '
+import ctypes
+import os
+import signal
+import subprocess
+import sys
+import time
+
+duration = float(sys.argv[1])
+command = sys.argv[2:]
+if duration <= 0:
+    raise SystemExit("deadline must be positive")
+if sys.platform.startswith("linux"):
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1) != 0:  # PR_SET_CHILD_SUBREAPER
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_CHILD_SUBREAPER) failed")
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise RuntimeError("Linux deadline supervisor requires pidfd identity and signalling")
+
+supervisor = os.getpid()
+state_dir = os.environ.get("EVAL_RUNTIME_SUBTREE_STATE_DIR")
+if not state_dir:
+    raise SystemExit("deadline supervisor requires outer subtree-state authority")
+marker = os.path.join(state_dir, f"active.{supervisor}.{time.time_ns()}")
+marker_fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+os.write(marker_fd, f"{supervisor}\n".encode())
+os.fsync(marker_fd)
+os.close(marker_fd)
+known = {}
+shutdown_signal = 0
+primary_pid = 0
+child = None
+
+def request_shutdown(signum, _frame):
+    global shutdown_signal
+    shutdown_signal = signum
+
+for watched in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(watched, request_shutdown)
+
+def process_table():
+    if sys.platform.startswith("linux"):
+        table = {}
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            pid = int(name)
+            try:
+                raw = open(f"/proc/{pid}/stat", encoding="utf-8").read()
+                fields = raw[raw.rfind(")") + 2:].split()
+                table[pid] = (int(fields[1]), fields[19])
+            except (FileNotFoundError, ProcessLookupError, PermissionError,
+                    IndexError, ValueError):
+                continue
+        return table
+    observer = subprocess.Popen(
+        ["ps", "-axo", "pid=,ppid=,lstart="], text=True, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL)
+    output, _ = observer.communicate()
+    if observer.returncode != 0:
+        raise RuntimeError("process census failed")
+    table = {}
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) >= 3:
+            table[int(fields[0])] = (int(fields[1]), " ".join(fields[2:]))
+    table.pop(observer.pid, None)
+    return table
+
+def descendant_frontier(snapshot):
+    frontier = {supervisor}
+    changed = True
+    while changed:
+        changed = False
+        for candidate, (parent, _started) in snapshot.items():
+            if parent in frontier and candidate not in frontier:
+                frontier.add(candidate)
+                changed = True
+    return frontier
+
+def bind_candidate(pid, observed_started, open_pidfd, fresh_snapshot, close_pidfd):
+    try:
+        pidfd = open_pidfd(pid)
+    except ProcessLookupError:
+        return None
+    fresh_table = fresh_snapshot()
+    fresh = fresh_table.get(pid)
+    fresh_frontier = descendant_frontier(fresh_table)
+    if fresh is None or fresh[1] != observed_started or pid not in fresh_frontier:
+        if pidfd is not None:
+            close_pidfd(pidfd)
+        return None
+    return (fresh[1], pidfd)
+
+def discover():
+    table = process_table()
+    frontier = descendant_frontier(table)
+    for pid in frontier - {supervisor}:
+        started = table[pid][1]
+        current = known.get(pid)
+        if current is None or current[0] != started:
+            if current is not None and current[1] is not None:
+                os.close(current[1])
+            # pidfd_open pins whichever process owns PID now, not necessarily
+            # the process observed by the preceding census. Re-read identity
+            # and ancestry after opening; only publish the binding when the
+            # pinned PID is still the same registered descendant.
+            binding = bind_candidate(
+                pid, started,
+                os.pidfd_open if sys.platform.startswith("linux") else lambda _pid: None,
+                process_table, os.close)
+            if binding is not None:
+                known[pid] = binding
+    table = process_table()
+    for pid, (started, pidfd) in list(known.items()):
+        current = table.get(pid)
+        if current is None or current[1] != started:
+            if pidfd is not None:
+                os.close(pidfd)
+            known.pop(pid, None)
+    return table
+
+def reap():
+    for pid in list(known):
+        if pid == primary_pid:
+            if child is not None and child.poll() is not None:
+                _started, pidfd = known.pop(pid)
+                if pidfd is not None:
+                    os.close(pidfd)
+            continue
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            continue
+
+def living():
+    table = discover()
+    reap()
+    return {pid for pid, (started, _pidfd) in known.items()
+            if pid in table and table[pid][1] == started}
+
+def signal_tree(signum):
+    for pid in sorted(living(), reverse=True):
+        try:
+            _started, pidfd = known[pid]
+            if pidfd is not None:
+                signal.pidfd_send_signal(pidfd, signum)
+            else:
+                os.kill(pid, signum)
+        except ProcessLookupError:
+            pass
+
+def terminate_tree():
+    signal_tree(signal.SIGTERM)
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if not living():
+            return
+        time.sleep(0.02)
+    signal_tree(signal.SIGKILL)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if not living():
+            return
+        time.sleep(0.02)
+    remaining = living()
+    if remaining:
+        print(f"ERROR hill-climb-fleet: deadline subtree is quarantined pids={sorted(remaining)}", file=sys.stderr, flush=True)
+    while remaining:
+        signal_tree(signal.SIGKILL)
+        time.sleep(1.0)
+        remaining = living()
+
+if os.environ.get("EVAL_RUNTIME_TEST_IDENTITY_SWAP") == "true":
+    closed = []
+    swapped = bind_candidate(
+        424242, "observed-start", lambda _pid: 99,
+        lambda: {424242: (supervisor, "replacement-start")}, closed.append)
+    if swapped is not None or closed != [99]:
+        raise RuntimeError("pidfd identity-swap refusal self-test failed")
+
+try:
+    child = subprocess.Popen(command, close_fds=True)
+    primary_pid = child.pid
+    discover()
+    expires = time.monotonic() + duration
+    timed_out = False
+    while child.poll() is None and not shutdown_signal:
+        discover()
+        if time.monotonic() >= expires:
+            timed_out = True
+            break
+        time.sleep(0.02)
+
+    # Normal command exit can also strand background descendants. Every
+    # bounded command is complete only when its registered subtree is quiet.
+    discover()
+    if timed_out or shutdown_signal or living():
+        terminate_tree()
+    status = child.poll()
+    if status is None:
+        status = child.wait()
+    reap()
+    if living():
+        raise RuntimeError("deadline subtree remained live after cleanup")
+    os.unlink(marker)
+    marker = None
+    if shutdown_signal:
+        raise SystemExit(128 + shutdown_signal)
+    if timed_out:
+        raise SystemExit(124)
+    if status < 0:
+        raise SystemExit(128 - status)
+    raise SystemExit(status)
+except BaseException:
+    # An unexpected supervisor failure is still not permission to abandon its
+    # registered children. If census/cleanup itself cannot prove quiescence,
+    # the active marker remains and the outer lock holder quarantines.
+    if marker is not None:
+        try:
+            if living():
+                terminate_tree()
+            if not living():
+                os.unlink(marker)
+                marker = None
+        except BaseException:
+            pass
+    raise
+' "$@"
+}
+
+runtime_deadline_expiry_for_test() {
+  [ "$#" -eq 2 ] \
+    || fail "usage: hill-climb-fleet _test-runtime-deadline-expiry READY CHILD_PID"
+  local status
+  set +e
+  run_with_deadline 0.2 python3 - "$1" "$2" <<'PY'
+import pathlib
+import subprocess
+import sys
+ready, child_pid = sys.argv[1:]
+child = subprocess.Popen([
+    sys.executable, '-c',
+    'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)'
+], start_new_session=True)
+pathlib.Path(child_pid).write_text(f'{child.pid}\n', encoding='utf-8')
+pathlib.Path(ready).write_text('ready\n', encoding='utf-8')
+child.wait()
+PY
+  status=$?
+  set -e
+  [ "$status" -eq 124 ] || fail "deadline supervisor returned $status instead of 124"
+  [ -s "$2" ] || fail "deadline fixture did not record its resistant grandchild"
+  ! kill -0 "$(cat "$2")" 2>/dev/null \
+    || fail "deadline supervisor returned while its resistant grandchild was alive"
+  printf 'DEADLINE SUBTREE TERMINATED\n'
+}
+
+runtime_deadline_identity_swap_for_test() {
+  EVAL_RUNTIME_TEST_IDENTITY_SWAP=true run_with_deadline 5 true
+  printf 'PIDFD IDENTITY SWAP REFUSED\n'
+}
+
+clear_stale_runtime_lease_after_stop() {
+  : # Kernel releases the shared lock when its owning process exits.
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "required command is missing: $1"
+}
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+sha256_stream() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    shasum -a 256 | awk '{print $1}'
+  fi
+}
+
+# A runtime install is not proven merely because bytes were copied once. The
+# legacy start/resume/score wrapper rewrote this file on every invocation, which
+# made a correct hand-install disappear immediately. These commands therefore
+# require an immutable install receipt that binds the currently executing bytes
+# and capture-lineage helper to the exact pinned deployment commit.
+verify_install_receipt() {
+  local expected_harness="${FLEET_EXPECTED_HARNESS_SHA:-}"
+  local expected_script="${FLEET_EXPECTED_SCRIPT_SHA256:-}"
+  local expected_lineage="${FLEET_EXPECTED_LINEAGE_SHA256:-}"
+  local script_path lineage_path receipt_dir authority_root runtime_user expected_receipt_uid verified_receipt
+  script_path="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0")"
+  lineage_path="$(dirname "$script_path")/capture-lineage"
+  runtime_user="$(id -un)"
+  if [ "$runtime_user" = "tester" ]; then
+    authority_root="/var/lib/eval-harness-install"
+    expected_receipt_uid=0
+  else
+    authority_root="${FLEET_INSTALL_AUTHORITY_ROOT:-}"
+    [ -n "$authority_root" ] || fail "non-production install verification requires FLEET_INSTALL_AUTHORITY_ROOT"
+    expected_receipt_uid="$(id -u)"
+  fi
+  authority_root="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$authority_root")"
+  receipt_dir="$authority_root/receipts"
+  for value in "$expected_harness" "$expected_script" "$expected_lineage"; do
+    case "$value" in ''|*[!0-9a-f]*) fail "install verification requires lowercase hexadecimal identities" ;; esac
+  done
+  [ "${#expected_harness}" -eq 40 ] || fail "FLEET_EXPECTED_HARNESS_SHA must be a full commit"
+  [ "${#expected_script}" -eq 64 ] || fail "FLEET_EXPECTED_SCRIPT_SHA256 must be a sha256"
+  [ "${#expected_lineage}" -eq 64 ] || fail "FLEET_EXPECTED_LINEAGE_SHA256 must be a sha256"
+  if [ ! -f "$script_path" ] || [ -L "$0" ]; then
+    fail "running harness is absent, non-regular, or symlinked"
+  fi
+  if [ ! -f "$lineage_path" ] || [ -L "$lineage_path" ]; then
+    fail "installed capture-lineage is absent, non-regular, or symlinked"
+  fi
+  [ "$(sha256_file "$script_path")" = "$expected_script" ] || fail "running harness digest differs from approved commit"
+  [ "$(sha256_file "$lineage_path")" = "$expected_lineage" ] || fail "installed capture-lineage digest differs from approved commit"
+  if [ ! -d "$receipt_dir" ] || [ -L "$receipt_dir" ]; then
+    fail "install receipt directory is absent or symlinked"
+  fi
+  verified_receipt="$(python3 - "$receipt_dir" "$expected_receipt_uid" "$expected_harness" "$expected_script" "$expected_lineage" \
+    "$script_path" "$lineage_path" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import stat
+import sys
+
+(root, expected_uid, harness, script_sha, lineage_sha,
+ script_path, lineage_path) = sys.argv[1:]
+expected_uid = int(expected_uid)
+authority_root = os.path.dirname(root)
+root_mode = os.lstat(root).st_mode
+if not stat.S_ISDIR(root_mode) or os.stat(root).st_uid != expected_uid \
+        or root_mode & (stat.S_IWGRP | stat.S_IWOTH):
+    raise SystemExit('install receipt authority directory is not trusted')
+required = {
+    'schema', 'ok', 'state', 'operation_sha256', 'manifest_sha256',
+    'preimage_commit', 'harness_sha', 'installer_sha', 'previous_script_sha256',
+    'previous_lineage_sha256', 'installed_script_sha256',
+    'installed_lineage_sha256', 'installer_leaf_sha256', 'target_script',
+    'target_lineage', 'target_mode', 'authority', 'proves', 'does_not_prove',
+}
+matches = []
+for path in pathlib.Path(root).glob('*.json'):
+    mode = path.lstat().st_mode
+    metadata = path.stat()
+    if not stat.S_ISREG(mode) or metadata.st_uid != expected_uid \
+            or mode & (stat.S_IWGRP | stat.S_IWOTH) or metadata.st_size > 4096:
+        continue
+    try:
+        value = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        continue
+    operation = value.get('operation_sha256') if isinstance(value, dict) else None
+    if isinstance(value, dict) and set(value) == required \
+            and value.get('schema') == 'eval-harness-install.v5' \
+            and value.get('ok') is True \
+            and value.get('state') in {'installed', 'adopted'} \
+            and isinstance(operation, str) and len(operation) == 64 \
+            and path.name == f'{operation}.json' \
+            and value.get('harness_sha') == harness \
+            and isinstance(value.get('preimage_commit'), str) and len(value['preimage_commit']) == 40 \
+            and isinstance(value.get('installer_sha'), str) and len(value['installer_sha']) == 40 \
+            and isinstance(value.get('manifest_sha256'), str) and len(value['manifest_sha256']) == 64 \
+            and isinstance(value.get('previous_script_sha256'), str) \
+            and len(value['previous_script_sha256']) == 64 \
+            and (value.get('previous_lineage_sha256') == 'absent' \
+                 or isinstance(value.get('previous_lineage_sha256'), str) \
+                 and len(value['previous_lineage_sha256']) == 64) \
+            and value.get('installed_script_sha256') == script_sha \
+            and value.get('installed_lineage_sha256') == lineage_sha \
+            and isinstance(value.get('installer_leaf_sha256'), str) \
+            and len(value['installer_leaf_sha256']) == 64 \
+            and value.get('target_script') == f'runtime/{operation}/hill-climb-fleet' \
+            and value.get('target_lineage') == f'runtime/{operation}/capture-lineage' \
+            and value.get('target_mode') == '0555' \
+            and value.get('authority') == 'root-control-plane' \
+            and value.get('proves') == ['installed-runtime-bytes'] \
+            and value.get('does_not_prove') == ['capture-launched', 'integration', 'deployment']:
+        operation = ''.join(line + '\n' for line in [
+            'schema=eval-harness-install-operation.v1',
+            f'harness_sha={harness}',
+            f"installer_sha={value['installer_sha']}",
+            f'new_script_sha={script_sha}',
+            f'new_lineage_sha={lineage_sha}',
+            f"leaf_sha={value['installer_leaf_sha256']}",
+            'target_script=runtime/hill-climb-fleet',
+            'target_lineage=runtime/capture-lineage',
+            'target_mode=0555',
+        ]).encode()
+        if hashlib.sha256(operation).hexdigest() != value['operation_sha256']:
+            continue
+        expected_dir = os.path.join(authority_root, 'runtime', value['operation_sha256'])
+        expected_script_path = os.path.join(expected_dir, 'hill-climb-fleet')
+        expected_lineage_path = os.path.join(expected_dir, 'capture-lineage')
+        current_path = os.path.join(authority_root, 'current')
+        runtime_root = os.path.join(authority_root, 'runtime')
+        if os.path.realpath(script_path) != expected_script_path \
+                or os.path.realpath(lineage_path) != expected_lineage_path \
+                or not os.path.islink(current_path) \
+                or os.path.realpath(current_path) != expected_dir:
+            continue
+        authority_meta = os.lstat(authority_root)
+        runtime_root_meta = os.lstat(runtime_root)
+        current_meta = os.lstat(current_path)
+        if authority_meta.st_uid != expected_uid \
+                or runtime_root_meta.st_uid != expected_uid \
+                or current_meta.st_uid != expected_uid \
+                or not stat.S_ISDIR(runtime_root_meta.st_mode) \
+                or authority_meta.st_mode & (stat.S_IWGRP | stat.S_IWOTH) \
+                or runtime_root_meta.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            continue
+        paths = [expected_dir, expected_script_path, expected_lineage_path]
+        metadata = [os.lstat(candidate) for candidate in paths]
+        if not stat.S_ISDIR(metadata[0].st_mode) \
+                or any(not stat.S_ISREG(item.st_mode) for item in metadata[1:]) \
+                or any(item.st_uid != expected_uid for item in metadata) \
+                or stat.S_IMODE(metadata[0].st_mode) != 0o555 \
+                or any(stat.S_IMODE(item.st_mode) != 0o555 for item in metadata[1:]):
+            continue
+        matches.append((path.name, value))
+if not matches:
+    raise SystemExit('no immutable install receipt binds the running harness')
+name, receipt = sorted(matches, key=lambda item: item[0])[-1]
+print('\t'.join([
+    receipt['operation_sha256'], receipt['harness_sha'], receipt['installer_sha'],
+]))
+PY
+  )"
+  IFS=$'\t' read -r install_receipt_operation_sha256 install_receipt_harness_sha \
+    install_receipt_installer_sha <<< "$verified_receipt"
+  printf 'HARNESS INSTALL VERIFIED harness=%s script=%s lineage=%s\n' \
+    "$expected_harness" "$expected_script" "$expected_lineage"
+}
+
+validate_executor() {
+  local name="$1" value="$2"
+  case "$value" in
+    codex|claude) ;;
+    *) fail "$name must be codex or claude; got '$value'" ;;
+  esac
+}
+
+validate_reasoning_effort() {
+  local name="$1" value="$2"
+  case "$value" in
+    minimal|low|medium|high|xhigh) ;;
+    *) fail "$name must be minimal, low, medium, high, or xhigh; got '$value'" ;;
+  esac
+}
+
+require_executor() {
+  local executor="$1"
+  require_command "$executor"
+  if [ "$executor" = "codex" ]; then
+    env -u OPENAI_API_KEY -u CODEX_API_KEY codex login status 2>&1 \
+      | grep -q 'Logged in using ChatGPT' \
+      || fail "Codex must be authenticated with ChatGPT subscription login; run 'codex login' as $(id -un)"
+  fi
+}
+
+numeric_between() {
+  local name="$1" value="$2" low="$3" high="$4"
+  case "$value" in
+    ''|*[!0-9]*) fail "$name must be numeric; got '$value'" ;;
+  esac
+  if [ "$value" -lt "$low" ] || [ "$value" -gt "$high" ]; then
+    fail "$name must be between $low and $high; got '$value'"
+  fi
+}
+
+validate_provenance_input() {
+  [ "${#deployment_sha}" -eq 40 ] \
+    || fail "FLEET_SHA must be the full 40-character deployed commit"
+  case "$deployment_sha" in
+    *[!0-9a-f]*) fail "FLEET_SHA must contain only lowercase hexadecimal characters" ;;
+  esac
+  [ "${#harness_sha}" -eq 40 ] \
+    || fail "FLEET_HARNESS_SHA must be the full 40-character harness commit"
+  case "$harness_sha" in
+    *[!0-9a-f]*) fail "FLEET_HARNESS_SHA must contain only lowercase hexadecimal characters" ;;
+  esac
+  [ -n "$deployment_run_url" ] \
+    || fail "FLEET_DEPLOYMENT_RUN_URL is required as deployment evidence"
+  case "$pin_source" in
+    explicit-pin|resolver|unspecified) ;;
+    *) fail "FLEET_PIN_SOURCE must be explicit-pin, resolver, or unspecified; got '$pin_source'" ;;
+  esac
+  git -C "$source_repo" rev-parse --git-dir >/dev/null 2>&1 \
+    || fail "source repo is missing: $source_repo"
+}
+
+validate_provenance() {
+  validate_provenance_input
+  git -C "$source_repo" cat-file -e "$deployment_sha^{commit}" \
+    || fail "deployed commit is unavailable: $deployment_sha"
+  git -C "$source_repo" cat-file -e "$harness_sha^{commit}" \
+    || fail "harness commit is unavailable: $harness_sha"
+  git -C "$source_repo" merge-base --is-ancestor "$deployment_sha" origin/staging \
+    || fail "deployed commit is not on origin/staging: $deployment_sha"
+  git -C "$source_repo" merge-base --is-ancestor "$harness_sha" origin/staging \
+    || fail "fleet harness commit is not on origin/staging: $harness_sha"
+}
+
+write_state() {
+  local path="$1" status="$2" detail="$3"
+  python3 - "$path" "$status" "$detail" <<'PY'
+import datetime
+import json
+import os
+import stat
+import sys
+import tempfile
+
+path, status, detail = sys.argv[1:]
+payload = {
+    "schema": "hill-climb-fleet-state.v1",
+    "status": status,
+    "detail": detail,
+    "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+}
+temporary = path + ".tmp"
+with open(temporary, "w", encoding="utf-8") as stream:
+    json.dump(payload, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+os.replace(temporary, path)
+PY
+}
+
+safe_stop_pid() {
+  local pid="$1" label="$2"
+  kill -0 "$pid" 2>/dev/null || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in $(seq 1 50); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  echo "Escalating managed $label pid=$pid to KILL" >&2
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
+collect_descendant_pids() {
+  local parent="$1" child
+  while IFS= read -r child; do
+    [ -n "$child" ] || continue
+    collect_descendant_pids "$child"
+    printf '%s\n' "$child"
+  done < <(pgrep -P "$parent" 2>/dev/null || true)
+}
+
+safe_stop_tree() {
+  local pid="$1" label="$2" descendants child alive
+  kill -0 "$pid" 2>/dev/null || return 0
+  descendants="$(collect_descendant_pids "$pid")"
+  for child in $descendants; do
+    kill -TERM "$child" 2>/dev/null || true
+  done
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in $(seq 1 50); do
+    alive=false
+    kill -0 "$pid" 2>/dev/null && alive=true
+    for child in $descendants; do
+      kill -0 "$child" 2>/dev/null && alive=true
+    done
+    [ "$alive" = "false" ] && return 0
+    sleep 0.1
+  done
+  echo "Escalating managed $label tree rooted at pid=$pid to KILL" >&2
+  for child in $descendants; do
+    kill -KILL "$child" 2>/dev/null || true
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
+stop_current() {
+  [ -L "$current_link" ] || return 0
+  local current supervisor_pid
+  current="$(readlink -f "$current_link")"
+  supervisor_pid=""
+  [ -f "$current/supervisor.pid" ] \
+    && supervisor_pid="$(tr -cd '0-9' < "$current/supervisor.pid")"
+  if [ -n "$supervisor_pid" ] && kill -0 "$supervisor_pid" 2>/dev/null; then
+    local group owner command_line
+    owner="$(ps -p "$supervisor_pid" -o user= 2>/dev/null | tr -d ' ' || true)"
+    command_line="$(ps -p "$supervisor_pid" -o command= 2>/dev/null || true)"
+    [ "$owner" = "$(id -un)" ] \
+      || fail "previous supervisor pid=$supervisor_pid belongs to $owner; refusing to stop it"
+    case "$command_line" in
+      *hill-climb-fleet*start*) ;;
+      *) fail "previous supervisor pid=$supervisor_pid has an unexpected command; refusing to stop it" ;;
+    esac
+    group="$(ps -o pgid= -p "$supervisor_pid" 2>/dev/null | tr -d ' ' || true)"
+    if [ "$group" = "$supervisor_pid" ]; then
+      echo "Stopping previous managed fleet process-group=$group"
+      kill -TERM -- "-$group" 2>/dev/null || true
+      sleep 2
+      kill -KILL -- "-$group" 2>/dev/null || true
+    else
+      safe_stop_pid "$supervisor_pid" "fleet supervisor"
+    fi
+  fi
+
+  while IFS= read -r pid_path; do
+    local pid cwd command_line
+    pid="$(tr -cd '0-9' < "$pid_path" 2>/dev/null || true)"
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+      continue
+    fi
+    cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | awk '/^n/ {sub(/^n/, ""); print; exit}')"
+    command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    case "$cwd:$command_line" in
+      "$current"/slots/*:*timeout*claude\ -p*|"$current"/slots/*:*timeout*codex\ exec*)
+        safe_stop_tree "$pid" "fleet worker"
+        ;;
+      *) echo "Refusing to stop unverified worker pid=$pid from $pid_path" >&2 ;;
+    esac
+  done < <(find "$current" -name worker.pid -type f -print 2>/dev/null)
+
+  while IFS= read -r pid_path; do
+    local pid cwd command_line
+    pid="$(tr -cd '0-9' < "$pid_path" 2>/dev/null || true)"
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+      continue
+    fi
+    cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | awk '/^n/ {sub(/^n/, ""); print; exit}')"
+    command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    case "$cwd:$command_line" in
+      "$state_root"/*/app:*cfp-scheduler-killer.core*) safe_stop_pid "$pid" "fleet SUT" ;;
+      *) echo "Refusing to stop unverified pid=$pid from $pid_path" >&2 ;;
+    esac
+  done < <(find "$current" -path '*/server/server.pid' -type f -print 2>/dev/null)
+
+  # terminalize_operator_stopped_run loads the STOPPED run's manifest into the
+  # shared globals (deployment_sha, harness_sha, models, ports, scenarios) via
+  # load_current_manifest. start_fleet calls stop_current BEFORE it pins the new
+  # run, so running the terminalizer in this shell silently replaced the pin the
+  # control plane just handed us with the previous run's SHA — every start from
+  # 2026-08-16T20:35Z on rebuilt the same stale commit. Isolate it: it only
+  # writes files, so a subshell loses nothing and its failures still propagate.
+  ( terminalize_operator_stopped_run "$current" )
+}
+
+# Fail loudly, naming the field, if anything moved the received pin between the
+# control-plane handoff and the moment the immutable run is created.
+assert_received_pin_intact() {
+  local field expected observed
+  while [ "$#" -ge 3 ]; do
+    field="$1"
+    expected="$2"
+    observed="$3"
+    shift 3
+    [ "$expected" = "$observed" ] \
+      || fail "received pin was overwritten before the run was created: $field requested='$expected' observed='$observed'"
+  done
+  [ "$#" -eq 0 ] || fail "assert_received_pin_intact needs field/expected/observed triples"
+}
+
+stop_legacy_fleet() {
+  [ "$stop_legacy" = "true" ] || return 0
+  local pid port cwd command_line owner
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    echo "Stopping legacy saturator pid=$pid"
+    safe_stop_pid "$pid" "legacy saturator"
+  done < <(pgrep -u "$(id -u)" -f '^bash /home/tester/climb-saturate.sh$' 2>/dev/null || true)
+
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    case "$command_line" in
+      *codex*curtaincallcfp.com*)
+        echo "Stopping unsafe legacy production climber pid=$pid"
+        safe_stop_pid "$pid" "production-targeting climber"
+        ;;
+    esac
+  done < <(pgrep -u "$(id -u)" -f 'codex.*curtaincallcfp.com' 2>/dev/null || true)
+
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | awk '/^n/ {sub(/^n/, ""); print; exit}')"
+    command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    case "$cwd:$command_line" in
+      "$state_root"/*/slots/*:*codex\ exec*|"$state_root"/*/slots/*:*claude\ -p*)
+        echo "Stopping orphan fleet worker pid=$pid cwd=$cwd"
+        safe_stop_tree "$pid" "orphan fleet worker"
+        ;;
+    esac
+  done < <(pgrep -u "$(id -u)" -f 'codex exec|claude -p' 2>/dev/null || true)
+
+  for port in $(seq 20602 20653); do
+    pid="$(lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1 || true)"
+    [ -n "$pid" ] || continue
+    owner="$(ps -p "$pid" -o user= 2>/dev/null | tr -d ' ' || true)"
+    cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | awk '/^n/ {sub(/^n/, ""); print; exit}')"
+    command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    if [ "$owner" = "$(id -un)" ] && [ "$cwd" = "$source_repo" ]; then
+      case "$command_line" in
+        *cfp-scheduler-killer.core*)
+          echo "Stopping legacy SUT port=$port pid=$pid"
+          safe_stop_pid "$pid" "legacy SUT"
+          ;;
+      esac
+    fi
+  done
+}
+
+copy_eval_kit() {
+  local destination="$1"
+  mkdir -p "$destination"
+  git -C "$base_kit" archive "$eval_kit_sha" | (
+    cd "$destination"
+    tar -xf -
+  )
+  install -m 0600 "$eval_config_path" "$destination/evalconfig.json"
+  [ "$(sha256_file "$destination/evalconfig.json")" = "$eval_config_sha256" ] \
+    || fail "copied eval config changed while preparing a lane"
+  ln -s "$base_kit/node_modules" "$destination/node_modules"
+  mkdir -p "$destination/.auth"
+}
+
+prepare_eval_config() {
+  if [ ! -f "$eval_config_path" ] || [ -L "$eval_config_path" ]; then
+    fail "eval config must be a regular non-symlink file: $eval_config_path"
+  fi
+  python3 - "$eval_config_path" <<'PY' \
+    || fail "eval config is not valid JSON: $eval_config_path"
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    payload = json.load(stream)
+if not isinstance(payload, dict):
+    raise SystemExit("eval config must be a JSON object")
+PY
+  eval_config_sha256=$(sha256_file "$eval_config_path")
+  case "$eval_config_sha256" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+    *) fail "could not hash eval config: $eval_config_path" ;;
+  esac
+  [ "${#eval_config_sha256}" -eq 64 ] || fail "eval config SHA-256 is invalid"
+  if [ -n "$expected_eval_config_sha256" ] \
+      && [ "$eval_config_sha256" != "$expected_eval_config_sha256" ]; then
+    fail "eval config SHA-256 does not match the pinned runtime input"
+  fi
+}
+
+configure_eval_kit() {
+  local kit="$1" port="$2"
+  python3 - "$kit/evalconfig.json" "$port" "$scenario_turn_budget" <<'PY'
+import json
+import os
+import sys
+
+path, port, scenario_turn_budget = sys.argv[1:]
+with open(path, encoding="utf-8") as stream:
+    config = json.load(stream)
+config["url"] = f"http://127.0.0.1:{port}"
+config["maxTurnsPerScenario"] = int(scenario_turn_budget)
+temporary = path + ".tmp"
+with open(temporary, "w", encoding="utf-8") as stream:
+    json.dump(config, stream, indent=2)
+    stream.write("\n")
+os.replace(temporary, path)
+PY
+}
+
+capture_personas() {
+  local kit="$1" port="$2" auth_log="$3"
+  local role label
+  : > "$auth_log"
+  while IFS=$'\t' read -r role label; do
+    (
+      cd "$kit"
+      run_with_deadline 120 npx --yes pnpm@9 run --silent sbek -- auth \
+        --persona "$role" --at /login --click "$label"
+    ) >> "$auth_log" 2>&1
+  done <<'EOF'
+organizer	Organizer · swyx
+reviewer	Reviewer · Maya Lindholm
+speaker	Speaker · Amara Devlin
+EOF
+
+  python3 - "$kit/.auth" "$port" <<'PY'
+import json
+import os
+import sys
+
+auth_dir, port = sys.argv[1:]
+for role in ("organizer", "reviewer", "speaker"):
+    path = os.path.join(auth_dir, f"127.0.0.1_{port}.{role}.json")
+    with open(path, encoding="utf-8") as stream:
+        payload = json.load(stream)
+    cookies = payload.get("cookies", [])
+    if not any(cookie.get("name") == "ring-session" for cookie in cookies):
+        raise SystemExit(f"{role} has no ring-session cookie in {path}")
+print("personas=organizer,reviewer,speaker cookies=verified")
+PY
+}
+
+prepare_lane() {
+  local slot="$1" lane="$2" port="$3" lane_dir="$4" lane_scenarios="$5"
+  local kit="$lane_dir/kit"
+  mkdir -p "$lane_dir"
+  echo "$(date -u +%FT%TZ) PREPARE slot=$slot lane=$lane scenarios=$lane_scenarios port=$port" \
+    >> "$run_dir/events.log"
+  if ! PORT="$port" \
+    JUDGE_SANDBOX_RUNTIME="$lane_dir/events.jsonl" \
+    JSONL_RUN_DIR="$lane_dir/server" \
+    JSONL_CLEAR_CLASSES=false \
+    JSONL_INHERIT_PROCESS_GROUP=true \
+    JVM_MAX_HEAP="$jvm_max_heap" \
+    "$app_dir/bin/reset-jsonl-server" > "$lane_dir/reset.log" 2>&1; then
+    return 1
+  fi
+  case "$lane" in
+    CFP|SPK)
+      "$capture_lineage_tool" create-lane \
+        --golden "$app_dir/resources/judge-sandbox/events.jsonl" \
+        --store "$lane_dir/events.jsonl" \
+        --output "$lane_dir/capture-lineage.json" \
+        --lane "$lane" \
+        --scenarios "$lane_scenarios" \
+        --product-sha "$deployment_sha" \
+        --harness-sha "$harness_sha" \
+        --eval-kit-sha "$eval_kit_sha" \
+        --eval-config-sha256 "$eval_config_sha256" \
+        --golden-sha256 "$golden_fixture_sha256" \
+        > "$lane_dir/capture-lineage.log" 2>&1 || return 1
+      ;;
+  esac
+  copy_eval_kit "$kit" || return 1
+  configure_eval_kit "$kit" "$port" || return 1
+  cp "$app_dir/docs/hill-climb/sbek-worker-charter.md" "$kit/SBEK-WORKER-CHARTER.md" \
+    || return 1
+  capture_personas "$kit" "$port" "$lane_dir/sbek-auth.log" \
+    > "$lane_dir/persona-proof.txt" || return 1
+  if ! (
+    cd "$kit"
+    run_with_deadline 120 npx --yes pnpm@9 run --silent sbek -- plan \
+      --url "http://127.0.0.1:$port" \
+      --scenarios "${lane_scenarios// /,}"
+  ) > "$lane_dir/plan.log" 2>&1; then
+    return 1
+  fi
+  python3 - "$lane_dir/ready.json" "$lane" "$lane_scenarios" "$slot" "$port" \
+    "$deployment_sha" "$lane_dir/server/receipt.json" <<'PY'
+import datetime
+import json
+import sys
+
+path, lane, lane_scenarios, slot, port, sha, server_receipt = sys.argv[1:]
+with open(server_receipt, encoding="utf-8") as stream:
+    server = json.load(stream)
+payload = {
+    "schema": "hill-climb-slot-ready.v1",
+    "ready_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "lane": lane,
+    "scenarios": lane_scenarios.split(),
+    "slot": int(slot),
+    "port": int(port),
+    "code_sha": sha,
+    "golden_sha256": server["golden_sha256"],
+    "submissions": server["submission_count"],
+    "personas": ["organizer", "reviewer", "speaker"],
+}
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(payload, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+PY
+}
+
+run_worker_agent() {
+  local kit="$1" prompt="$2"
+  case "$worker_executor" in
+    codex)
+      cd "$kit"
+      run_with_deadline "$worker_timeout" env -u OPENAI_API_KEY -u CODEX_API_KEY codex exec \
+        --ephemeral --ignore-user-config --ignore-rules \
+        --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \
+        --model "$worker_model" \
+        -c "model_reasoning_effort=\"$worker_reasoning_effort\"" \
+        --json --color never \
+        -c 'mcp_servers.sbek.command="npx"' \
+        -c 'mcp_servers.sbek.args=["--no-install","tsx","src/mcp.ts"]' \
+        -c 'mcp_servers.sbek.required=true' \
+        -c 'mcp_servers.sbek.enabled_tools=["start_scenario","abort_scenario","navigate","snapshot","click","fill","select","drag","upload","press","scroll","wait","screenshot","observe","done"]' \
+        "$prompt"
+      ;;
+    claude)
+      cd "$kit"
+      run_with_deadline "$worker_timeout" claude -p "$prompt" --model "$worker_model" \
+        --mcp-config .mcp.json --strict-mcp-config \
+        --allowedTools 'mcp__sbek,mcp__sbek__*,Read' \
+        --verbose --output-format stream-json
+      ;;
+  esac
+}
+
+scenario_evidence_outcome() {
+  local kit="$1" scenario="$2"
+  python3 - "$kit" "$scenario" <<'PY'
+import glob
+import json
+import os
+import sys
+
+kit, scenario = sys.argv[1:]
+paths = glob.glob(os.path.join(kit, "runs", "*", scenario, "evidence.json"))
+if not paths:
+    print("missing")
+    raise SystemExit(0)
+if len(paths) != 1:
+    print("corrupt")
+    raise SystemExit(0)
+try:
+    with open(paths[0], encoding="utf-8") as stream:
+        outcome = json.load(stream).get("outcome")
+except (OSError, ValueError):
+    print("corrupt")
+    raise SystemExit(0)
+allowed = {"completed", "blocked", "feature_not_found", "agent_error"}
+print(outcome if outcome in allowed else "corrupt")
+PY
+}
+
+scenario_evidence_path() {
+  local kit="$1" scenario="$2"
+  python3 - "$kit" "$scenario" <<'PY'
+import glob
+import os
+import sys
+
+kit, scenario = sys.argv[1:]
+paths = glob.glob(os.path.join(kit, "runs", "*", scenario, "evidence.json"))
+if len(paths) != 1:
+    raise SystemExit(f"expected exactly one evidence file for {scenario}; found {len(paths)}")
+print(paths[0])
+PY
+}
+
+scenario_predecessor_receipt() {
+  local kit="$1" lineage_path="$2" scenario="$3"
+  python3 - "$kit" "$lineage_path" "$scenario" <<'PY'
+import glob
+import json
+import os
+import sys
+
+kit, lineage_path, scenario = sys.argv[1:]
+with open(lineage_path, encoding="utf-8") as stream:
+    scenarios = json.load(stream)["scenarios"]
+index = scenarios.index(scenario)
+if index == 0:
+    print("-")
+    raise SystemExit(0)
+prior = scenarios[index - 1]
+paths = glob.glob(os.path.join(kit, "runs", "*", prior, "capture-receipt.json"))
+if len(paths) != 1:
+    raise SystemExit(f"expected exactly one predecessor receipt for {scenario}; found {len(paths)}")
+print(paths[0])
+PY
+}
+
+normalize_captured_receipt() {
+  local cycle_dir="$1" evidence_outcome="$2"
+  if [ -s "$cycle_dir/worker.exit" ] \
+      && [ "$(cat "$cycle_dir/worker.exit")" != 0 ] \
+      && [ ! -e "$cycle_dir/worker.exit.before-resume" ]; then
+    cp "$cycle_dir/worker.exit" "$cycle_dir/worker.exit.before-resume"
+  fi
+  if [ -e "$cycle_dir/worker.failed" ]; then
+    mv "$cycle_dir/worker.failed" "$cycle_dir/worker.failed.before-resume"
+  fi
+  printf '0\n' > "$cycle_dir/worker.exit"
+  touch "$cycle_dir/worker.done"
+  if [ "$evidence_outcome" = "blocked" ]; then
+    touch "$cycle_dir/worker.blocked"
+  fi
+}
+
+run_cycle() {
+  local slot="$1" scenario="$2" port="$3" lane_dir="$4" cycle_dir="$5" predecessor="$6"
+  local kit="$lane_dir/kit" exit_code=0 prompt evidence_outcome evidence_path store_before
+  local failure_reason
+  mkdir -p "$cycle_dir"
+  if ! capture_personas "$kit" "$port" "$cycle_dir/sbek-auth.log" \
+      > "$cycle_dir/persona-proof.txt"; then
+    touch "$cycle_dir/worker.failed"
+    record_terminal_disposition "$slot" "$scenario" "$port" "$cycle_dir" \
+      failed auth-refused slot-supervisor slot-local "$predecessor"
+    echo "$(date -u +%FT%TZ) AUTH_FAILED slot=$slot scenario=$scenario port=$port scope=slot-local reason=auth-refused" \
+      >> "$run_dir/events.log"
+    return 30
+  fi
+  echo "$(date -u +%FT%TZ) AUTHENTICATED slot=$slot scenario=$scenario port=$port" \
+    >> "$run_dir/events.log"
+  prompt="Read SBEK-WORKER-CHARTER.md and AGENTS.md. Capture scenario $scenario fully against the isolated SUT http://127.0.0.1:$port. The supervisor just refreshed and verified all persona sessions; prior scenarios in this area remain in the same store. The canonical fixture is Enterprise AI Summit: organizer swyx, reviewer Maya Lindholm, speaker Amara Devlin. Never create or use the legacy DevFlow Conf or Priya Raman identities. Never visit /login merely to chase a fixture identity. If the script explicitly requires a perspective transition, navigate to /login once and immediately click the corresponding sandbox persona button; never fill email or take a second action while on /login. Record only the canonical identity actually observed. Call start_scenario, browse with screenshots and factual observations, and call done. Do not judge or score; fresh consolidated judges do that after every scenario finishes. Report every real DEFECT. Never target production or fabricate evidence."
+  store_before="$(sha256_file "$lane_dir/events.jsonl"):$(wc -c < "$lane_dir/events.jsonl" | tr -d ' ')"
+  echo "$(date -u +%FT%TZ) START slot=$slot scenario=$scenario port=$port" \
+    >> "$run_dir/events.log"
+  set +e
+  (
+    printf '%s\n' "$BASHPID" > "$cycle_dir/worker.pid"
+    run_worker_agent "$kit" "$prompt"
+  ) > "$cycle_dir/worker.log" 2>&1
+  exit_code=$?
+  set -e
+  evidence_outcome="$(scenario_evidence_outcome "$kit" "$scenario")"
+  printf '%s\n' "$exit_code" > "$cycle_dir/worker.exit"
+  if [ "$exit_code" -eq 0 ] \
+      && [ "$evidence_outcome" != "missing" ] \
+      && [ "$evidence_outcome" != "corrupt" ]; then
+    case "$scenario" in
+      CFP-*|SPK-*)
+        evidence_path="$(scenario_evidence_path "$kit" "$scenario")" || {
+          touch "$cycle_dir/worker.failed"
+          record_terminal_disposition "$slot" "$scenario" "$port" "$cycle_dir" \
+            failed missing-evidence capture-worker slot-local "$predecessor"
+          return 30
+        }
+        if ! "$capture_lineage_tool" record \
+            --lineage "$lane_dir/capture-lineage.json" \
+            --store "$lane_dir/events.jsonl" \
+            --store-before "$store_before" \
+            --evidence "$evidence_path" \
+            --auth-proof "$cycle_dir/persona-proof.txt" \
+            --predecessor "$predecessor" \
+            --output "$(dirname "$evidence_path")/capture-receipt.json" \
+            > "$cycle_dir/capture-lineage.log" 2>&1; then
+          touch "$cycle_dir/worker.failed"
+          record_terminal_disposition "$slot" "$scenario" "$port" "$cycle_dir" \
+            failed capture-lineage-refused capture-validator slot-local "$predecessor"
+          echo "$(date -u +%FT%TZ) LINEAGE_FAILED slot=$slot scenario=$scenario port=$port worker_exit=0 scope=slot-local reason=capture-lineage-refused" \
+            >> "$run_dir/events.log"
+          # A scoped top-up must charge this scenario only. Keep the lane
+          # alive so later selected scenarios get their own evidence attempt;
+          # the scheduler handles this typed refusal as a scenario-local zero.
+          if [ -n "${FLEET_SCENARIOS:-}" ]; then
+            return 31
+          fi
+          return 30
+        fi
+        ;;
+    esac
+    normalize_captured_receipt "$cycle_dir" "$evidence_outcome"
+    if [ "$evidence_outcome" = "blocked" ]; then
+      echo "Worker produced BLOCKED evidence; journey captured and lane continues" \
+        >> "$cycle_dir/worker.log"
+    fi
+    echo "$(date -u +%FT%TZ) CAPTURED slot=$slot scenario=$scenario outcome=$evidence_outcome port=$port" \
+      >> "$run_dir/events.log"
+    return 0
+  fi
+  touch "$cycle_dir/worker.failed"
+  if [ "$exit_code" -ne 0 ]; then
+    failure_reason="worker-exit"
+  elif [ "$evidence_outcome" = "missing" ]; then
+    failure_reason="missing-evidence"
+  else
+    failure_reason="ambiguous-evidence-owner"
+  fi
+  record_terminal_disposition "$slot" "$scenario" "$port" "$cycle_dir" \
+    failed "$failure_reason" capture-worker slot-local "$predecessor"
+  echo "$(date -u +%FT%TZ) FAILED slot=$slot scenario=$scenario port=$port worker_exit=$exit_code scope=slot-local reason=$failure_reason" \
+    >> "$run_dir/events.log"
+  return 30
+}
+
+# INTENT: EVAL-CAPTURE-TERMINAL-001
+# INTENT: EVAL-CAPTURE-SCOPE-001
+record_terminal_disposition() {
+  local slot="$1" scenario="$2" port="$3" cycle_dir="$4"
+  local status="$5" cause="$6" owner="$7" scope="$8" predecessor="${9:--}"
+  local disposition_state
+  mkdir -p "$cycle_dir"
+  disposition_state="$(python3 - "$cycle_dir/terminal-disposition.json" \
+    "$scenario" "$status" "$cause" "$owner" "$scope" "$predecessor" <<'PY'
+import datetime
+import json
+import os
+import stat
+import sys
+import tempfile
+
+path, scenario, status, cause, owner, scope, predecessor = sys.argv[1:]
+if status not in {"failed", "not-run"}:
+    raise SystemExit(f"invalid terminal disposition status: {status}")
+if scope not in {"scenario-local", "slot-local", "run-global"}:
+    raise SystemExit(f"invalid terminal disposition scope: {scope}")
+payload = {
+    "schema": "hill-climb-scenario-terminal.v2",
+    "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "scenario": scenario,
+    "status": status,
+    "cause": cause,
+    "owner": owner,
+    "scope": scope,
+}
+
+if predecessor != "-":
+    payload["predecessor"] = predecessor
+semantic_keys = ("schema", "scenario", "status", "cause", "owner", "scope", "predecessor")
+def same_existing() -> bool:
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(mode):
+        raise SystemExit("terminal disposition path is not a regular file")
+    with open(path, encoding="utf-8") as stream:
+        existing = json.load(stream)
+    expected = {
+        "schema": "hill-climb-scenario-terminal.v2",
+        "scenario": scenario,
+        "status": status,
+        "cause": cause,
+        "owner": owner,
+        "scope": scope,
+    }
+    if predecessor != "-":
+        expected["predecessor"] = predecessor
+    existing_semantic = {
+        key: existing[key] for key in semantic_keys if key in existing
+    }
+    if set(existing) != set(payload) or not isinstance(existing.get("recorded_at"), str) \
+            or not existing["recorded_at"] or existing_semantic != expected:
+        raise SystemExit("existing terminal disposition conflicts with requested outcome")
+    return True
+if same_existing():
+    print("reused")
+    raise SystemExit(0)
+data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+fd, temporary = tempfile.mkstemp(prefix=".terminal-disposition.", dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    try:
+        os.link(temporary, path)
+    except FileExistsError:
+        if not same_existing():
+            raise SystemExit("terminal disposition publication raced without a final receipt")
+        print("reused")
+    else:
+        directory_fd = os.open(os.path.dirname(path), os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        print("created")
+finally:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+PY
+)"
+  if [ "$disposition_state" = "created" ]; then
+    echo "$(date -u +%FT%TZ) DISPOSITION slot=$slot scenario=$scenario port=$port status=$status scope=$scope reason=$cause owner=$owner predecessor=$predecessor" \
+      >> "$run_dir/events.log"
+  fi
+}
+
+record_slot_requeue() {
+  local slot="$1" lane="$2" cause="$3" owner="$4" scenario_text="$5"
+  python3 - "$run_dir/slots/slot-$slot/requeue-request.json" \
+    "$lane" "$cause" "$owner" "$scenario_text" <<'PY'
+import datetime
+import json
+import os
+import stat
+import sys
+import tempfile
+
+path, lane, cause, owner, scenario_text = sys.argv[1:]
+payload = {
+    "schema": "hill-climb-slot-requeue.v1",
+    "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "lane": lane,
+    "cause": cause,
+    "owner": owner,
+    "scenarios": scenario_text.split(),
+    "required_action": "new-capture-plan",
+}
+semantic_keys = ("schema", "lane", "cause", "owner", "scenarios", "required_action")
+def same_existing() -> bool:
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(mode):
+        raise SystemExit("slot requeue path is not a regular file")
+    with open(path, encoding="utf-8") as stream:
+        existing = json.load(stream)
+    semantic = {key: payload[key] for key in (
+        "schema", "lane", "cause", "owner", "scenarios", "required_action"
+    )}
+    if set(existing) != set(payload) or not isinstance(existing.get("recorded_at"), str) \
+            or not existing["recorded_at"] \
+            or {key: existing.get(key) for key in semantic} != semantic:
+        raise SystemExit("existing slot requeue request conflicts with requested work")
+    return True
+if same_existing():
+    raise SystemExit(0)
+data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+fd, temporary = tempfile.mkstemp(prefix=".requeue-request.", dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    try:
+        os.link(temporary, path)
+    except FileExistsError:
+        if not same_existing():
+            raise SystemExit("slot requeue publication raced without a final receipt")
+    else:
+        directory_fd = os.open(os.path.dirname(path), os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+finally:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+PY
+}
+
+record_lane_not_run() {
+  local slot="$1" lane="$2" port="$3" cause="$4" owner="$5" scope="$6"
+  local scenario cycle_dir
+  for scenario in "${scenarios[@]}"; do
+    [ "${scenario%%-*}" = "$lane" ] || continue
+    cycle_dir="$run_dir/slots/slot-$slot/$lane/$scenario"
+    record_terminal_disposition "$slot" "$scenario" "$port" "$cycle_dir" \
+      not-run "$cause" "$owner" "$scope"
+  done
+}
+
+record_all_not_run() {
+  local cause="$1" owner="$2" scope="$3" slot lane port scenario path
+  for slot in "${!lane_prefixes[@]}"; do
+    lane="${lane_prefixes[$slot]}"
+    port=$((base_port + slot))
+    for scenario in "${scenarios[@]}"; do
+      [ "${scenario%%-*}" = "$lane" ] || continue
+      path="$run_dir/slots/slot-$slot/$lane/$scenario/terminal-disposition.json"
+      [ -e "$path" ] || record_terminal_disposition "$slot" "$scenario" "$port" \
+        "$(dirname "$path")" not-run "$cause" "$owner" "$scope"
+    done
+  done
+}
+
+# INTENT: EVAL-CAPTURE-SCOPE-001
+slot_main() {
+  local slot="$1" scenario cycle_dir lane_dir lane_scenarios=""
+  local lane="${lane_prefixes[$slot]}" predecessor_receipt="-" evidence_path
+  local cycle_status quarantine_cause="" quarantine_owner="" quarantine_scope=""
+  local requeue_scenarios=""
+  local port=$((base_port + slot))
+  local slot_failed=false
+  lane_dir="$run_dir/slots/slot-$slot/$lane"
+  for scenario in "${scenarios[@]}"; do
+    [ "${scenario%%-*}" = "$lane" ] || continue
+    lane_scenarios="${lane_scenarios:+$lane_scenarios }$scenario"
+  done
+  if ! prepare_lane "$slot" "$lane" "$port" "$lane_dir" "$lane_scenarios"; then
+    record_lane_not_run "$slot" "$lane" "$port" \
+      slot-prepare-failed slot-supervisor slot-local
+    record_slot_requeue "$slot" "$lane" slot-prepare-failed slot-supervisor "$lane_scenarios"
+    touch "$run_dir/slots/slot-$slot/prepare.failed"
+    return 1
+  fi
+  touch "$run_dir/slots/slot-$slot/initial.ready"
+  while [ ! -e "$run_dir/release" ] && [ ! -e "$run_dir/abort" ]; do sleep 1; done
+  if [ -e "$run_dir/abort" ]; then
+    record_lane_not_run "$slot" "$lane" "$port" \
+      run-readiness-aborted run-supervisor run-global
+    return 1
+  fi
+
+  for scenario in "${scenarios[@]}"; do
+    [ "${scenario%%-*}" = "$lane" ] || continue
+    cycle_dir="$lane_dir/$scenario"
+    if [ -e "$run_dir/abort" ] && [ -z "$quarantine_cause" ]; then
+      quarantine_cause="run-aborted-before-$scenario"
+      quarantine_owner="run-supervisor"
+      quarantine_scope="run-global"
+    fi
+    if [ -n "$quarantine_cause" ]; then
+      record_terminal_disposition "$slot" "$scenario" "$port" "$cycle_dir" \
+        not-run "$quarantine_cause" "$quarantine_owner" "$quarantine_scope"
+      if [ "$quarantine_scope" = "slot-local" ]; then
+        requeue_scenarios="${requeue_scenarios:+$requeue_scenarios }$scenario"
+      fi
+      continue
+    fi
+    if run_cycle "$slot" "$scenario" "$port" "$lane_dir" "$cycle_dir" "$predecessor_receipt"; then
+      cycle_status=0
+    else
+      cycle_status=$?
+    fi
+    case "$cycle_status" in
+      0) ;;
+      20)
+        slot_failed=true
+        continue
+        ;;
+      30)
+        slot_failed=true
+        quarantine_cause="slot-quarantined-after-$scenario"
+        quarantine_owner="slot-supervisor"
+        quarantine_scope="slot-local"
+        requeue_scenarios="$scenario"
+        continue
+        ;;
+      31)
+        slot_failed=true
+        continue
+        ;;
+      *)
+        slot_failed=true
+        record_terminal_disposition "$slot" "$scenario" "$port" "$cycle_dir" \
+          failed "unclassified-cycle-status-$cycle_status" run-supervisor run-global \
+          "$predecessor_receipt"
+        quarantine_cause="run-aborted-after-$scenario"
+        quarantine_owner="run-supervisor"
+        quarantine_scope="run-global"
+        touch "$run_dir/abort"
+        continue
+        ;;
+    esac
+    case "$scenario" in
+      CFP-*|SPK-*)
+        evidence_path="$(scenario_evidence_path "$lane_dir/kit" "$scenario")" || {
+          slot_failed=true
+          quarantine_cause="run-invariant-failed-after-$scenario"
+          quarantine_owner="run-supervisor"
+          quarantine_scope="run-global"
+          touch "$run_dir/abort"
+          continue
+        }
+        predecessor_receipt="$(dirname "$evidence_path")/capture-receipt.json"
+        ;;
+    esac
+  done
+  if [ "$quarantine_scope" = "slot-local" ]; then
+    record_slot_requeue "$slot" "$lane" "$quarantine_cause" \
+      "$quarantine_owner" "$requeue_scenarios"
+  fi
+  if [ "$slot_failed" = "true" ]; then
+    touch "$run_dir/slots/slot-$slot/slot.failed"
+    return 1
+  fi
+  touch "$run_dir/slots/slot-$slot/slot.done"
+}
+
+summarize_run() {
+  python3 - "$run_dir" "${scenarios[*]}" "$capture_lineage_tool" <<'PY'
+import datetime
+import glob
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+
+run_dir, scenario_text, capture_lineage = sys.argv[1:]
+expected = scenario_text.split()
+results = []
+insight_lines = []
+
+def verified_capture(scenario, evidence_path):
+    if not os.path.isfile(capture_lineage) or not os.access(capture_lineage, os.X_OK):
+        return False
+    lane = scenario.split("-", 1)[0]
+    lane_scenarios = [item for item in expected if item.startswith(lane + "-")]
+    index = lane_scenarios.index(scenario)
+    lineage_paths = glob.glob(os.path.join(run_dir, "slots", "slot-*", lane, "capture-lineage.json"))
+    if len(lineage_paths) != 1:
+        return False
+    receipt_path = os.path.join(os.path.dirname(evidence_path), "capture-receipt.json")
+    if index == 0:
+        predecessor = "-"
+    else:
+        predecessor_paths = glob.glob(os.path.join(
+            run_dir, "slots", "slot-*", lane, "kit", "runs", "*",
+            lane_scenarios[index - 1], "capture-receipt.json"
+        ))
+        if len(predecessor_paths) != 1:
+            return False
+        predecessor = predecessor_paths[0]
+    command = [
+        capture_lineage, "verify-receipt", "--lineage", lineage_paths[0],
+        "--receipt", receipt_path, "--evidence", evidence_path,
+        "--scenario", scenario, "--predecessor", predecessor,
+    ]
+    return subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+for scenario in expected:
+    matches = []
+    for root, _, files in os.walk(os.path.join(run_dir, "slots")):
+        if os.path.basename(root) == scenario and "worker.exit" in files:
+            matches.append(root)
+    dispositions = []
+    for root, _, files in os.walk(os.path.join(run_dir, "slots")):
+        if os.path.basename(root) == scenario and "terminal-disposition.json" in files:
+            dispositions.append(os.path.join(root, "terminal-disposition.json"))
+    if len(matches) > 1 or len(dispositions) > 1:
+        raise SystemExit(f"duplicate attempt artifacts for {scenario}")
+    disposition = None
+    if dispositions:
+        validated = subprocess.run(
+            [capture_lineage, "verify-disposition", "--path", dispositions[0],
+             "--scenario", scenario], capture_output=True, text=True
+        )
+        if validated.returncode != 0:
+            raise SystemExit(f"invalid terminal disposition for {scenario}")
+        disposition = json.loads(validated.stdout)
+    evidence_paths = []
+    for slot_root in (os.path.join(run_dir, "slots"),):
+        for evidence_root, _, evidence_files in os.walk(slot_root):
+            if os.path.basename(evidence_root) == scenario and "evidence.json" in evidence_files:
+                evidence_paths.append(os.path.join(evidence_root, "evidence.json"))
+    if len(evidence_paths) > 1:
+        raise SystemExit(f"duplicate evidence artifacts for {scenario}")
+    outcome = "missing"
+    if evidence_paths:
+        try:
+            with open(evidence_paths[0], encoding="utf-8") as stream:
+                outcome = json.load(stream).get("outcome", "corrupt")
+        except (OSError, ValueError):
+            outcome = "corrupt"
+    allowed_outcomes = {"completed", "blocked", "feature_not_found", "agent_error"}
+    accepted_evidence = False
+    if outcome in allowed_outcomes:
+        if scenario.startswith(("CFP-", "SPK-")):
+            accepted_evidence = verified_capture(scenario, evidence_paths[0])
+        else:
+            accepted_evidence = True
+    if disposition is not None:
+        if accepted_evidence:
+            raise SystemExit(f"contradictory accepted evidence and terminal disposition for {scenario}")
+        results.append({key: disposition.get(key) for key in (
+            "scenario", "status", "cause", "owner", "scope", "predecessor"
+        ) if disposition.get(key) is not None} | {"disposition": disposition["status"]})
+        continue
+    root = matches[0] if matches else None
+    exit_code = None
+    log_path = None
+    lines = []
+    if root is not None:
+        with open(os.path.join(root, "worker.exit"), encoding="utf-8") as stream:
+            exit_code = int(stream.read().strip())
+        log_path = os.path.join(root, "worker.log")
+        if os.path.isfile(log_path):
+            with open(log_path, encoding="utf-8", errors="replace") as stream:
+                lines = stream.readlines()
+    for line in lines:
+        if re.search(r"DEFECT:|coverage|area score|not_found|failing", line, re.I):
+            compact = line.strip()
+            if compact:
+                insight_lines.append(f"[{scenario}] {compact}")
+    if not accepted_evidence:
+        missing_result = {"scenario": scenario, "status": "missing", "disposition": "missing"}
+        if exit_code is not None:
+            missing_result["worker_exit"] = exit_code
+        results.append(missing_result)
+        continue
+    results.append({
+        "scenario": scenario,
+        "status": outcome,
+        "disposition": (
+            "blocked" if outcome == "blocked" else "captured"
+        ),
+        "outcome": outcome,
+        **({"worker_exit": exit_code} if exit_code is not None else {}),
+        **({"log_path": log_path} if log_path is not None else {}),
+    })
+
+captured = sum(item["status"] in {"completed", "blocked", "feature_not_found", "agent_error"} for item in results)
+blocked = sum(item["status"] == "blocked" for item in results)
+terminal = sum(item["disposition"] != "missing" for item in results)
+missing = len(expected) - terminal
+named_zero = sum(item["disposition"] in {"failed", "not-run"} for item in results)
+failed = len(results) - captured
+payload = {
+    "schema": "hill-climb-fleet-summary.v1",
+    "finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "expected": len(expected),
+    "complete": captured,
+    "captured": captured,
+    "blocked": blocked,
+    "terminal": terminal,
+    "missing": missing,
+    "named_zero": named_zero,
+    "failed_or_missing": failed,
+    "status": "complete" if terminal == len(expected) else "failed",
+    "results": results,
+}
+with open(os.path.join(run_dir, "summary.json"), "w", encoding="utf-8") as stream:
+    json.dump(payload, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+with open(os.path.join(run_dir, "INSIGHTS.txt"), "w", encoding="utf-8") as stream:
+    stream.write("\n".join(insight_lines[-1000:]))
+    stream.write("\n")
+with open(os.path.join(run_dir, "SUMMARY.md"), "w", encoding="utf-8") as stream:
+    stream.write(f"# Fleet run {os.path.basename(run_dir)}\n\n")
+    stream.write(f"Status: **{payload['status']}**. Captured: {captured}/{len(expected)}; blocked: {blocked}.\n\n")
+    for item in results:
+        stream.write(f"- {item['scenario']}: {item['status']}\n")
+print(json.dumps(payload, sort_keys=True))
+PY
+}
+
+# One place writes the run receipt, so the pin it records can be exercised
+# hermetically instead of only in a live 25-minute cycle.
+write_run_manifest() {
+  [ "$#" -eq 2 ] || fail "usage: write_run_manifest PATH RUN_ID"
+  [ "${#install_receipt_operation_sha256}" -eq 64 ] \
+    || fail "verified install receipt operation is absent"
+  [ "${#install_receipt_harness_sha}" -eq 40 ] \
+    || fail "verified install receipt harness is absent"
+  [ "${#install_receipt_installer_sha}" -eq 40 ] \
+    || fail "verified install receipt installer is absent"
+  python3 - "$1" "$2" "$deployment_sha" "$harness_sha" \
+    "$deployment_run_url" "$app_dir" "$base_port" "$slot_count" \
+    "${scenarios[*]}" "${lane_prefixes[*]}" "$evidence_only" \
+    "$worker_executor" "$worker_model" "$worker_reasoning_effort" \
+    "$judge_executor" "$judge_model" "$judge_reasoning_effort" \
+    "$scenario_turn_budget" "$golden_fixture_sha256" \
+    "$eval_kit_sha" "$eval_kit_archive_sha256" "$eval_config_sha256" \
+    "$received_deployment_sha" "$received_harness_sha" \
+    "$received_deployment_run_url" "$pin_source" \
+    "$install_receipt_operation_sha256" "$install_receipt_harness_sha" \
+    "$install_receipt_installer_sha" <<'PY'
+import datetime
+import json
+import re
+import sys
+
+path, run_id, sha, harness_sha, run_url, app_dir, base_port, slots, scenarios, lanes, evidence_only, worker_executor, worker_model, worker_reasoning_effort, judge_executor, judge_model, judge_reasoning_effort, scenario_turn_budget, golden_fixture_sha256, eval_kit_sha, eval_kit_archive_sha256, eval_config_sha256, received_sha, received_harness_sha, received_run_url, pin_source, install_operation, install_harness, install_installer = sys.argv[1:]
+
+
+def deployment_run_id(url):
+    """The GitHub Actions run id inside the deployment proof, or ''."""
+    match = re.search(r"/actions/runs/(\d+)", url)
+    return match.group(1) if match else ""
+
+
+payload = {
+    "schema": "hill-climb-fleet-manifest.v1",
+    "run_id": run_id,
+    "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "code_sha": sha,
+    "harness_sha": harness_sha,
+    "deployment_run_url": run_url,
+    # The pin exactly as the control plane handed it over, plus which mode
+    # produced it. Verbatim: never re-derived, never defaulted. This is what
+    # lets the receipt name its subject (code_sha), its evidence source (the
+    # deployment run id), and the causal binding (pin_source).
+    "received_pin": {
+        "code_sha": received_sha,
+        "harness_sha": received_harness_sha,
+        "deployment_run_url": received_run_url,
+        "deployment_run_id": deployment_run_id(received_run_url),
+        "pin_source": pin_source,
+    },
+    "install_receipt": {
+        "schema": "eval-harness-install.v5",
+        "operation_sha256": install_operation,
+        "harness_sha": install_harness,
+        "installer_sha": install_installer,
+    },
+    "app_dir": app_dir,
+    "dirty": False,
+    "base_port": int(base_port),
+    "slots": int(slots),
+    "stateful_area_lanes": lanes.split(),
+    "scenarios": scenarios.split(),
+    "evidence_only": evidence_only == "true",
+    "worker_executor": worker_executor,
+    "worker_model": worker_model,
+    "worker_reasoning_effort": worker_reasoning_effort,
+    "judge_executor": judge_executor,
+    "judge_model": judge_model,
+    "judge_reasoning_effort": judge_reasoning_effort,
+    "max_turns_per_scenario": int(scenario_turn_budget),
+    "capture_lineage_schema": "capture-lineage.v1",
+    "golden_fixture_sha256": golden_fixture_sha256,
+    "eval_kit_sha": eval_kit_sha,
+    "eval_kit_archive_sha256": eval_kit_archive_sha256,
+    "eval_config_sha256": eval_config_sha256,
+}
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(payload, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+PY
+}
+
+start_fleet() {
+  [ "$(id -un)" != "root" ] || fail "run as the tester seat, not root"
+  require_command git
+  require_command python3
+  require_command curl
+  require_command lsof
+  validate_executor FLEET_EXECUTOR "$fleet_executor"
+  validate_executor FLEET_WORKER_EXECUTOR "$worker_executor"
+  validate_executor FLEET_JUDGE_EXECUTOR "$judge_executor"
+  if [ -z "$worker_model" ]; then
+    case "$worker_executor" in
+      codex) worker_model="gpt-5.6-terra" ;;
+      claude) worker_model="opus" ;;
+    esac
+  fi
+  if [ -z "$judge_model" ]; then
+    case "$judge_executor" in
+      codex) judge_model="gpt-5.6-sol" ;;
+      claude) judge_model="opus" ;;
+    esac
+  fi
+  case "$worker_executor" in
+    codex)
+      worker_reasoning_effort="${worker_reasoning_effort:-high}"
+      validate_reasoning_effort FLEET_WORKER_REASONING_EFFORT "$worker_reasoning_effort"
+      ;;
+    claude)
+      [ -z "$worker_reasoning_effort" ] \
+        || fail "FLEET_WORKER_REASONING_EFFORT is only supported by the Codex worker"
+      worker_reasoning_effort="not-applicable"
+      ;;
+  esac
+  case "$judge_executor" in
+    codex)
+      judge_reasoning_effort="${judge_reasoning_effort:-high}"
+      validate_reasoning_effort FLEET_JUDGE_REASONING_EFFORT "$judge_reasoning_effort"
+      ;;
+    claude)
+      [ -z "$judge_reasoning_effort" ] \
+        || fail "FLEET_JUDGE_REASONING_EFFORT is only supported by the Codex judge"
+      judge_reasoning_effort="not-applicable"
+      ;;
+  esac
+  require_executor "$worker_executor"
+  require_command npx
+  git -C "$base_kit" rev-parse --git-dir >/dev/null 2>&1 \
+    || fail "eval kit must be a Git checkout: $base_kit"
+  eval_kit_sha=$(git -C "$base_kit" rev-parse HEAD)
+  eval_kit_archive_sha256=$(git -C "$base_kit" archive "$eval_kit_sha" | sha256_stream)
+  prepare_eval_config
+  numeric_between FLEET_SLOTS "$slot_count" 1 16
+  numeric_between FLEET_BASE_PORT "$base_port" 1024 65518
+  numeric_between FLEET_READY_TIMEOUT_SECONDS "$ready_timeout" 30 1800
+  numeric_between FLEET_WORKER_TIMEOUT_SECONDS "$worker_timeout" 60 7200
+  numeric_between FLEET_MAX_TURNS_PER_SCENARIO "$scenario_turn_budget" 40 1000
+  case "$stop_legacy" in true|false) ;; *) fail "FLEET_STOP_LEGACY must be true or false" ;; esac
+  case "$evidence_only" in true|false) ;; *) fail "FLEET_CONSOLIDATE_EVIDENCE_ONLY must be true or false" ;; esac
+  validate_provenance_input
+  [ -d "$base_kit/node_modules" ] || fail "eval kit or node_modules is missing: $base_kit"
+  [ -e "$current_link" ] && [ ! -L "$current_link" ] \
+    && fail "$current_link exists but is not a symlink"
+
+  local pinned_worker_model="$worker_model" pinned_judge_model="$judge_model"
+  local pinned_worker_effort="$worker_reasoning_effort"
+  local pinned_judge_effort="$judge_reasoning_effort"
+  local pinned_turn_budget="$scenario_turn_budget" pinned_base_port="$base_port"
+
+  mkdir -p "$state_root"
+  stop_current
+  stop_legacy_fleet
+
+  assert_received_pin_intact \
+    FLEET_SHA "$received_deployment_sha" "$deployment_sha" \
+    FLEET_HARNESS_SHA "$received_harness_sha" "$harness_sha" \
+    FLEET_DEPLOYMENT_RUN_URL "$received_deployment_run_url" "$deployment_run_url" \
+    FLEET_WORKER_MODEL "$pinned_worker_model" "$worker_model" \
+    FLEET_JUDGE_MODEL "$pinned_judge_model" "$judge_model" \
+    FLEET_WORKER_REASONING_EFFORT "$pinned_worker_effort" "$worker_reasoning_effort" \
+    FLEET_JUDGE_REASONING_EFFORT "$pinned_judge_effort" "$judge_reasoning_effort" \
+    FLEET_MAX_TURNS_PER_SCENARIO "$pinned_turn_budget" "$scenario_turn_budget" \
+    FLEET_BASE_PORT "$pinned_base_port" "$base_port"
+
+  git -C "$source_repo" fetch --quiet origin staging
+  validate_provenance
+
+  select_scenarios_and_lanes
+
+  run_id="$(date -u +%Y%m%dT%H%M%SZ)-${deployment_sha:0:12}-$$"
+  run_dir="$state_root/$run_id"
+  app_dir="$run_dir/app"
+  mkdir -p "$run_dir/slots" "$run_dir/inputs"
+  install -m 0400 "$eval_config_path" "$run_dir/inputs/evalconfig.json"
+  [ "$(sha256_file "$run_dir/inputs/evalconfig.json")" = "$eval_config_sha256" ] \
+    || fail "eval config changed before the run input was pinned"
+  eval_config_path="$run_dir/inputs/evalconfig.json"
+  ln -sfn "$run_dir" "$current_link"
+  printf '%s\n' "$$" > "$run_dir/supervisor.pid"
+  : > "$run_dir/events.log"
+  write_state "$run_dir/state.json" preparing "creating immutable worktree"
+  git -C "$source_repo" worktree add --detach "$app_dir" "$deployment_sha" \
+    > "$run_dir/worktree.log" 2>&1
+  [ "$(git -C "$app_dir" rev-parse HEAD)" = "$deployment_sha" ] \
+    || fail "immutable worktree SHA mismatch"
+  [ -z "$(git -C "$app_dir" status --short)" ] || fail "immutable worktree is dirty"
+  [ -x "$app_dir/bin/reset-jsonl-server" ] \
+    || fail "deployed commit lacks bin/reset-jsonl-server"
+  [ -x "$app_dir/bin/consolidate-hill-climb" ] \
+    || fail "deployed commit lacks bin/consolidate-hill-climb"
+  [ -s "$app_dir/docs/hill-climb/sbek-worker-charter.md" ] \
+    || fail "deployed commit lacks the SBEK worker charter"
+  golden_fixture_sha256=$(sha256_file "$app_dir/resources/judge-sandbox/events.jsonl")
+
+  write_state "$run_dir/state.json" preparing "compile gate"
+  (cd "$app_dir" && make compile-check) > "$run_dir/compile.log" 2>&1 \
+    || fail "compile gate failed; see $run_dir/compile.log"
+  [ -z "$(git -C "$app_dir" status --short)" ] \
+    || fail "compile gate made the immutable worktree dirty"
+
+  write_run_manifest "$run_dir/manifest.json" "$run_id"
+
+  write_state "$run_dir/state.json" preparing "starting SUTs and authenticating personas"
+  slot_pids=()
+  for ((slot=0; slot<slot_count; slot++)); do
+    mkdir -p "$run_dir/slots/slot-$slot"
+    slot_main "$slot" > "$run_dir/slots/slot-$slot/slot.log" 2>&1 &
+    slot_pids+=("$!")
+  done
+
+  # Scoped runs may contain fewer than the full six lanes. Preserve the
+  # production quorum of four when all lanes are present, but require every
+  # selected lane for a scoped top-up rather than making 2-lane runs
+  # impossible by construction.
+  local readiness_quorum=$slot_count
+  [ "$readiness_quorum" -gt 4 ] && readiness_quorum=4
+  deadline=$((SECONDS + ready_timeout))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    ready_count="$(find "$run_dir/slots" -name initial.ready -type f | wc -l | tr -d ' ')"
+    failed_count="$(find "$run_dir/slots" -name prepare.failed -type f | wc -l | tr -d ' ')"
+    [ "$ready_count" -ge "$readiness_quorum" ] && break
+    [ $((ready_count + failed_count)) -ge "$slot_count" ] && break
+    sleep 2
+  done
+  ready_count="$(find "$run_dir/slots" -name initial.ready -type f | wc -l | tr -d ' ')"
+  failed_count="$(find "$run_dir/slots" -name prepare.failed -type f | wc -l | tr -d ' ')"
+  if [ "$ready_count" -lt "$readiness_quorum" ]; then
+    touch "$run_dir/abort"
+    record_all_not_run run-readiness-aborted run-supervisor run-global
+    write_state "$run_dir/state.json" failed "readiness quorum failed: ready=$ready_count failed=$failed_count slots=$slot_count"
+    wait || true
+    summarize_run || true
+    fail "fleet readiness failed; see $run_dir"
+  fi
+
+  python3 - "$run_dir/readiness.json" "$run_dir/manifest.json" <<'PY'
+import datetime
+import glob
+import json
+import os
+import sys
+
+path, manifest_path = sys.argv[1:]
+with open(manifest_path, encoding="utf-8") as stream:
+    manifest = json.load(stream)
+receipts = []
+for ready_path in sorted(glob.glob(os.path.join(os.path.dirname(path), "slots", "*", "*", "ready.json"))):
+    with open(ready_path, encoding="utf-8") as stream:
+        receipts.append(json.load(stream))
+payload = {
+    "schema": "hill-climb-fleet-readiness.v1",
+    "status": "ready",
+    "verified_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "code_sha": manifest["code_sha"],
+    "deployment_run_url": manifest["deployment_run_url"],
+    "slots": receipts,
+}
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(payload, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+PY
+  write_state "$run_dir/state.json" running "$ready_count SUTs ready; $failed_count slots quarantined; healthy lanes released"
+  touch "$run_dir/release"
+
+  worker_failed=0
+  for pid in "${slot_pids[@]}"; do
+    wait "$pid" || worker_failed=1
+  done
+  if [ "$worker_failed" -ne 0 ] && [ -e "$run_dir/abort" ]; then
+    summarize_run > "$run_dir/summary-line.json"
+    write_state "$run_dir/state.json" failed "run-global failure interrupted scenario workers"
+    return 1
+  fi
+  write_state "$run_dir/state.json" consolidating "scenario workers exited; judging consolidated evidence"
+  if ! "$app_dir/bin/consolidate-hill-climb" "$run_dir" \
+      > "$run_dir/consolidate.log" 2>&1; then
+    summarize_run > "$run_dir/summary-line.json"
+    if grep -q "judge session quota exhausted" "$run_dir/consolidate.log"; then
+      write_state "$run_dir/state.json" evidence-complete "judging-failed: judge session quota exhausted; replay sealed fold"
+    else
+      write_state "$run_dir/state.json" evidence-complete "judging-failed: consolidated judging failed; replay sealed fold"
+    fi
+    return 1
+  fi
+  summarize_run > "$run_dir/summary-line.json"
+  if [ "$evidence_only" = "true" ]; then
+    write_state "$run_dir/state.json" complete "all ${#scenarios[@]} target scenarios captured with consolidated evidence"
+  else
+    write_state "$run_dir/state.json" complete "all ${#scenarios[@]} scenarios scored in one consolidated report"
+  fi
+}
+
+load_current_manifest() {
+  [ -L "$current_link" ] || fail "no managed fleet run exists"
+  run_dir="$(readlink -f "$current_link")"
+  [ -s "$run_dir/manifest.json" ] || fail "current run lacks a manifest"
+  local manifest_line
+  manifest_line="$(python3 - "$run_dir/manifest.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    manifest = json.load(stream)
+worker_executor = manifest.get("worker_executor", "codex")
+judge_executor = manifest.get("judge_executor", worker_executor)
+default_budget = 240 if worker_executor == "codex" else 120
+fields = [
+    manifest["code_sha"], manifest.get("harness_sha", manifest["code_sha"]),
+    manifest["deployment_run_url"], manifest["app_dir"],
+    str(manifest["base_port"]), str(manifest.get("evidence_only", False)).lower(),
+    worker_executor, manifest.get("worker_model", ""),
+    manifest.get("worker_reasoning_effort", "high" if worker_executor == "codex" else "not-applicable"),
+    judge_executor,
+    manifest.get("judge_model", "gpt-5.6-sol" if judge_executor == "codex" else "opus"),
+    manifest.get("judge_reasoning_effort", "high" if judge_executor == "codex" else "not-applicable"),
+    str(manifest.get("max_turns_per_scenario", default_budget)),
+]
+print("\t".join(fields))
+PY
+)"
+  IFS=$'\t' read -r deployment_sha harness_sha deployment_run_url app_dir base_port \
+    evidence_only worker_executor worker_model worker_reasoning_effort \
+    judge_executor judge_model judge_reasoning_effort scenario_turn_budget \
+    <<< "$manifest_line"
+  scenarios=()
+  while IFS= read -r scenario; do
+    scenarios+=("$scenario")
+  done < <(python3 - "$run_dir/manifest.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    print("\n".join(json.load(stream)["scenarios"]))
+PY
+)
+  lane_prefixes=()
+  while IFS= read -r lane; do
+    lane_prefixes+=("$lane")
+  done < <(python3 - "$run_dir/manifest.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    print("\n".join(json.load(stream)["stateful_area_lanes"]))
+PY
+)
+  slot_count="${#lane_prefixes[@]}"
+}
+
+terminalize_operator_stopped_run() {
+  local stopped_run="$1" scenario prefix slot lane port cycle_dir candidate original_status missing_count
+  [ -s "$stopped_run/manifest.json" ] || return 0
+  run_dir="$stopped_run"
+  load_current_manifest
+  summarize_run >/dev/null
+  original_status="$(python3 - "$run_dir/state.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    print(json.load(stream).get("status", "unknown"))
+PY
+)"
+  missing_count="$(python3 - "$run_dir/summary.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    print(json.load(stream).get("missing", -1))
+PY
+)"
+  case "$original_status:$missing_count" in
+    complete:0|failed:0|cancelled:0|stopped:0|stopped-contaminated:0|evidence-complete:0) return 0 ;;
+  esac
+  while IFS= read -r scenario; do
+    [ -n "$scenario" ] || continue
+    prefix="${scenario%%-*}"
+    slot=""
+    for candidate in "${!lane_prefixes[@]}"; do
+      lane="${lane_prefixes[$candidate]}"
+      if [ "$lane" = "$prefix" ]; then
+        slot="$candidate"
+        break
+      fi
+    done
+    [ -n "$slot" ] || fail "stopped scenario has no owned lane: $scenario"
+    port=$((base_port + slot))
+    cycle_dir="$run_dir/slots/slot-$slot/$prefix/$scenario"
+    record_terminal_disposition "$slot" "$scenario" "$port" "$cycle_dir" \
+      not-run operator-stop fleet-operator run-global
+  done < <(python3 - "$run_dir/summary.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    summary = json.load(stream)
+for result in summary.get("results", []):
+    if result.get("disposition") == "missing":
+        print(result["scenario"])
+PY
+)
+  summarize_run >/dev/null
+  write_state "$run_dir/state.json" stopped \
+    "operator stopped managed processes; every planned scenario has a terminal disposition"
+}
+
+lane_slot() {
+  local wanted="$1" index
+  for index in "${!lane_prefixes[@]}"; do
+    if [ "${lane_prefixes[$index]}" = "$wanted" ]; then
+      printf '%s\n' "$index"
+      return 0
+    fi
+  done
+  return 1
+}
+
+show_resume_plan() {
+  load_current_manifest
+  local scenario lane slot kit outcome disposition evidence_path receipt_path predecessor lineage_path terminal_path
+  for scenario in "${scenarios[@]}"; do
+    lane="${scenario%%-*}"
+    slot="$(lane_slot "$lane")" || fail "manifest has no lane for $scenario"
+    kit="$run_dir/slots/slot-$slot/$lane/kit"
+    outcome="$(scenario_evidence_outcome "$kit" "$scenario")"
+    case "$outcome" in
+      completed|blocked|feature_not_found|agent_error)
+        disposition=skip
+        case "$scenario" in
+          CFP-*|SPK-*)
+            lineage_path="$run_dir/slots/slot-$slot/$lane/capture-lineage.json"
+            if ! predecessor="$(scenario_predecessor_receipt "$kit" "$lineage_path" "$scenario" 2>/dev/null)" \
+                || ! evidence_path="$(scenario_evidence_path "$kit" "$scenario" 2>/dev/null)" \
+                || ! "$capture_lineage_tool" verify-receipt \
+                  --lineage "$lineage_path" \
+                  --receipt "$(dirname "$evidence_path")/capture-receipt.json" \
+                  --evidence "$evidence_path" \
+                  --scenario "$scenario" \
+                  --predecessor "$predecessor" >/dev/null 2>&1; then
+              disposition=fail
+            else
+              receipt_path="$(dirname "$evidence_path")/capture-receipt.json"
+            fi
+            ;;
+        esac
+        ;;
+      missing)
+        terminal_path="$run_dir/slots/slot-$slot/$lane/$scenario/terminal-disposition.json"
+        disposition=run
+        [ ! -e "$terminal_path" ] || disposition=new-plan
+        ;;
+      *) disposition=fail ;;
+    esac
+    printf '%s\t%s\t%s\n' "$scenario" "$outcome" "$disposition"
+  done
+}
+
+verify_resume_runtime() {
+  [ "$(id -un)" != "root" ] || fail "run as the tester seat, not root"
+  require_command python3
+  require_command curl
+  require_command lsof
+  require_command npx
+  validate_executor FLEET_WORKER_EXECUTOR "$worker_executor"
+  validate_executor FLEET_JUDGE_EXECUTOR "$judge_executor"
+  if [ "$worker_executor" = codex ]; then
+    validate_reasoning_effort FLEET_WORKER_REASONING_EFFORT "$worker_reasoning_effort"
+  fi
+  if [ "$judge_executor" = codex ]; then
+    validate_reasoning_effort FLEET_JUDGE_REASONING_EFFORT "$judge_reasoning_effort"
+  fi
+  require_executor "$worker_executor"
+  [ -d "$app_dir" ] || fail "immutable run worktree is missing: $app_dir"
+  [ -s "$run_dir/readiness.json" ] || fail "current run lacks readiness proof"
+  python3 - "$run_dir/manifest.json" "$run_dir/readiness.json" <<'PY' \
+    || fail "readiness proof does not match the current run"
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    manifest = json.load(stream)
+with open(sys.argv[2], encoding="utf-8") as stream:
+    readiness = json.load(stream)
+assert readiness["status"] == "ready"
+assert readiness["code_sha"] == manifest["code_sha"]
+assert len(readiness["slots"]) >= min(4, len(manifest["stateful_area_lanes"]))
+assert all(slot["code_sha"] == manifest["code_sha"] for slot in readiness["slots"])
+PY
+  local slot port code
+  for ((slot=0; slot<slot_count; slot++)); do
+    port=$((base_port + slot))
+    code="$(curl -sS -m 3 -o /dev/null -w '%{http_code}' \
+      "http://127.0.0.1:$port/login" 2>/dev/null || true)"
+    [ "$code" = 200 ] || fail "resume SUT port=$port is not ready (HTTP $code)"
+  done
+}
+
+resume_slot_main() {
+  local slot="$1" scenario cycle_dir lane_dir outcome evidence_path receipt_path
+  local lane="${lane_prefixes[$slot]}" predecessor_receipt="-"
+  local port=$((base_port + slot))
+  lane_dir="$run_dir/slots/slot-$slot/$lane"
+  for scenario in "${scenarios[@]}"; do
+    [ "${scenario%%-*}" = "$lane" ] || continue
+    cycle_dir="$lane_dir/$scenario"
+    outcome="$(scenario_evidence_outcome "$lane_dir/kit" "$scenario")"
+    case "$outcome" in
+      completed|blocked|feature_not_found|agent_error)
+        case "$scenario" in
+          CFP-*|SPK-*)
+            evidence_path="$(scenario_evidence_path "$lane_dir/kit" "$scenario")" || return 1
+            receipt_path="$(dirname "$evidence_path")/capture-receipt.json"
+            "$capture_lineage_tool" verify-receipt \
+              --lineage "$lane_dir/capture-lineage.json" \
+              --receipt "$receipt_path" \
+              --evidence "$evidence_path" \
+              --scenario "$scenario" \
+              --predecessor "$predecessor_receipt" >/dev/null || return 1
+            predecessor_receipt="$receipt_path"
+            ;;
+        esac
+        normalize_captured_receipt "$cycle_dir" "$outcome"
+        echo "$(date -u +%FT%TZ) RESUME_SKIP slot=$slot scenario=$scenario outcome=$outcome port=$port" \
+          >> "$run_dir/events.log"
+        ;;
+      missing)
+        run_cycle "$slot" "$scenario" "$port" "$lane_dir" "$cycle_dir" "$predecessor_receipt" || return 1
+        case "$scenario" in
+          CFP-*|SPK-*)
+            evidence_path="$(scenario_evidence_path "$lane_dir/kit" "$scenario")" || return 1
+            predecessor_receipt="$(dirname "$evidence_path")/capture-receipt.json"
+            ;;
+        esac
+        ;;
+      *)
+        echo "Corrupt evidence for $scenario; refusing to overwrite it" >&2
+        return 1
+        ;;
+    esac
+  done
+  if [ -e "$run_dir/slots/slot-$slot/slot.failed" ]; then
+    mv "$run_dir/slots/slot-$slot/slot.failed" \
+      "$run_dir/slots/slot-$slot/slot.failed.before-resume"
+  fi
+  touch "$run_dir/slots/slot-$slot/slot.done"
+}
+
+consolidate_current_run() {
+  write_state "$run_dir/state.json" consolidating "all scenario evidence captured; launching fresh judges"
+  if FLEET_CONSOLIDATE_RESUME=true \
+      FLEET_EXECUTOR="$fleet_executor" \
+      FLEET_JUDGE_EXECUTOR="$judge_executor" \
+      FLEET_JUDGE_MODEL="$judge_model" \
+      FLEET_JUDGE_REASONING_EFFORT="$judge_reasoning_effort" \
+      "$app_dir/bin/consolidate-hill-climb" "$run_dir" \
+      > "$run_dir/consolidate.log" 2>&1; then
+    write_state "$run_dir/state.json" complete "all preserved scenarios scored in one consolidated report"
+    echo "Fleet score complete: $run_dir/report.json"
+    return 0
+  fi
+  if grep -q "judge session quota exhausted" "$run_dir/consolidate.log"; then
+    write_state "$run_dir/state.json" evidence-complete "judging-failed: judge session quota exhausted; replay sealed fold"
+  else
+    write_state "$run_dir/state.json" evidence-complete "judging-failed: consolidated judging failed; replay sealed fold"
+  fi
+  tail -20 "$run_dir/consolidate.log" >&2 || true
+  return 1
+}
+
+resume_scenarios() {
+  load_current_manifest
+  if find "$run_dir/slots" -name terminal-disposition.json -type f -print -quit \
+      | grep -q .; then
+    fail "terminal scenario dispositions require a new capture plan; refusing in-place replay"
+  fi
+  verify_resume_runtime
+  write_state "$run_dir/state.json" running "resuming only missing scenarios against preserved lane state"
+  local slot worker_failed=0
+  local resume_pids=()
+  for ((slot=0; slot<slot_count; slot++)); do
+    resume_slot_main "$slot" > "$run_dir/slots/slot-$slot/resume.log" 2>&1 &
+    resume_pids+=("$!")
+  done
+  for pid in "${resume_pids[@]}"; do
+    wait "$pid" || worker_failed=1
+  done
+  summarize_run > "$run_dir/summary-line.json"
+  if [ "$worker_failed" -ne 0 ]; then
+    write_state "$run_dir/state.json" failed "one or more resumed scenario workers failed"
+    return 1
+  fi
+  python3 - "$run_dir/summary.json" <<'PY' \
+    || fail "resume ended without complete scenario evidence"
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    summary = json.load(stream)
+assert summary.get("status") == "complete"
+assert summary.get("failed_or_missing") == 0
+assert summary.get("captured") == summary.get("expected")
+PY
+  if [ "$evidence_only" = "true" ]; then
+    write_state "$run_dir/state.json" complete "all preserved scenarios captured"
+    return 0
+  fi
+  consolidate_current_run
+}
+
+resume_score() {
+  load_current_manifest
+  [ -s "$run_dir/summary.json" ] || fail "current run lacks a scenario summary"
+  python3 - "$run_dir/summary.json" <<'PY' || fail "current run does not have complete scenario evidence"
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    summary = json.load(stream)
+assert summary.get("status") == "complete"
+assert summary.get("failed_or_missing") == 0
+assert summary.get("complete") == summary.get("expected")
+PY
+  consolidate_current_run
+}
+
+show_status() {
+  if [ ! -L "$current_link" ]; then
+    echo "No managed fleet run exists."
+    return 1
+  fi
+  local current
+  current="$(readlink -f "$current_link")"
+  echo "Run: $current"
+  python3 - "$current" "$capture_lineage_tool" <<'PY'
+import json
+import os
+import pathlib
+import stat
+import subprocess
+import sys
+from collections import Counter
+from datetime import datetime, timezone
+
+run = pathlib.Path(sys.argv[1])
+disposition_verifier = pathlib.Path(sys.argv[2])
+manifest_path = run / "manifest.json"
+manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
+expected = len(manifest.get("scenarios", []))
+expected_list = manifest.get("scenarios", [])
+expected_ids = set(expected_list)
+evidence_only = manifest.get("evidence_only", False)
+worker_exit_paths = list(run.glob("slots/slot-*/*/*/worker.exit"))
+disposition_paths = list(run.glob("slots/slot-*/*/*/terminal-disposition.json"))
+worker_exits = len(worker_exit_paths)
+worker_counts = Counter(path.parent.name for path in worker_exit_paths)
+disposition_counts = Counter(path.parent.name for path in disposition_paths)
+duplicates = sorted(
+    scenario for scenario, count in (worker_counts + disposition_counts).items()
+    if worker_counts[scenario] > 1 or disposition_counts[scenario] > 1
+)
+if duplicates:
+    raise SystemExit(f"duplicate attempt artifacts: {','.join(duplicates)}")
+for path in disposition_paths:
+    validated = subprocess.run(
+        [str(disposition_verifier), "verify-disposition", "--path", str(path),
+         "--scenario", path.parent.name], capture_output=True, text=True
+    )
+    if validated.returncode != 0:
+        raise SystemExit(f"invalid terminal disposition: {path}")
+allowed_outcomes = {"completed", "blocked", "feature_not_found", "agent_error"}
+accepted_evidence = {}
+evidence_paths = list(run.glob("slots/slot-*/**/evidence.json"))
+evidence_counts = Counter(path.parent.name for path in evidence_paths)
+duplicate_evidence = sorted(scenario for scenario, count in evidence_counts.items() if count > 1)
+if duplicate_evidence:
+    raise SystemExit(f"duplicate evidence artifacts: {','.join(duplicate_evidence)}")
+
+def verified_capture(scenario, evidence_path):
+    lane = scenario.split("-", 1)[0]
+    lane_scenarios = [item for item in expected_list if item.startswith(lane + "-")]
+    index = lane_scenarios.index(scenario)
+    lineage_paths = list(run.glob(f"slots/slot-*/{lane}/capture-lineage.json"))
+    verifier = disposition_verifier
+    if len(lineage_paths) != 1 or not verifier.is_file():
+        return False
+    receipt_path = evidence_path.with_name("capture-receipt.json")
+    if index == 0:
+        predecessor = "-"
+    else:
+        predecessor_paths = list(run.glob(
+            f"slots/slot-*/{lane}/kit/runs/*/{lane_scenarios[index - 1]}/capture-receipt.json"
+        ))
+        if len(predecessor_paths) != 1:
+            return False
+        predecessor = str(predecessor_paths[0])
+    command = [
+        str(verifier), "verify-receipt", "--lineage", str(lineage_paths[0]),
+        "--receipt", str(receipt_path), "--evidence", str(evidence_path),
+        "--scenario", scenario, "--predecessor", predecessor,
+    ]
+    return subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+for path in evidence_paths:
+    scenario = path.parent.name
+    try:
+        outcome = json.loads(path.read_text(encoding="utf-8")).get("outcome")
+    except (OSError, ValueError):
+        continue
+    if outcome not in allowed_outcomes:
+        continue
+    if scenario.startswith(("CFP-", "SPK-")):
+        accepted = verified_capture(scenario, path)
+    else:
+        accepted = True
+    if accepted:
+        accepted_evidence[scenario] = outcome
+evidence = len(accepted_evidence)
+contradictory_ids = sorted(set(accepted_evidence) & set(disposition_counts))
+if contradictory_ids:
+    raise SystemExit(
+        f"contradictory evidence and terminal disposition: {','.join(contradictory_ids)}"
+    )
+terminal_ids = set(accepted_evidence) | set(disposition_counts)
+unexpected_ids = sorted(terminal_ids - expected_ids)
+if unexpected_ids:
+    raise SystemExit(f"terminal outcomes for unplanned scenarios: {','.join(unexpected_ids)}")
+missing_ids = sorted(expected_ids - terminal_ids)
+worker_failures = len(list(run.glob("slots/slot-*/*/*/worker.failed")))
+blocked = sum(outcome == "blocked" for outcome in accepted_evidence.values())
+judge_exits = len(list(run.glob("judges/*.exit")))
+judge_expected = 0 if evidence_only else 6
+report = "n/a" if evidence_only else ("yes" if (run / "report.json").is_file() else "no")
+print(
+    "Progress: "
+    f"journeys={worker_exits}/{expected} "
+    f"evidence={evidence}/{expected} "
+    f"failures={worker_failures} blocked={blocked} "
+    f"judges={judge_exits}/{judge_expected} report={report}"
+)
+print(
+    "Terminal: "
+    f"planned={expected} terminal={len(terminal_ids)} "
+    f"missing={len(missing_ids)} ids={','.join(missing_ids) or '-'}"
+)
+# INTENT: EVAL-CAPTURE-LIVENESS-001
+state_path = run / "state.json"
+state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
+state_status = state.get("status", "missing")
+last_progress = None
+events_path = run / "events.log"
+progress_kinds = {
+    "PREPARE", "AUTHENTICATED", "AUTH_FAILED", "START", "CAPTURED",
+    "LINEAGE_FAILED", "FAILED", "DISPOSITION", "RESUME_SKIP",
+}
+if events_path.is_file():
+    for line in events_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        fields = line.split(" ", 2)
+        if len(fields) < 2 or fields[1] not in progress_kinds:
+            continue
+        token = fields[0]
+        try:
+            observed = datetime.fromisoformat(token.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if last_progress is None or observed > last_progress:
+            last_progress = observed
+terminal_states = {"complete", "failed", "cancelled", "stopped", "stopped-contaminated", "evidence-complete"}
+if state_status in terminal_states and missing_ids:
+    raise SystemExit(
+        f"terminal run state {state_status!r} contradicts missing scenarios: {','.join(missing_ids)}"
+    )
+now_epoch = int(os.environ.get("FLEET_STATUS_NOW_EPOCH", str(int(datetime.now(timezone.utc).timestamp()))))
+stale_after = int(os.environ.get("FLEET_STALE_AFTER_SECONDS", "600"))
+age_seconds = None if last_progress is None else max(0, now_epoch - int(last_progress.timestamp()))
+stale = state_status not in terminal_states and (age_seconds is None or age_seconds > stale_after)
+print(
+    "Liveness: "
+    f"state={state_status} "
+    f"last-progress-at={last_progress.isoformat().replace('+00:00', 'Z') if last_progress else '-'} "
+    f"age-seconds={age_seconds if age_seconds is not None else '-'} "
+    f"stale={'true' if stale else 'false'}"
+)
+PY
+  [ -s "$current/state.json" ] && python3 -m json.tool "$current/state.json"
+  [ -s "$current/readiness.json" ] && python3 -m json.tool "$current/readiness.json"
+  [ -s "$current/summary.json" ] && python3 -m json.tool "$current/summary.json"
+  echo "Recent events:"
+  tail -30 "$current/events.log" 2>/dev/null || true
+}
+
+show_lane_plan() {
+  local index lane scenario lane_scenarios
+  numeric_between FLEET_SLOTS "$slot_count" 1 16
+  select_scenarios_and_lanes
+  for index in "${!lane_prefixes[@]}"; do
+    lane="${lane_prefixes[$index]}"
+    lane_scenarios=""
+    for scenario in "${scenarios[@]}"; do
+      [ "${scenario%%-*}" = "$lane" ] || continue
+      lane_scenarios="${lane_scenarios:+$lane_scenarios }$scenario"
+    done
+    printf '%s\t%s\t%s\n' "$index" "$lane" "$lane_scenarios"
+  done
+}
+
+copy_eval_kit_for_test() {
+  [ "$#" -eq 1 ] || fail "usage: hill-climb-fleet _copy-eval-kit DESTINATION"
+  [ ! -e "$1" ] || fail "copy destination already exists: $1"
+  git -C "$base_kit" rev-parse --git-dir >/dev/null 2>&1 \
+    || fail "eval kit must be a Git checkout: $base_kit"
+  eval_kit_sha=$(git -C "$base_kit" rev-parse HEAD)
+  prepare_eval_config
+  copy_eval_kit "$1"
+  jq -nc --arg destination "$1" --arg eval_kit_sha "$eval_kit_sha" \
+    --arg eval_config_sha256 "$eval_config_sha256" \
+    '{schema:"hill-climb-eval-kit-copy.v1",destination:$destination,
+      eval_kit_sha:$eval_kit_sha,eval_config_sha256:$eval_config_sha256}'
+}
+
+# Writes a real run receipt from the received pin, with only the run-scoped
+# facts a live start would have gathered stubbed out. Proves the RECEIPT, not
+# the send.
+manifest_receipt_for_test() {
+  [ "$#" -eq 1 ] || fail "usage: hill-climb-fleet _test-write-manifest OUTPUT"
+  validate_provenance_input
+  scenarios=(CFP-S1)
+  lane_prefixes=(CFP)
+  slot_count=1
+  app_dir="$(dirname "$1")/app"
+  worker_model="${worker_model:-gpt-test-worker}"
+  judge_model="${judge_model:-gpt-test-judge}"
+  worker_reasoning_effort="${worker_reasoning_effort:-high}"
+  judge_reasoning_effort="${judge_reasoning_effort:-high}"
+  golden_fixture_sha256=golden-fixture
+  eval_kit_sha=eval-kit-sha
+  eval_kit_archive_sha256=eval-kit-archive
+  eval_config_sha256=eval-config
+  write_run_manifest "$1" "test-run-id"
+}
+
+stop_current_pin_for_test() {
+  [ "$#" -eq 0 ] || fail "usage: hill-climb-fleet _test-stop-pin"
+  stop_current
+  printf '%s\t%s\t%s\t%s\t%s\n' "$deployment_sha" "$harness_sha" \
+    "$deployment_run_url" "$worker_model" "$base_port"
+}
+
+slot_scheduler_for_test() {
+  [ "$#" -eq 2 ] || fail "usage: hill-climb-fleet _test-slot-scheduler ROOT MODE"
+  run_dir="$1"
+  app_dir="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+  local mode="$2" scenario cycle_dir
+  case "$mode" in scenario-local|slot-local|run-global) ;; *) fail "invalid scheduler test mode" ;; esac
+  mkdir -p "$run_dir/slots/slot-0"
+  : > "$run_dir/events.log"
+  if [ "$mode" = "scenario-local" ]; then
+    scenarios=(ABS-S1 ABS-S2 ABS-S3)
+    lane_prefixes=(ABS)
+  else
+    scenarios=(CFP-S1 CFP-S2 CFP-S3)
+    lane_prefixes=(CFP)
+  fi
+  base_port=20700
+  prepare_lane() { return 0; }
+  scenario_evidence_path() {
+    local kit="$1" wanted="$2" evidence
+    evidence="$kit/runs/test/$wanted/evidence.json"
+    mkdir -p "$(dirname "$evidence")"
+    printf '%s\n' '{"outcome":"completed"}' > "$evidence"
+    printf '%s\n' '{}' > "$(dirname "$evidence")/capture-receipt.json"
+    printf '%s\n' "$evidence"
+  }
+  run_cycle() {
+    local slot="$1" wanted="$2" port="$3" lane_dir="$4" wanted_dir="$5" predecessor="$6"
+    local evidence
+    mkdir -p "$wanted_dir"
+    touch "$wanted_dir/executed"
+    : > "$wanted_dir/worker.log"
+    if [ "$wanted" = "${scenarios[0]}" ]; then
+      if [ "$mode" = "run-global" ]; then
+        return 40
+      fi
+      record_terminal_disposition "$slot" "$wanted" "$port" "$wanted_dir" \
+        failed fixture-refused capture-validator "$mode" "$predecessor"
+      [ "$mode" = "scenario-local" ] && return 20
+      return 30
+    fi
+    evidence="$wanted_dir/kit/runs/test/$wanted/evidence.json"
+    mkdir -p "$(dirname "$evidence")"
+    printf '%s\n' '{"outcome":"completed"}' > "$evidence"
+    printf '0\n' > "$wanted_dir/worker.exit"
+    return 0
+  }
+  touch "$run_dir/release"
+  set +e
+  slot_main 0
+  local scheduler_status=$?
+  set -e
+  summarize_run >/dev/null
+  printf '%s\n' "$scheduler_status"
+}
+
+case "${1:-start}" in
+  start) run_with_runtime_lease start ;;
+  check-provenance) validate_provenance; echo "PROVENANCE OK sha=$deployment_sha" ;;
+  plan-lanes) show_lane_plan ;;
+  _copy-eval-kit) shift; copy_eval_kit_for_test "$@" ;;
+  _test-slot-scheduler) shift; slot_scheduler_for_test "$@" ;;
+  _test-stop-pin) shift; stop_current_pin_for_test "$@" ;;
+  _test-write-manifest) shift; manifest_receipt_for_test "$@" ;;
+  _test-runtime-lock-foreground) shift; run_with_runtime_lease _test-runtime-lock-foreground "$@" ;;
+  _test-runtime-lock-pregate) shift; run_with_runtime_lease _test-runtime-lock-pregate "$@" ;;
+  _test-runtime-lock-timeout-tree) shift; run_with_runtime_lease _test-runtime-lock-timeout-tree "$@" ;;
+  _test-runtime-deadline-expiry) shift; run_with_runtime_lease _test-runtime-deadline-expiry "$@" ;;
+  _test-runtime-deadline-identity-swap) run_with_runtime_lease _test-runtime-deadline-identity-swap ;;
+  _test-runtime-lock-contender) run_with_runtime_lease _test-runtime-lock-contender ;;
+  verify-install) verify_install_receipt ;;
+  resume-plan) show_resume_plan ;;
+  resume) run_with_runtime_lease resume ;;
+  score) run_with_runtime_lease score ;;
+  _runtime-lock-child)
+    [ "${FLEET_RUNTIME_LOCK_CHILD:-}" = 1 ] || fail "runtime lock child lacks its dedicated holder"
+    python3 - "${FLEET_RUNTIME_LOCK_PATH:-}" "${FLEET_RUNTIME_LOCK_PARENT_PID:-}" "$PPID" <<'PY' \
+      || fail "runtime lock child lacks its dedicated holder"
+import fcntl
+import os
+import sys
+path, parent, shell_parent = sys.argv[1:]
+if not parent.isdigit() or shell_parent != parent:
+    raise SystemExit(1)
+descriptor = os.open(path, os.O_WRONLY)
+try:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(0)
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        raise SystemExit(1)
+finally:
+    os.close(descriptor)
+PY
+    shift
+    case "${1:-}" in
+      start) verify_install_receipt; start_fleet ;;
+      resume) verify_install_receipt; resume_scenarios ;;
+      score) verify_install_receipt; resume_score ;;
+      _test-runtime-lock-foreground) shift; runtime_lock_foreground_for_test "$@" ;;
+      _test-runtime-lock-pregate) shift; : > "$4" ;;
+      _test-runtime-lock-timeout-tree) shift; runtime_lock_timeout_tree_for_test "$@" ;;
+      _test-runtime-deadline-expiry) shift; runtime_deadline_expiry_for_test "$@" ;;
+      _test-runtime-deadline-identity-swap) runtime_deadline_identity_swap_for_test ;;
+      _test-runtime-lock-contender) printf 'RUNTIME LOCK ACQUIRED\n' ;;
+      *) fail "invalid runtime lock child command" ;;
+    esac
+    ;;
+  status) show_status ;;
+  stop) stop_current; clear_stale_runtime_lease_after_stop; echo "Managed fleet stopped." ;;
+  *) fail "usage: hill-climb-fleet [start|check-provenance|plan-lanes|resume-plan|resume|score|status|stop|verify-install]" ;;
+esac

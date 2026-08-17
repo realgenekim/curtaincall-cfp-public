@@ -1,0 +1,47 @@
+{
+  "schema": "hill-climb-predicate-registry.v1",
+  "criteria": {
+    "CFP-16": {
+      "area": "call-for-papers",
+      "status": "candidate",
+      "predicate": "cfp-scheduler-killer.rubric-predicates/closed-cfp-answer-post-refused",
+      "rubric_clause_id": "CFP-16/answer-post-refused-after-close",
+      "residual_model_required": true
+    },
+    "SPK-11": {
+      "area": "speaker-management",
+      "status": "candidate",
+      "predicate": "cfp-scheduler-killer.rubric-predicates-schedule/spk-11",
+      "rubric_clause_id": "SPK-11/canonical-speaker-session-equality",
+      "residual_model_required": true
+    },
+    "CNT-14": {
+      "area": "content-management",
+      "status": "candidate",
+      "predicate": "cfp-scheduler-killer.exports/latest-files-zip-verdict",
+      "rubric_clause_id": "CNT-14/latest-archive-members-exact",
+      "residual_model_required": true
+    },
+    "AIA-04": {
+      "area": "ai-agenda",
+      "status": "candidate",
+      "predicate": "cfp-scheduler-killer.rubric-predicates-schedule/aia-04",
+      "rubric_clause_id": "AIA-04/speaker-overlap-conflict-exact",
+      "residual_model_required": true
+    },
+    "AIA-05": {
+      "area": "ai-agenda",
+      "status": "candidate",
+      "predicate": "cfp-scheduler-killer.rubric-predicates-schedule/aia-05",
+      "rubric_clause_id": "AIA-05/room-overlap-conflict-exact",
+      "residual_model_required": true
+    },
+    "EMB-01": {
+      "area": "public-widgets",
+      "status": "candidate",
+      "predicate": "cfp-scheduler-killer.exports/sessions-card-count-verdict",
+      "rubric_clause_id": "EMB-01/session-card-count-equals-source",
+      "residual_model_required": true
+    }
+  }
+}

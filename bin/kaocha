@@ -1,0 +1,7 @@
+#!/usr/bin/env sh
+# 512m heap cap (Gene 2026-08-10): watch-mode + suite JVMs were eating the laptop.
+# CFP_MAIL_DISABLE: tests must NEVER hit a real mail transport (SES live-fire
+# incident, 2026-08-11) — ses/enabled? honors this and letters stay rendered.
+CFP_MAIL_DISABLE=1
+export CFP_MAIL_DISABLE
+exec clojure -J-Xmx512m -M:run-tests "$@"

@@ -1,0 +1,669 @@
+#!/usr/bin/env bash
+# Fast contract checks for the fleet's production-provenance gate.
+set -euo pipefail
+
+repo_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+script="$repo_root/bin/hill-climb-fleet"
+control_script="$repo_root/bin/reset-anvil-fleet"
+proof="https://github.com/realgenekim/curtaincall-cfp/actions/runs/test"
+good_sha="$(git -C "$repo_root" rev-parse origin/staging)"
+
+FLEET_SOURCE_REPO="$repo_root" FLEET_SHA="$good_sha" \
+  FLEET_DEPLOYMENT_RUN_URL="$proof" "$script" check-provenance >/dev/null
+
+if FLEET_SOURCE_REPO="$repo_root" FLEET_SHA=not-a-sha \
+  FLEET_DEPLOYMENT_RUN_URL="$proof" "$script" check-provenance >/dev/null 2>&1; then
+  echo "FAIL: malformed SHA passed provenance" >&2
+  exit 1
+fi
+
+foreign_sha="$(printf 'fleet provenance negative test\n' \
+  | git -C "$repo_root" commit-tree "$(git -C "$repo_root" write-tree)")"
+if FLEET_SOURCE_REPO="$repo_root" FLEET_SHA="$foreign_sha" \
+  FLEET_DEPLOYMENT_RUN_URL="$proof" "$script" check-provenance >/dev/null 2>&1; then
+  echo "FAIL: commit outside origin/staging passed provenance" >&2
+  exit 1
+fi
+
+lane_plan="$(FLEET_SLOTS=8 \
+  FLEET_SCENARIOS='CFP-S1,ABS-S1,CFP-S2,ABS-S2,SPK-S1' \
+  "$script" plan-lanes)"
+expected_plan="$(printf '0\tCFP\tCFP-S1 CFP-S2\n1\tABS\tABS-S1 ABS-S2\n2\tSPK\tSPK-S1')"
+if [ "$lane_plan" != "$expected_plan" ]; then
+  echo "FAIL: scenarios were not grouped into ordered stateful area lanes" >&2
+  printf '%s\n' "$lane_plan" >&2
+  exit 1
+fi
+
+if FLEET_SLOTS=2 FLEET_SCENARIOS='CFP-S1,ABS-S1,SPK-S1' \
+    "$script" plan-lanes >/dev/null 2>&1; then
+  echo "FAIL: insufficient lanes did not fail closed" >&2
+  exit 1
+fi
+
+status_root="$(mktemp -d)"
+trap 'rm -rf "$status_root"' EXIT
+
+# The eval kit's required runtime config is intentionally untracked. The
+# copier must overlay the pinned bytes onto the exact Git archive and prove
+# their digest before any SUT lane starts.
+kit_root="$status_root/eval-kit"
+kit_copy="$status_root/eval-kit-copy"
+git init -q "$kit_root"
+git -C "$kit_root" config user.name fixture
+git -C "$kit_root" config user.email fixture@example.com
+printf 'tracked\n' >"$kit_root/AGENTS.md"
+git -C "$kit_root" add AGENTS.md
+git -C "$kit_root" commit -qm base
+mkdir "$kit_root/node_modules"
+printf '{"url":"http://example.invalid"}\n' >"$kit_root/evalconfig.json"
+config_sha=$(shasum -a 256 "$kit_root/evalconfig.json" | awk '{print $1}')
+copy_receipt=$(FLEET_EVAL_KIT="$kit_root" \
+  FLEET_EVAL_CONFIG="$kit_root/evalconfig.json" FLEET_EVAL_CONFIG_SHA256="$config_sha" \
+  "$script" _copy-eval-kit "$kit_copy")
+jq -e --arg sha "$config_sha" '.schema == "hill-climb-eval-kit-copy.v1" and
+  .eval_config_sha256 == $sha' <<<"$copy_receipt" >/dev/null
+[[ "$(shasum -a 256 "$kit_copy/evalconfig.json" | awk '{print $1}')" == "$config_sha" ]]
+if git -C "$kit_root" archive HEAD | tar -tf - | grep -q '^evalconfig.json$'; then
+  echo "FAIL: regression fixture accidentally tracks evalconfig.json" >&2
+  exit 1
+fi
+bad_config="$status_root/bad-evalconfig.json"
+printf '{broken\n' >"$bad_config"
+if FLEET_EVAL_KIT="$kit_root" FLEET_EVAL_CONFIG="$bad_config" \
+    "$script" _copy-eval-kit "$status_root/bad-copy" >/dev/null 2>&1; then
+  echo "FAIL: malformed eval config passed the copy gate" >&2
+  exit 1
+fi
+
+status_run="$status_root/run"
+mkdir -p "$status_run/slots/slot-0/ABS/ABS-S1/kit/runs/one/ABS-S1" "$status_run/judges"
+ln -s "$status_run" "$status_root/current"
+printf '%s\n' '{"scenarios":["ABS-S1","ABS-S2"]}' > "$status_run/manifest.json"
+printf '%s\n' '{"status":"running"}' > "$status_run/state.json"
+printf '%s\n' '2026-08-16T00:00:00Z START slot=0 scenario=ABS-S1 port=20700' > "$status_run/events.log"
+printf '%s\n' 0 > "$status_run/slots/slot-0/ABS/ABS-S1/worker.exit"
+printf '%s\n' '{"outcome":"completed"}' > "$status_run/slots/slot-0/ABS/ABS-S1/kit/runs/one/ABS-S1/evidence.json"
+printf '%s\n' 0 > "$status_run/judges/abstract.exit"
+status_output="$(FLEET_STATE_ROOT="$status_root" "$script" status)"
+if ! grep -q 'Progress: journeys=1/2 evidence=1/2 failures=0 blocked=0 judges=1/6 report=no' \
+    <<< "$status_output"; then
+  echo "FAIL: status did not summarize live fleet progress" >&2
+  printf '%s\n' "$status_output" >&2
+  exit 1
+fi
+if ! grep -q 'Terminal: planned=2 terminal=1 missing=1 ids=ABS-S2' <<< "$status_output"; then
+  echo "FAIL: status did not name the planned scenario without a terminal disposition" >&2
+  printf '%s\n' "$status_output" >&2
+  exit 1
+fi
+
+# A worker process exit corroborates execution; it is never a logical outcome.
+mkdir -p "$status_run/slots/slot-0/ABS/ABS-S2"
+printf '%s\n' 17 > "$status_run/slots/slot-0/ABS/ABS-S2/worker.exit"
+status_output="$(FLEET_STATE_ROOT="$status_root" "$script" status)"
+if ! grep -q 'Terminal: planned=2 terminal=1 missing=1 ids=ABS-S2' <<< "$status_output"; then
+  echo "FAIL: worker.exit was accepted as a terminal scenario outcome" >&2
+  printf '%s\n' "$status_output" >&2
+  exit 1
+fi
+rm "$status_run/slots/slot-0/ABS/ABS-S2/worker.exit"
+
+# A fresh diagnostic line must not make an old running capture look live.
+printf '%s\n' '2026-08-16T00:19:59Z DIAGNOSTIC worker-process-still-present' \
+  >> "$status_run/events.log"
+# INTENT-TEST: EVAL-CAPTURE-LIVENESS-001
+status_now_epoch="$(python3 - <<'PY'
+import datetime
+print(int(datetime.datetime(2026, 8, 16, 0, 20, tzinfo=datetime.timezone.utc).timestamp()))
+PY
+)"
+status_output="$(FLEET_STATE_ROOT="$status_root" FLEET_STATUS_NOW_EPOCH="$status_now_epoch" \
+  FLEET_STALE_AFTER_SECONDS=600 "$script" status)"
+if ! grep -q 'Liveness: state=running last-progress-at=2026-08-16T00:00:00Z age-seconds=1200 stale=true' \
+    <<< "$status_output"; then
+  echo "FAIL: status did not derive stale liveness from the last durable progress event" >&2
+  printf '%s\n' "$status_output" >&2
+  exit 1
+fi
+
+# A declared terminal run cannot retain planned-minus-terminal holes.
+printf '%s\n' '{"status":"failed"}' > "$status_run/state.json"
+if FLEET_STATE_ROOT="$status_root" "$script" status >/dev/null 2>&1; then
+  echo "FAIL: terminal run state with missing scenarios passed reconciliation" >&2
+  exit 1
+fi
+printf '%s\n' '{"status":"running"}' > "$status_run/state.json"
+
+# INTENT-TEST: EVAL-CAPTURE-TERMINAL-001
+printf '%s\n' '{"schema":"hill-climb-scenario-terminal.v2","recorded_at":"2026-08-16T00:00:00+00:00","scenario":"ABS-S2","status":"not-run","cause":"predecessor-failed","owner":"scenario-scheduler","scope":"scenario-local","predecessor":"ABS-S1"}' \
+  > "$status_run/slots/slot-0/ABS/ABS-S2/terminal-disposition.json"
+status_output="$(FLEET_STATE_ROOT="$status_root" "$script" status)"
+if ! grep -q 'Terminal: planned=2 terminal=2 missing=0 ids=-' <<< "$status_output"; then
+  echo "FAIL: status ignored an explicit skipped_due_to_predecessor terminal disposition" >&2
+  printf '%s\n' "$status_output" >&2
+  exit 1
+fi
+
+printf '%s\n' '{"status":"failed"}' > "$status_run/state.json"
+status_output="$(FLEET_STATE_ROOT="$status_root" FLEET_STATUS_NOW_EPOCH="$status_now_epoch" \
+  FLEET_STALE_AFTER_SECONDS=600 "$script" status)"
+if ! grep -q 'Liveness: state=failed .* stale=false' <<< "$status_output"; then
+  echo "FAIL: old terminal state was relabeled stalled" >&2
+  printf '%s\n' "$status_output" >&2
+  exit 1
+fi
+
+# INTENT-TEST: EVAL-CAPTURE-TERMINAL-001
+duplicate_dir="$status_run/slots/slot-1/ABS/ABS-S2"
+mkdir -p "$duplicate_dir"
+cp "$status_run/slots/slot-0/ABS/ABS-S2/terminal-disposition.json" \
+  "$duplicate_dir/terminal-disposition.json"
+if FLEET_STATE_ROOT="$status_root" "$script" status >/dev/null 2>&1; then
+  echo "FAIL: duplicate logical scenario dispositions passed status reconciliation" >&2
+  exit 1
+fi
+rm -rf "$status_run/slots/slot-1"
+
+external_disposition="$status_root/external-disposition.json"
+cp "$status_run/slots/slot-0/ABS/ABS-S2/terminal-disposition.json" "$external_disposition"
+mv "$status_run/slots/slot-0/ABS/ABS-S2/terminal-disposition.json" \
+  "$status_run/slots/slot-0/ABS/ABS-S2/terminal-disposition.saved"
+ln -s "$external_disposition" \
+  "$status_run/slots/slot-0/ABS/ABS-S2/terminal-disposition.json"
+if FLEET_STATE_ROOT="$status_root" "$script" status >/dev/null 2>&1; then
+  echo "FAIL: symlinked terminal disposition passed reconciliation" >&2
+  exit 1
+fi
+rm "$status_run/slots/slot-0/ABS/ABS-S2/terminal-disposition.json"
+mv "$status_run/slots/slot-0/ABS/ABS-S2/terminal-disposition.saved" \
+  "$status_run/slots/slot-0/ABS/ABS-S2/terminal-disposition.json"
+
+duplicate_evidence_dir="$status_run/slots/slot-1/ABS/kit/runs/two/ABS-S1"
+mkdir -p "$duplicate_evidence_dir"
+printf '%s\n' '{"outcome":"completed"}' > "$duplicate_evidence_dir/evidence.json"
+printf '%s\n' '{}' > "$duplicate_evidence_dir/capture-receipt.json"
+if FLEET_STATE_ROOT="$status_root" "$script" status >/dev/null 2>&1; then
+  echo "FAIL: duplicate immutable evidence attempts passed status reconciliation" >&2
+  exit 1
+fi
+rm -rf "$status_run/slots/slot-1"
+
+mkdir -p "$status_run/slots/slot-0/ABS/ABS-S2/kit/runs/one/ABS-S2"
+printf '%s\n' '{"outcome":"completed"}' \
+  > "$status_run/slots/slot-0/ABS/ABS-S2/kit/runs/one/ABS-S2/evidence.json"
+if FLEET_STATE_ROOT="$status_root" "$script" status >/dev/null 2>&1; then
+  echo "FAIL: contradictory evidence and non-capture disposition passed reconciliation" >&2
+  exit 1
+fi
+rm -rf "$status_run/slots/slot-0/ABS/ABS-S2/kit"
+
+rm "$status_run/judges/abstract.exit"
+rm "$status_run/slots/slot-0/ABS/ABS-S2/terminal-disposition.json"
+printf '%s\n' '{"scenarios":["ABS-S1"],"evidence_only":true}' > "$status_run/manifest.json"
+status_output="$(FLEET_STATE_ROOT="$status_root" "$script" status)"
+if ! grep -q 'Progress: journeys=1/1 evidence=1/1 failures=0 blocked=0 judges=0/0 report=n/a' \
+    <<< "$status_output"; then
+  echo "FAIL: evidence-only target status looked like a full score run" >&2
+  printf '%s\n' "$status_output" >&2
+  exit 1
+fi
+
+# A CFP/SPK evidence filename and worker exit are not accepted without a
+# capture-lineage receipt that verifies against the exact immutable evidence.
+forged_root="$status_root/forged-lineage"
+forged_run="$forged_root/run"
+mkdir -p "$forged_run/slots/slot-0/CFP/CFP-S1/kit/runs/one/CFP-S1"
+ln -s "$forged_run" "$forged_root/current"
+printf '{"app_dir":"%s","scenarios":["CFP-S1"],"evidence_only":true}\n' \
+  "$repo_root" > "$forged_run/manifest.json"
+printf '%s\n' '{"status":"running"}' > "$forged_run/state.json"
+printf '%s\n' '2026-08-16T00:00:00Z START slot=0 scenario=CFP-S1 port=20700' \
+  > "$forged_run/events.log"
+printf '%s\n' 0 > "$forged_run/slots/slot-0/CFP/CFP-S1/worker.exit"
+printf '%s\n' '{"outcome":"completed"}' \
+  > "$forged_run/slots/slot-0/CFP/CFP-S1/kit/runs/one/CFP-S1/evidence.json"
+printf '%s\n' '{}' \
+  > "$forged_run/slots/slot-0/CFP/CFP-S1/kit/runs/one/CFP-S1/capture-receipt.json"
+forged_output="$(FLEET_STATE_ROOT="$forged_root" "$script" status)"
+if ! grep -q 'Progress: journeys=1/1 evidence=0/1' <<< "$forged_output" \
+    || ! grep -q 'Terminal: planned=1 terminal=0 missing=1 ids=CFP-S1' <<< "$forged_output"; then
+  echo "FAIL: forged/unverified capture receipt was accepted as evidence" >&2
+  printf '%s\n' "$forged_output" >&2
+  exit 1
+fi
+
+# INTENT-TEST: EVAL-CAPTURE-TERMINAL-001
+# INTENT-TEST: EVAL-CAPTURE-SCOPE-001
+scenario_scope_root="$status_root/scenario-local"
+scenario_scope_status="$($script _test-slot-scheduler "$scenario_scope_root" scenario-local)"
+if [ "$scenario_scope_status" -ne 1 ] \
+    || [ ! -e "$scenario_scope_root/slots/slot-0/ABS/ABS-S2/executed" ] \
+    || [ ! -e "$scenario_scope_root/slots/slot-0/ABS/ABS-S3/executed" ]; then
+  echo "FAIL: scenario-local refusal prevented independent siblings from running" >&2
+  exit 1
+fi
+python3 - "$scenario_scope_root" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+planned = {"ABS-S1", "ABS-S2", "ABS-S3"}
+captured = {path.parent.name for path in root.glob("slots/slot-*/**/evidence.json")}
+disposed = {path.parent.name for path in root.glob("slots/slot-*/*/*/terminal-disposition.json")}
+assert captured.isdisjoint(disposed), (captured, disposed)
+assert captured | disposed == planned, (captured, disposed)
+assert not list(root.glob("slots/slot-*/requeue-request.json"))
+summary = json.loads((root / "summary.json").read_text())
+logical = {item["scenario"]: item["disposition"] for item in summary["results"]}
+assert logical == {"ABS-S1": "failed", "ABS-S2": "captured", "ABS-S3": "captured"}, logical
+PY
+
+slot_scope_root="$status_root/slot-local"
+slot_scope_status="$($script _test-slot-scheduler "$slot_scope_root" slot-local)"
+if [ "$slot_scope_status" -ne 1 ] \
+    || [ -e "$slot_scope_root/slots/slot-0/CFP/CFP-S2/executed" ] \
+    || [ -e "$slot_scope_root/slots/slot-0/CFP/CFP-S3/executed" ]; then
+  echo "FAIL: slot-local refusal did not quarantine untouched siblings" >&2
+  exit 1
+fi
+python3 - "$slot_scope_root" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+planned = {"CFP-S1", "CFP-S2", "CFP-S3"}
+receipts = {}
+for path in root.glob("slots/slot-*/*/*/terminal-disposition.json"):
+    payload = json.loads(path.read_text())
+    receipts[path.parent.name] = payload
+assert set(receipts) == planned, receipts
+assert receipts["CFP-S1"]["status"] == "failed"
+for scenario in ("CFP-S2", "CFP-S3"):
+    assert receipts[scenario]["status"] == "not-run", receipts[scenario]
+    assert receipts[scenario]["scope"] == "slot-local", receipts[scenario]
+    assert receipts[scenario]["owner"] == "slot-supervisor", receipts[scenario]
+requeue = json.loads((root / "slots/slot-0/requeue-request.json").read_text())
+assert requeue["required_action"] == "new-capture-plan", requeue
+assert requeue["scenarios"] == ["CFP-S1", "CFP-S2", "CFP-S3"], requeue
+summary = json.loads((root / "summary.json").read_text())
+logical = {item["scenario"]: item["disposition"] for item in summary["results"]}
+assert logical == {"CFP-S1": "failed", "CFP-S2": "not-run", "CFP-S3": "not-run"}, logical
+PY
+
+# A second identical scheduling fold must reuse the immutable terminal facts.
+slot_scope_status="$($script _test-slot-scheduler "$slot_scope_root" slot-local)"
+[ "$slot_scope_status" -eq 1 ] || {
+  echo "FAIL: identical terminal/requeue receipts were not idempotent" >&2
+  exit 1
+}
+
+run_global_root="$status_root/run-global"
+run_global_status="$($script _test-slot-scheduler "$run_global_root" run-global)"
+if [ "$run_global_status" -ne 1 ]; then
+  echo "FAIL: run-global scheduler fixture did not fail the run" >&2
+  exit 1
+fi
+python3 - "$run_global_root" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+planned = {"CFP-S1", "CFP-S2", "CFP-S3"}
+receipts = {
+    path.parent.name: json.loads(path.read_text())
+    for path in root.glob("slots/slot-*/*/*/terminal-disposition.json")
+}
+assert set(receipts) == planned, receipts
+assert receipts["CFP-S1"]["status"] == "failed", receipts
+assert receipts["CFP-S1"]["scope"] == "run-global", receipts
+for scenario in ("CFP-S2", "CFP-S3"):
+    assert receipts[scenario]["status"] == "not-run", receipts[scenario]
+    assert receipts[scenario]["scope"] == "run-global", receipts[scenario]
+summary = json.loads((root / "summary.json").read_text())
+assert summary["terminal"] == summary["expected"] == 3, summary
+assert summary["missing"] == 0, summary
+PY
+
+# A partial/conflicting final file is never overwritten or treated as reusable.
+conflict_root="$status_root/conflicting-terminal"
+mkdir -p "$conflict_root/slots/slot-0/CFP/CFP-S1"
+printf '%s\n' '{"schema":"hill-climb-scenario-terminal.v2"' \
+  > "$conflict_root/slots/slot-0/CFP/CFP-S1/terminal-disposition.json"
+if "$script" _test-slot-scheduler "$conflict_root" slot-local >/dev/null 2>&1; then
+  echo "FAIL: partial immutable terminal receipt was overwritten" >&2
+  exit 1
+fi
+
+run_cycle_body="$(sed -n '/^run_cycle() {/,/^}/p' "$script")"
+slot_main_body="$(sed -n '/^slot_main() {/,/^}/p' "$script")"
+configure_body="$(sed -n '/^configure_eval_kit() {/,/^}/p' "$script")"
+worker_adapter_body="$(sed -n '/^run_worker_agent() {/,/^}/p' "$script")"
+if ! grep -q 'maxTurnsPerScenario.*scenario_turn_budget' <<< "$configure_body"; then
+  echo "FAIL: eval kits do not receive the executor-specific call budget" >&2
+  exit 1
+fi
+if ! grep -q 'codex).*240' "$script"; then
+  echo "FAIL: Codex still has the under-provisioned 120-call budget" >&2
+  exit 1
+fi
+if ! grep -q 'claude).*120' "$script"; then
+  echo "FAIL: Claude rollback lost its certified 120-call budget" >&2
+  exit 1
+fi
+if ! grep -q 'max_turns_per_scenario.*scenario_turn_budget' "$script"; then
+  echo "FAIL: the immutable run manifest does not attribute its turn budget" >&2
+  exit 1
+fi
+for provenance_field in harness_sha worker_reasoning_effort judge_model judge_reasoning_effort; do
+  if ! grep -q "\"$provenance_field\"" "$script"; then
+    echo "FAIL: immutable run manifest does not attribute $provenance_field" >&2
+    exit 1
+  fi
+done
+if ! grep -q '"capture_lineage_schema": "capture-lineage.v1"' "$script"; then
+  echo "FAIL: immutable run manifest does not declare capture lineage" >&2
+  exit 1
+fi
+if ! grep -q 'capture_personas.*cycle_dir/sbek-auth.log' <<< "$run_cycle_body"; then
+  echo "FAIL: every scenario must refresh and prove persona sessions" >&2
+  exit 1
+fi
+if ! grep -q 'navigate to /login once and immediately click' <<< "$run_cycle_body"; then
+  echo "FAIL: workers lack the safe persona-transition contract" >&2
+  exit 1
+fi
+if ! grep -q 'never fill email or take a second action while on /login' \
+    <<< "$run_cycle_body"; then
+  echo "FAIL: workers are not warned about the login-wall false positive" >&2
+  exit 1
+fi
+if grep -q 'exit_code=65\|treating the journey as failed' <<< "$run_cycle_body"; then
+  echo "FAIL: valid blocked evidence still aborts a stateful lane" >&2
+  exit 1
+fi
+if ! grep -q 'BLOCKED.*captured' <<< "$run_cycle_body"; then
+  echo "FAIL: blocked evidence is not recorded separately from process failure" >&2
+  exit 1
+fi
+if grep -Fq "\$app_dir/bin/capture-lineage" "$script"; then
+  echo "FAIL: runtime still executes the product worktree capture-lineage helper" >&2
+  exit 1
+fi
+runtime_lineage_pattern="\"\\\$capture_lineage_tool\" (create-lane|record|verify-receipt)"
+runtime_lineage_calls=$(grep -Ec "$runtime_lineage_pattern" "$script")
+if [ "$runtime_lineage_calls" -ne 4 ]; then
+  echo "FAIL: not every capture-lineage execution is bound to the installed sibling helper" >&2
+  exit 1
+fi
+lineage_line=$(grep -n 'capture_lineage_tool.*record' <<< "$run_cycle_body" | head -1 | cut -d: -f1)
+captured_line=$(grep -n 'normalize_captured_receipt' <<< "$run_cycle_body" | head -1 | cut -d: -f1)
+if [ -z "$lineage_line" ] || [ -z "$captured_line" ] || [ "$lineage_line" -ge "$captured_line" ]; then
+  echo "FAIL: CFP/Speaker lineage is not verified before evidence becomes CAPTURED" >&2
+  exit 1
+fi
+if ! grep -q 'reason=capture-lineage-refused' "$script"; then
+  echo "FAIL: lineage refusal does not publish a typed supervisor reason" >&2
+  exit 1
+fi
+if ! grep -q 'failure_reason="ambiguous-evidence-owner"' "$script"; then
+  echo "FAIL: zero-exit corrupt evidence does not publish a typed supervisor reason" >&2
+  exit 1
+fi
+if grep -q 'failed_predecessor\|record_skipped_predecessor' <<< "$slot_main_body"; then
+  echo "FAIL: a scenario-local refusal still suppresses every later scenario in its lane" >&2
+  exit 1
+fi
+# INTENT-TEST: EVAL-CAPTURE-SCOPE-001
+if ! grep -q 'cycle_status' <<< "$slot_main_body" \
+    || ! grep -q 'slot-quarantined-after' <<< "$slot_main_body" \
+    || ! grep -q 'not-run.*quarantine_cause' <<< "$slot_main_body"; then
+  echo "FAIL: scheduler does not contain scenario-local and slot-local blast radii" >&2
+  exit 1
+fi
+
+default_executor_assignment="fleet_executor=\"\${FLEET_EXECUTOR:-codex}\""
+if ! grep -Fq "$default_executor_assignment" "$script"; then
+  echo "FAIL: Codex is not the default fleet executor" >&2
+  exit 1
+fi
+for executor in codex claude; do
+  if ! grep -q "$executor)" <<< "$worker_adapter_body"; then
+    echo "FAIL: worker adapter does not support $executor" >&2
+    exit 1
+  fi
+done
+for codex_guard in --ephemeral --ignore-user-config --dangerously-bypass-approvals-and-sandbox \
+    mcp_servers.sbek.required model_reasoning_effort env\ -u\ OPENAI_API_KEY; do
+  if ! grep -q -- "$codex_guard" <<< "$worker_adapter_body"; then
+    echo "FAIL: Codex worker is missing guard: $codex_guard" >&2
+    exit 1
+  fi
+done
+
+for forwarded in FLEET_SCENARIOS FLEET_CONSOLIDATE_EVIDENCE_ONLY FLEET_MAX_TURNS_PER_SCENARIO \
+    FLEET_EXECUTOR FLEET_WORKER_EXECUTOR FLEET_WORKER_MODEL FLEET_WORKER_REASONING_EFFORT \
+    FLEET_JUDGE_EXECUTOR FLEET_JUDGE_MODEL FLEET_JUDGE_REASONING_EFFORT; do
+  if ! grep -q "$forwarded='" "$control_script"; then
+    echo "FAIL: local control plane does not forward $forwarded to anvil" >&2
+    exit 1
+  fi
+done
+
+score_body="$(sed -n '/^consolidate_current_run() {/,/^}/p' "$script")"
+if ! grep -q 'FLEET_CONSOLIDATE_RESUME=true' <<< "$score_body"; then
+  echo "FAIL: score retry does not preserve consolidated evidence" >&2
+  exit 1
+fi
+resume_body="$(sed -n '/^resume_scenarios() {/,/^}/p' "$script")"
+if ! grep -q 'terminal scenario dispositions require a new capture plan' <<< "$resume_body"; then
+  echo "FAIL: in-place resume can overwrite or contradict a terminal scenario attempt" >&2
+  exit 1
+fi
+if ! grep -q 'judge session quota exhausted' <<< "$score_body"; then
+  echo "FAIL: score retry does not diagnose temporary judge quota failure" >&2
+  exit 1
+fi
+if ! grep -q 'write_state.*evidence-complete.*judging-failed:.*replay sealed fold' <<< "$score_body"; then
+  echo "FAIL: a cheap judgement failure collapses into an expensive capture failure" >&2
+  exit 1
+fi
+if grep -q 'write_state.*failed.*scenario evidence complete' "$script"; then
+  echo "FAIL: complete evidence is mislabeled as capture failure" >&2
+  exit 1
+fi
+if [ "$(grep -c 'write_state.*evidence-complete.*judging-failed:.*replay sealed fold' "$script")" -ne 4 ]; then
+  echo "FAIL: every ordinary and replay judgement failure must preserve complete evidence" >&2
+  exit 1
+fi
+if ! grep -q '"evidence-complete"' "$script"; then
+  echo "FAIL: evidence-complete is not a terminal run-read state" >&2
+  exit 1
+fi
+if ! grep -q "score)" "$control_script"; then
+  echo "FAIL: local control plane cannot resume scoring" >&2
+  exit 1
+fi
+
+resume_body="$(sed -n '/^resume_scenarios() {/,/^}/p' "$script")"
+for guard in 'load_current_manifest' 'verify_resume_runtime' 'resume_slot_main' \
+    'summarize_run' 'consolidate_current_run'; do
+  if ! grep -q "$guard" <<< "$resume_body"; then
+    echo "FAIL: scenario resume is missing guard: $guard" >&2
+    exit 1
+  fi
+done
+if ! grep -q "resume)" "$control_script"; then
+  echo "FAIL: local control plane cannot resume missing scenarios" >&2
+  exit 1
+fi
+
+resume_root="$status_root/resume"
+resume_run="$resume_root/run"
+mkdir -p "$resume_run/slots/slot-0/ABS/kit/runs/one/ABS-S1" \
+  "$resume_run/slots/slot-0/ABS/kit/runs/one/ABS-S2"
+ln -s "$resume_run" "$resume_root/current"
+printf '%s\n' '{"app_dir":"/tmp/app","base_port":20700,"code_sha":"0000000000000000000000000000000000000000","deployment_run_url":"https://example.test/run","evidence_only":false,"judge_executor":"codex","judge_model":"gpt-judge","judge_reasoning_effort":"high","scenarios":["ABS-S1","ABS-S2","ABS-S3"],"slots":1,"stateful_area_lanes":["ABS"],"worker_executor":"codex","worker_model":"gpt-test","worker_reasoning_effort":"high"}' > "$resume_run/manifest.json"
+printf '%s\n' '{"outcome":"completed"}' > "$resume_run/slots/slot-0/ABS/kit/runs/one/ABS-S1/evidence.json"
+printf '%s\n' '{"outcome":"blocked"}' > "$resume_run/slots/slot-0/ABS/kit/runs/one/ABS-S2/evidence.json"
+resume_plan="$(FLEET_STATE_ROOT="$resume_root" "$script" resume-plan)"
+expected_resume_plan="$(printf 'ABS-S1\tcompleted\tskip\nABS-S2\tblocked\tskip\nABS-S3\tmissing\trun')"
+if [ "$resume_plan" != "$expected_resume_plan" ]; then
+  echo "FAIL: resume plan did not skip valid completed/blocked evidence" >&2
+  printf '%s\n' "$resume_plan" >&2
+  exit 1
+fi
+
+lineage_resume_root="$status_root/lineage-resume"
+lineage_resume_run="$lineage_resume_root/run"
+mkdir -p "$lineage_resume_run/slots/slot-0/CFP/kit/runs/one/CFP-S1"
+ln -s "$lineage_resume_run" "$lineage_resume_root/current"
+printf '%s\n' '{"app_dir":"/tmp/app","base_port":20700,"code_sha":"0000000000000000000000000000000000000000","deployment_run_url":"https://example.test/run","evidence_only":false,"judge_executor":"codex","judge_model":"gpt-judge","judge_reasoning_effort":"high","scenarios":["CFP-S1"],"slots":1,"stateful_area_lanes":["CFP"],"worker_executor":"codex","worker_model":"gpt-test","worker_reasoning_effort":"high"}' > "$lineage_resume_run/manifest.json"
+printf '%s\n' '{"outcome":"completed"}' > "$lineage_resume_run/slots/slot-0/CFP/kit/runs/one/CFP-S1/evidence.json"
+lineage_resume_plan="$(FLEET_STATE_ROOT="$lineage_resume_root" "$script" resume-plan)"
+[ "$lineage_resume_plan" = "$(printf 'CFP-S1\tcompleted\tfail')" ] || {
+  echo "FAIL: resume plan skipped CFP evidence without a lineage receipt" >&2
+  printf '%s\n' "$lineage_resume_plan" >&2
+  exit 1
+}
+
+malformed_stop_home="$status_root/malformed-stop-home"
+malformed_stop_root="$status_root/malformed-stop"
+malformed_stop_run="$malformed_stop_root/run"
+mkdir -p "$malformed_stop_home" "$malformed_stop_run/slots/slot-0/ABS/ABS-S1"
+ln -s "$malformed_stop_run" "$malformed_stop_root/current"
+printf '%s\n' '{"app_dir":"/tmp/app","base_port":20700,"code_sha":"0000000000000000000000000000000000000000","deployment_run_url":"https://example.test/run","evidence_only":false,"judge_executor":"codex","judge_model":"gpt-judge","judge_reasoning_effort":"high","scenarios":["ABS-S1"],"slots":1,"stateful_area_lanes":["ABS"],"worker_executor":"codex","worker_model":"gpt-test","worker_reasoning_effort":"high"}' > "$malformed_stop_run/manifest.json"
+printf '%s\n' '{"schema":"hill-climb-fleet-state.v1","status":"running","detail":"test"}' > "$malformed_stop_run/state.json"
+: > "$malformed_stop_run/events.log"
+printf '%s\n' '{"scenario":"ABS-S1","status":"not-run","cause":"fake","owner":"fake","scope":"run-global"}' \
+  > "$malformed_stop_run/slots/slot-0/ABS/ABS-S1/terminal-disposition.json"
+if HOME="$malformed_stop_home" FLEET_STATE_ROOT="$malformed_stop_root" "$script" stop \
+    >"$status_root/malformed-stop.out" 2>"$status_root/malformed-stop.err"; then
+  echo "FAIL stop accepted a schemaless terminal disposition" >&2
+  exit 1
+fi
+python3 - "$malformed_stop_run/state.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    assert json.load(stream)["status"] == "running"
+PY
+
+stop_home="$status_root/stop-home"
+stop_root="$status_root/stop"
+stop_run="$stop_root/run"
+mkdir -p "$stop_home" "$stop_run/slots/slot-0/ABS/ABS-S1" "$stop_run/slots/slot-0/ABS/ABS-S2"
+ln -s "$stop_run" "$stop_root/current"
+printf '%s\n' '{"app_dir":"/tmp/app","base_port":20700,"code_sha":"0000000000000000000000000000000000000000","deployment_run_url":"https://example.test/run","evidence_only":false,"judge_executor":"codex","judge_model":"gpt-judge","judge_reasoning_effort":"high","scenarios":["ABS-S1","ABS-S2"],"slots":1,"stateful_area_lanes":["ABS"],"worker_executor":"codex","worker_model":"gpt-test","worker_reasoning_effort":"high"}' > "$stop_run/manifest.json"
+printf '%s\n' '{"schema":"hill-climb-fleet-state.v1","status":"running","detail":"test"}' > "$stop_run/state.json"
+: > "$stop_run/events.log"
+HOME="$stop_home" FLEET_STATE_ROOT="$stop_root" "$script" stop >"$status_root/stop.out"
+for scenario in ABS-S1 ABS-S2; do
+  disposition="$stop_run/slots/slot-0/ABS/$scenario/terminal-disposition.json"
+  python3 - "$disposition" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    value = json.load(stream)
+assert value["status"] == "not-run"
+assert value["cause"] == "operator-stop"
+assert value["scope"] == "run-global"
+PY
+done
+python3 - "$stop_run/state.json" "$stop_run/summary.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    state = json.load(stream)
+with open(sys.argv[2], encoding="utf-8") as stream:
+    summary = json.load(stream)
+assert state["status"] == "stopped"
+assert summary["missing"] == 0
+assert summary["terminal"] == summary["expected"] == 2
+PY
+
+# Stopping the previous run must never rewrite the pin the control plane just
+# handed this start.  Before 2026-08-17 the terminalizer's load_current_manifest
+# clobbered deployment_sha/harness_sha/models/ports in the caller's shell, so
+# every start silently rebuilt the previous run's commit.
+pin_home="$status_root/pin-home"
+pin_root="$status_root/pin"
+pin_run="$pin_root/run"
+mkdir -p "$pin_home" "$pin_run/slots/slot-0/ABS/ABS-S1"
+ln -s "$pin_run" "$pin_root/current"
+printf '%s\n' '{"app_dir":"/tmp/app","base_port":20700,"code_sha":"0000000000000000000000000000000000000000","harness_sha":"0000000000000000000000000000000000000000","deployment_run_url":"https://example.test/stale","evidence_only":false,"judge_executor":"codex","judge_model":"gpt-stale-judge","judge_reasoning_effort":"high","scenarios":["ABS-S1"],"slots":1,"stateful_area_lanes":["ABS"],"worker_executor":"codex","worker_model":"gpt-stale","worker_reasoning_effort":"high"}' > "$pin_run/manifest.json"
+printf '%s\n' '{"schema":"hill-climb-fleet-state.v1","status":"running","detail":"test"}' > "$pin_run/state.json"
+: > "$pin_run/events.log"
+pinned_sha="1111111111111111111111111111111111111111"
+pin_observed="$(HOME="$pin_home" FLEET_STATE_ROOT="$pin_root" \
+  FLEET_SHA="$pinned_sha" FLEET_HARNESS_SHA="$pinned_sha" \
+  FLEET_DEPLOYMENT_RUN_URL='https://example.test/pinned' \
+  FLEET_WORKER_MODEL=gpt-pinned FLEET_BASE_PORT=20900 \
+  "$script" _test-stop-pin)"
+pin_expected="$(printf '%s\t%s\t%s\tgpt-pinned\t20900' \
+  "$pinned_sha" "$pinned_sha" 'https://example.test/pinned')"
+if [ "$pin_observed" != "$pin_expected" ]; then
+  echo "FAIL: stopping the previous run overwrote the received pin" >&2
+  printf 'expected: %s\nobserved: %s\n' "$pin_expected" "$pin_observed" >&2
+  exit 1
+fi
+python3 - "$pin_run/state.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    assert json.load(stream)["status"] == "stopped"
+PY
+
+grep -q 'received pin was overwritten before the run was created' "$script" \
+  || { echo "FAIL: start_fleet does not refuse a drifted pin" >&2; exit 1; }
+
+# The RECEIPT, not the send: write a real manifest from a received pin and
+# assert the run can prove which deployment it graded and how the pin arrived.
+receipt_root="$status_root/receipt"
+mkdir -p "$receipt_root"
+FLEET_SOURCE_REPO="$repo_root" \
+  FLEET_SHA="$pinned_sha" FLEET_HARNESS_SHA="$good_sha" \
+  FLEET_DEPLOYMENT_RUN_URL='https://github.com/realgenekim/curtaincall-cfp/actions/runs/32010388563' \
+  FLEET_PIN_SOURCE=explicit-pin \
+  FLEET_INSTALL_RECEIPT_OPERATION_SHA256="$(printf 'a%.0s' {1..64})" \
+  FLEET_INSTALL_RECEIPT_HARNESS_SHA="$good_sha" \
+  FLEET_INSTALL_RECEIPT_INSTALLER_SHA="$pinned_sha" \
+  "$script" _test-write-manifest "$receipt_root/manifest.json"
+python3 - "$receipt_root/manifest.json" "$pinned_sha" "$good_sha" <<'PY'
+import json
+import sys
+
+path, pinned_sha, harness_sha = sys.argv[1:]
+with open(path, encoding="utf-8") as stream:
+    manifest = json.load(stream)
+pin = manifest["received_pin"]
+assert manifest["code_sha"] == pinned_sha, manifest["code_sha"]
+assert manifest["harness_sha"] == harness_sha, manifest["harness_sha"]
+assert pin["code_sha"] == pinned_sha, pin
+assert pin["harness_sha"] == harness_sha, pin
+assert pin["deployment_run_url"].endswith("/actions/runs/32010388563"), pin
+assert pin["deployment_run_id"] == "32010388563", pin
+assert pin["pin_source"] == "explicit-pin", pin
+install = manifest["install_receipt"]
+assert install["schema"] == "eval-harness-install.v5", install
+assert install["operation_sha256"] == "a" * 64, install
+assert install["harness_sha"] == harness_sha, install
+assert install["installer_sha"] == pinned_sha, install
+PY
+
+# An unknown pin mode is a refusal, not a silently recorded string.
+if FLEET_SOURCE_REPO="$repo_root" FLEET_SHA="$pinned_sha" FLEET_HARNESS_SHA="$good_sha" \
+    FLEET_DEPLOYMENT_RUN_URL='https://example.test/actions/runs/1' \
+    FLEET_PIN_SOURCE=guessed \
+    FLEET_INSTALL_RECEIPT_OPERATION_SHA256="$(printf 'a%.0s' {1..64})" \
+    FLEET_INSTALL_RECEIPT_HARNESS_SHA="$good_sha" \
+    FLEET_INSTALL_RECEIPT_INSTALLER_SHA="$pinned_sha" \
+    "$script" _test-write-manifest "$receipt_root/rejected.json" >/dev/null 2>&1; then
+  echo "FAIL: an unrecognized pin source was accepted into the run receipt" >&2
+  exit 1
+fi
+
+echo "PASS fleet topology: provenance, stateful lanes, and live progress are explicit"

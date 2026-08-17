@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+# Fast filesystem contract checks for append-only judgement folding.
+set -euo pipefail
+
+repo_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+fold="$repo_root/bin/hill-climb-judgement-fold"
+test_root="$(mktemp -d "${TMPDIR:-/tmp}/judgement-fold-test.XXXXXX")"
+trap 'rm -rf -- "$test_root"' EXIT
+registry="$test_root/active-registry.json"
+jq '.criteria["CFP-16"].status = "active"' \
+  "$repo_root/resources/hill-climb-predicate-registry.json" >"$registry"
+
+make_candidates() {
+  local root=$1
+  python3 - "$root" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+root.mkdir(parents=True)
+input_root = root.parent.parent / "judgement-inputs" / "call-for-papers"
+input_root.mkdir(parents=True)
+(input_root / "brief.txt").write_text("fixture rubric brief\n")
+(input_root / "input.sha256").write_text("fixture immutable input manifest\n")
+scores = [90.0, 20.0, 60.0]
+verdicts = ["pass", "fail", "partial"]
+
+def write(path, value):
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+for sample, (score, verdict) in enumerate(zip(scores, verdicts), 1):
+    attempt = root / f"attempt-{sample:04d}"
+    attempt.mkdir()
+    (attempt / "prompt.txt").write_text("fixture exact prompt")
+    judgement = {
+        "items": [
+            {"id": "CFP-01", "verdict": verdict, "confidence": "high",
+             "reasoning": f"qualitative sample {sample}", "evidence_refs": ["capture:one"]},
+            {"id": "CFP-16", "verdict": "pass", "confidence": "high",
+             "reasoning": "semantic residual passes", "evidence_refs": ["capture:two"]},
+        ],
+        "defects": [],
+        "area_notes": f"sample {sample}",
+    }
+    write(attempt / "judgement.json", judgement)
+    judgement_sha = digest(attempt / "judgement.json")
+    invocation = {
+        "schema": "hill-climb-judge-invocation.v1",
+        "area": "call-for-papers", "sample": sample,
+        "executor": "codex", "model": "fixture-model", "reasoning_effort": "high",
+        "prompt_sha256": digest(attempt / "prompt.txt"),
+        "input_sha256": digest(input_root / "input.sha256"),
+        "rubric_sha256": digest(input_root / "brief.txt"),
+        "eval_kit_archive_sha256": "8" * 64,
+        "eval_config_sha256": "9" * 64,
+    }
+    output = {
+        "schema": "hill-climb-judge-output.v1",
+        "area": "call-for-papers", "sample": sample,
+        "path": "judgement.json", "sha256": judgement_sha,
+    }
+    score_receipt = {
+        "schema": "hill-climb-candidate-score.v1",
+        "area": "call-for-papers", "sample": sample,
+        "judgement_sha256": judgement_sha,
+        "computed_score_pct": score, "score_pct": score, "coverage_pct": 100.0,
+        "report_sha256": "",
+        "score_code_sha256": "8" * 64,
+        "eval_config_sha256": "9" * 64,
+    }
+    write(attempt / "candidate-report.json", {"fixture_score": score})
+    score_receipt["report_sha256"] = digest(attempt / "candidate-report.json")
+    write(attempt / "invocation.json", invocation)
+    write(attempt / "judgement-receipt.json", output)
+    write(attempt / "score-receipt.json", score_receipt)
+    candidate = {
+        "schema": "hill-climb-judgement-candidate.v1",
+        "status": "enrolled", "area": "call-for-papers", "sample": sample,
+        "attempt": attempt.name,
+        "receipts": {
+            "invocation_sha256": digest(attempt / "invocation.json"),
+            "judgement_sha256": digest(attempt / "judgement-receipt.json"),
+            "score_sha256": digest(attempt / "score-receipt.json"),
+        },
+    }
+    write(attempt / "candidate.json", candidate)
+PY
+}
+
+candidate_root="$test_root/run/judgement-candidates/call-for-papers"
+predicate_root="$test_root/predicates"
+mkdir -p "$predicate_root"
+make_candidates "$candidate_root"
+
+python3 - "$predicate_root/CFP-16.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "w", encoding="utf-8") as stream:
+    json.dump({
+        "schema": "hill-climb-predicate-verdict.v1",
+        "rubric_id": "CFP-16",
+        "rubric_clause_id": "CFP-16/answer-post-refused-after-close",
+        "rubric_spec_sha256": "RUBRIC_SHA_PLACEHOLDER",
+        "outcome": "pass",
+        "reason_code": "closed-answer-post-returned-4xx",
+        "fact_receipts": [
+            {"sha256": "4" * 64, "byte_count": 81, "locator": "receiver://fixture/request"},
+            {"sha256": "5" * 64, "byte_count": 42, "locator": "receiver://fixture/response"},
+        ],
+        "test": {"predicate_code_sha256": "6" * 64,
+                 "test_sha256": "7" * 64,
+                 "case": "closed-cfp-answer-post-predicate-test"},
+    }, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+PY
+rubric_sha=$(sha256sum "$test_root/run/judgement-inputs/call-for-papers/brief.txt" | awk '{print $1}')
+python3 - "$predicate_root/CFP-16.json" "$rubric_sha" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    payload = json.load(stream)
+payload["rubric_spec_sha256"] = sys.argv[2]
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(payload, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+PY
+
+output="$test_root/folded.json"
+receipt="$test_root/fold-receipt.json"
+"$fold" --area call-for-papers --sample-count 3 \
+  --candidates "$candidate_root" --predicate-registry "$registry" \
+  --predicate-results "$predicate_root" --output "$output" --receipt "$receipt" >/dev/null
+
+jq -e '
+  .items[0].id == "CFP-01" and .items[0].verdict == "partial" and
+  .items[1].id == "CFP-16" and .items[1].verdict == "pass" and
+  (.items[1].reasoning | contains("Deterministic required clause passed"))
+' "$output" >/dev/null
+jq -e '
+  .selected_sample == 3 and .scores_pct == [90,20,60] and
+  .computed_scores_pct == [90,20,60] and
+  .fold_status == "complete" and .noise_calibration.status == "insufficient" and
+  .noise_calibration.delta_render == "variance-uncalibrated" and
+  .dispersion.coverage_min_pct == 100 and .dispersion.iqr_pct == 70 and
+  .dispersion.mad_pct == 30 and .dispersion.max_pct == 90 and
+  .dispersion.median_pct == 60 and .dispersion.min_pct == 20 and
+  ((.dispersion.scaled_mad_pct - 44.478) | fabs) < 0.000001 and
+  .dispersion.status == "descriptive-only" and
+  .predicate_results == [{"fact_receipt_count":2,"receipt_sha256":.predicate_results[0].receipt_sha256,
+    "residual_model_required":true,"rubric_clause_id":"CFP-16/answer-post-refused-after-close",
+    "rubric_id":"CFP-16","status":"pass"}]
+' "$receipt" >/dev/null
+
+# A malformed judge-output receipt is a typed refused sample, not a run-killer.
+cp -a "$test_root/run" "$test_root/malformed-run"
+malformed_root="$test_root/malformed-run/judgement-candidates/call-for-papers"
+python3 - "$malformed_root/attempt-0003" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+attempt = pathlib.Path(sys.argv[1])
+receipt_path = attempt / "judgement-receipt.json"
+receipt = json.loads(receipt_path.read_text())
+receipt["sha256"] = ""
+receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+score_path = attempt / "score-receipt.json"
+score = json.loads(score_path.read_text())
+score["judgement_sha256"] = ""
+score_path.write_text(json.dumps(score, indent=2, sort_keys=True) + "\n")
+candidate_path = attempt / "candidate.json"
+candidate = json.loads(candidate_path.read_text())
+candidate["receipts"]["judgement_sha256"] = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+candidate["receipts"]["score_sha256"] = hashlib.sha256(score_path.read_bytes()).hexdigest()
+candidate_path.write_text(json.dumps(candidate, indent=2, sort_keys=True) + "\n")
+PY
+"$fold" --area call-for-papers --sample-count 3 \
+  --candidates "$malformed_root" --predicate-registry "$registry" \
+  --predicate-results "$predicate_root" \
+  --output "$test_root/malformed-output.json" --receipt "$test_root/malformed-receipt.json" >/dev/null
+jq -e '
+  .fold_status == "complete" and .refused_sample_n == 1 and
+  .refused_samples[0].sample == 3 and
+  (.refused_samples[0].reason | contains("judge-receipt-malformed"))
+' "$test_root/malformed-receipt.json" >/dev/null
+
+# Idempotent replay verifies the existing bytes rather than replacing them.
+before_output=$(sha256sum "$output" | awk '{print $1}')
+before_receipt=$(sha256sum "$receipt" | awk '{print $1}')
+"$fold" --area call-for-papers --sample-count 3 \
+  --candidates "$candidate_root" --predicate-registry "$registry" \
+  --predicate-results "$predicate_root" --output "$output" --receipt "$receipt" >/dev/null
+[ "$before_output" = "$(sha256sum "$output" | awk '{print $1}')" ]
+[ "$before_receipt" = "$(sha256sum "$receipt" | awk '{print $1}')" ]
+
+# A folded output does not launder later mutation of an enrolled component.
+cp "$candidate_root/attempt-0001/prompt.txt" "$test_root/prompt.good"
+printf 'changed prompt\n' >"$candidate_root/attempt-0001/prompt.txt"
+if "$fold" --area call-for-papers --sample-count 3 \
+    --candidates "$candidate_root" --predicate-registry "$registry" \
+    --predicate-results "$predicate_root" --output "$output" --receipt "$receipt" \
+    >"$test_root/mutated.out" 2>"$test_root/mutated.err"; then
+  echo "FAIL: mutated enrolled component survived fold verification" >&2
+  exit 1
+fi
+grep -q 'invocation prompt hash changed' "$test_root/mutated.err"
+cp "$test_root/prompt.good" "$candidate_root/attempt-0001/prompt.txt"
+
+# Missing deterministic facts are unverified; model fallback remains forbidden.
+missing_output="$test_root/missing-folded.json"
+missing_receipt="$test_root/missing-fold-receipt.json"
+mkdir "$test_root/no-predicates"
+"$fold" --area call-for-papers --sample-count 3 \
+  --candidates "$candidate_root" --predicate-registry "$registry" \
+  --predicate-results "$test_root/no-predicates" \
+  --output "$missing_output" --receipt "$missing_receipt" >/dev/null
+jq -e '
+  .items[1].id == "CFP-16" and .items[1].verdict == "cannot_judge" and
+  (.items[1].reasoning | contains("model fallback is forbidden"))
+' "$missing_output" >/dev/null
+
+# A completed below-gate sample remains enrolled, but its eligible score is
+# null and no median/dispersion can be published from the fold.
+cp -a "$test_root/run" "$test_root/low-coverage-run"
+low_root="$test_root/low-coverage-run/judgement-candidates/call-for-papers"
+python3 - "$low_root/attempt-0002" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+attempt = pathlib.Path(sys.argv[1])
+score_path = attempt / "score-receipt.json"
+score = json.loads(score_path.read_text())
+score["coverage_pct"] = 55.0
+score["score_pct"] = None
+score_path.write_text(json.dumps(score, indent=2, sort_keys=True) + "\n")
+candidate_path = attempt / "candidate.json"
+candidate = json.loads(candidate_path.read_text())
+candidate["receipts"]["score_sha256"] = hashlib.sha256(score_path.read_bytes()).hexdigest()
+candidate_path.write_text(json.dumps(candidate, indent=2, sort_keys=True) + "\n")
+PY
+"$fold" --area call-for-papers --sample-count 3 \
+  --candidates "$low_root" --predicate-registry "$registry" \
+  --predicate-results "$predicate_root" --output "$test_root/low-output.json" \
+  --receipt "$test_root/low-receipt.json" >/dev/null
+jq -e '
+  .fold_status == "coverage-withheld" and .valid_score_n == 2 and
+  .coverage_gate_failures == [2] and .scores_pct == [90,null,60] and
+  .computed_scores_pct == [90,20,60] and .selected_sample == null and
+  .selected_judgement_sha256 == null and .withheld_projection_sample == 3 and
+  .dispersion.status == "withheld-coverage" and .dispersion.median_pct == null and
+  .dispersion.mad_pct == null and .dispersion.iqr_pct == null
+' "$test_root/low-receipt.json" >/dev/null
+
+# A mismatched invocation tuple cannot be folded.
+cp -a "$test_root/run" "$test_root/bad-run"
+bad_root="$test_root/bad-run/judgement-candidates/call-for-papers"
+python3 - "$bad_root/attempt-0003" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+attempt = pathlib.Path(sys.argv[1])
+invocation = json.loads((attempt / "invocation.json").read_text())
+invocation["model"] = "different-model"
+(attempt / "invocation.json").write_text(json.dumps(invocation, indent=2, sort_keys=True) + "\n")
+candidate = json.loads((attempt / "candidate.json").read_text())
+candidate["receipts"]["invocation_sha256"] = hashlib.sha256(
+    (attempt / "invocation.json").read_bytes()).hexdigest()
+(attempt / "candidate.json").write_text(json.dumps(candidate, indent=2, sort_keys=True) + "\n")
+PY
+if "$fold" --area call-for-papers --sample-count 3 \
+    --candidates "$bad_root" --predicate-registry "$registry" \
+    --predicate-results "$predicate_root" --output "$test_root/bad.json" \
+    --receipt "$test_root/bad-receipt.json" >"$test_root/bad.out" 2>"$test_root/bad.err"; then
+  echo "FAIL: mismatched model tuple reached the fold" >&2
+  exit 1
+fi
+grep -q 'candidate invocation tuples differ' "$test_root/bad.err"
+
+# An existing output without its receipt is a typed refusal, never an overwrite.
+orphan="$test_root/orphan.json"
+printf '{}\n' > "$orphan"
+if "$fold" --area call-for-papers --sample-count 3 \
+    --candidates "$candidate_root" --predicate-registry "$registry" \
+    --predicate-results "$predicate_root" --output "$orphan" \
+    --receipt "$test_root/orphan-receipt.json" >"$test_root/orphan.out" 2>"$test_root/orphan.err"; then
+  echo "FAIL: orphaned output was accepted" >&2
+  exit 1
+fi
+grep -q 'must either both exist or both be absent' "$test_root/orphan.err"
+[ "$(cat "$orphan")" = '{}' ]
+
+echo "PASS judgement fold: N=3 median, immutable receipts, predicate authority, no overwrite"

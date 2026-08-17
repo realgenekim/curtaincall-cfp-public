@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Login treatments + promise copy + all-events placement</title>
+<style>
+  :root {
+    --paper:#FAF7F2; --paper-deep:#F1EADD; --card:#FFFFFF;
+    --ink:#221E17; --ink-soft:#3B342A; --muted:#7C7264; --muted-2:#948A7B;
+    --kicker:#9C9284; --line:#E9E1D5; --line-soft:#EFE8DC;
+    --field-line:#DDD4C6; --placeholder:#B4A996;
+    --link:#1E62A8; --go:#1B7A4B; --danger:#B3261E;
+    --highlight:#FFF1B8; --focus-line:#B9924A;
+    --ghost-line:#DFD5C4; --ghost-ink:#C4B9A6;
+    --radius:7px; --radius-lg:12px;
+    --font-display:'Fraunces','Iowan Old Style','Palatino Linotype',Georgia,serif;
+    --font-ui:'Source Sans 3',system-ui,'Seravek','Avenir Next','Segoe UI',sans-serif;
+  }
+  @font-face { font-family:'Fraunces';
+    src:url('http://localhost:20501/vendor/fraunces-latin.woff2') format('woff2');
+    font-weight:100 900; font-style:normal; font-display:swap; }
+  @font-face { font-family:'Source Sans 3';
+    src:url('http://localhost:20501/vendor/source-sans-3-latin.woff2') format('woff2');
+    font-weight:200 900; font-style:normal; font-display:swap; }
+
+  * { box-sizing:border-box; margin:0; }
+  body { background:#EDE7DC; font-family:var(--font-ui); color:var(--ink); padding:28px; }
+  h1 { font-family:var(--font-display); font-size:26px; margin-bottom:4px; }
+  .sub { color:var(--muted); margin-bottom:24px; font-size:14.5px; max-width:70ch; }
+  .lbl { font-family:var(--font-display); font-weight:700; font-size:17px; margin:34px 0 3px; }
+  .why { color:var(--muted); font-size:12.5px; margin-bottom:12px; max-width:640px; }
+  a { color:var(--link); text-decoration:none; }
+  .g-btn { display:inline-flex; align-items:center; gap:10px; background:var(--link); color:#fff;
+           border-radius:var(--radius); padding:12px 22px; font-weight:600; font-size:16px; }
+  .g-btn .g { background:#fff; color:var(--link); border-radius:3px; width:22px; height:22px;
+              display:inline-flex; align-items:center; justify-content:center;
+              font-weight:800; font-family:Georgia,serif; }
+  .kick { font-size:11.5px; letter-spacing:.1em; text-transform:uppercase;
+          color:var(--kicker); font-weight:600; }
+
+  /* T1 — the marquee (centered, Google-only, public-CFP escape) */
+  .t1 { background:var(--paper); border:1px solid var(--line); border-radius:14px;
+        max-width:560px; padding:52px 48px 40px; text-align:center; }
+  .t1 .brand { font-family:var(--font-display); font-weight:700; font-size:17px;
+               margin-bottom:30px; }
+  .t1 h2 { font-family:var(--font-display); font-size:29px; line-height:1.2; margin-bottom:8px; }
+  .t1 .sub2 { color:var(--muted); font-size:15px; margin-bottom:28px; }
+  .t1 .fine { color:var(--muted); font-size:13px; margin-top:26px; padding-top:18px;
+              border-top:1px solid var(--line); }
+  .t1 .fine b { color:var(--ink-soft); }
+
+  /* T2 — the playbill */
+  .t2 { background:var(--paper); border:1px solid var(--line); border-radius:14px;
+        max-width:560px; padding:40px 48px 36px; }
+  .t2 .top { text-align:center; border-bottom:3px double var(--field-line);
+             padding-bottom:18px; margin-bottom:18px; }
+  .t2 .top .kick { display:block; margin-bottom:6px; }
+  .t2 .top h2 { font-family:var(--font-display); font-size:34px; font-weight:800; }
+  .t2 .welcome { text-align:center; font-family:var(--font-display); font-size:18px;
+                 font-style:italic; color:var(--ink-soft); margin-bottom:20px; line-height:1.4; }
+  .t2 .cast { max-width:360px; margin:0 auto 24px; }
+  .t2 .cast .row { display:flex; align-items:baseline; gap:8px; font-size:14.5px;
+                   padding:5px 0; }
+  .t2 .cast .row .dots { flex:1; border-bottom:1.5px dotted var(--field-line); }
+  .t2 .cast .row b { font-family:var(--font-display); }
+  .t2 .cast .row .you { color:var(--muted); font-style:italic; }
+  .t2 .act { text-align:center; }
+  .t2 .fine { text-align:center; color:var(--muted); font-size:13px; margin-top:22px; }
+
+  /* T3 — the split door, welcome-first */
+  .t3 { background:var(--paper); border:1px solid var(--line); border-radius:14px;
+        max-width:880px; overflow:hidden; }
+  .t3 .head { padding:34px 44px 26px; border-bottom:1px solid var(--line); }
+  .t3 .head .brand { font-family:var(--font-display); font-weight:700; font-size:16px;
+                     margin-bottom:16px; }
+  .t3 .head h2 { font-family:var(--font-display); font-size:27px; line-height:1.25;
+                 max-width:24ch; }
+  .t3 .body { display:grid; grid-template-columns:1fr 1fr; }
+  .t3 .doorL { padding:28px 44px 34px; }
+  .t3 .doorL .kick { display:block; margin-bottom:10px; }
+  .t3 .doorL .hint { color:var(--muted); font-size:12.5px; margin-top:8px; }
+  .t3 .doorR { padding:28px 40px 34px; background:var(--paper-deep);
+               border-left:1px solid var(--line); }
+  .t3 .doorR .kick { display:block; margin-bottom:10px; }
+  .t3 .doorR p { font-size:14.5px; color:var(--ink-soft); line-height:1.5; margin-bottom:10px; }
+
+  /* all-events placement snippets */
+  .railbits { display:flex; gap:24px; flex-wrap:wrap; }
+  .railbit { width:260px; }
+  .railbit .cap { font-weight:600; font-size:13px; margin-bottom:6px; }
+  .sect { background:var(--card); border:1px solid var(--line); border-radius:var(--radius-lg);
+          padding:10px 12px; }
+  .role { font-family:var(--font-display); font-weight:700; font-size:14.5px;
+          padding-bottom:7px; margin-bottom:4px; border-bottom:1px solid var(--line-soft);
+          display:flex; justify-content:space-between; align-items:baseline; }
+  .role small { font-family:var(--font-ui); font-weight:400; font-size:11.5px; color:var(--muted); }
+  .role .see { font-family:var(--font-ui); font-weight:400; font-size:12px; white-space:nowrap; }
+  .ghost-box { border:1.5px dashed var(--ghost-line); border-radius:var(--radius);
+               padding:9px 11px; margin:6px 0 2px; }
+  .ghost-box b { font-family:var(--font-display); font-size:14.5px; color:var(--muted);
+                 display:block; font-weight:600; }
+  .ghost-box .row2 { display:flex; gap:14px; font-size:12.5px; margin-top:2px; }
+  .sb-item { display:block; font-size:14px; color:var(--muted); padding:4px 2px; }
+
+  /* promise copy options */
+  .promises { display:flex; gap:20px; flex-wrap:wrap; }
+  .promise { width:300px; background:var(--paper); border:1px solid var(--line);
+             border-radius:var(--radius-lg); padding:16px 18px; }
+  .promise .kick { display:block; margin-bottom:8px; }
+  .promise p { font-family:var(--font-display); font-size:15.5px; line-height:1.45;
+               color:var(--ink-soft); }
+  .promise .note { font-family:var(--font-ui); color:var(--muted); font-size:12px;
+                   margin-top:8px; }
+</style>
+</head>
+<body>
+<h1>Login treatments · promise copy · all-events placement</h1>
+<p class="sub">All three logins lead with your welcome line. Honesty rule baked in: prod has no SMTP, so the email/magic-link form does NOT appear — Google is the door (email returns when a mailer exists; dev keeps its echoed link either way).</p>
+
+<p class="lbl">Login T1 — The marquee</p>
+<p class="why">Centered, one act. The welcome line IS the headline; one button; the "no sign-in needed to submit" note carries the only other door that matters.</p>
+<div class="t1">
+  <div class="brand">Curtain Call</div>
+  <h2>Whether you're an organizer, a speaker, or a reviewer —<br>we're glad you're here.</h2>
+  <div class="sub2">One sign-in covers all three. No passwords, no forms.</div>
+  <span class="g-btn"><span class="g">G</span> Continue with Google</span>
+  <div class="fine">Just submitting a talk? <b>No sign-in needed</b> — the call-for-speakers page is public. Your account happens when you press submit.</div>
+</div>
+
+<p class="lbl">Login T2 — The playbill</p>
+<p class="why">Leans into the name. The three hats as a cast list — every role played by you. Warmest of the three; most memorable; slight risk of cute.</p>
+<div class="t2">
+  <div class="top"><span class="kick">Curtain Call presents</span><h2>Tonight's Roles</h2></div>
+  <div class="welcome">Whether you're an organizer, a speaker, or a reviewer —<br>we're glad you're here.</div>
+  <div class="cast">
+    <div class="row"><b>The Organizer</b><span class="dots"></span><span class="you">played by you</span></div>
+    <div class="row"><b>The Speaker</b><span class="dots"></span><span class="you">played by you</span></div>
+    <div class="row"><b>The Reviewer</b><span class="dots"></span><span class="you">played by you</span></div>
+  </div>
+  <div class="act"><span class="g-btn"><span class="g">G</span> Take the stage — sign in with Google</span></div>
+  <div class="fine">Submitting a talk needs no sign-in — the call-for-speakers page is public.</div>
+</div>
+
+<p class="lbl">Login T3 — Welcome-first split</p>
+<p class="why">The welcome line owns a full-width header; below it, two equal doors: sign in (Google) vs. just-submit (public CFP). Treats the speaker-without-account path as a first-class door, not fine print.</p>
+<div class="t3">
+  <div class="head">
+    <div class="brand">Curtain Call</div>
+    <h2>Whether you're an organizer, a speaker, or a reviewer — we're glad you're here.</h2>
+  </div>
+  <div class="body">
+    <div class="doorL">
+      <span class="kick">Sign in — one account covers all three roles</span>
+      <span class="g-btn"><span class="g">G</span> Continue with Google</span>
+      <div class="hint">New or returning — any Google account works. No passwords.</div>
+    </div>
+    <div class="doorR">
+      <span class="kick">Just here to submit a talk?</span>
+      <p>No sign-in needed. The call-for-speakers page is public — your account happens when you press submit.</p>
+      <a href="#">Find your event's call →</a>
+    </div>
+  </div>
+</div>
+
+<p class="lbl">All-events placement (rail, organizer card)</p>
+<p class="why">"+ New event" is gone from the rail top in both. Two homes for All events:</p>
+<div class="railbits">
+  <div class="railbit">
+    <p class="cap">A — in the role header, right side</p>
+    <div class="sect">
+      <div class="role"><span>As an organizer</span><a class="see" href="#">see all events →</a></div>
+      <div class="ghost-box"><b>Your event will live here</b><a href="#" style="font-size:12.5px">Create it →</a></div>
+      <div class="sb-item">① Create event …</div>
+    </div>
+  </div>
+  <div class="railbit">
+    <p class="cap">B — second line of the ghost box</p>
+    <div class="sect">
+      <div class="role"><span>As an organizer</span></div>
+      <div class="ghost-box"><b>Your event will live here</b>
+        <div class="row2"><a href="#">Create it →</a><a href="#">See all events →</a></div>
+      </div>
+      <div class="sb-item">① Create event …</div>
+    </div>
+  </div>
+</div>
+
+<p class="lbl">The promise block — copy variations (replaces the queue/table quote)</p>
+<p class="why">Same slot at the bottom of the welcome; pick the one that sounds like us.</p>
+<div class="promises">
+  <div class="promise"><span class="kick">Our promise to you</span>
+    <p>Nothing you write here is ever lost, and nothing is ever deleted. The whole story of your call, kept.</p>
+    <div class="note">The append-only ledger as a promise, not a feature.</div>
+  </div>
+  <div class="promise"><span class="kick">Why we built this</span>
+    <p>24 conferences, 12 years, five tools we hated. This is the one we always wanted.</p>
+    <div class="note">The scar-tissue credential — concrete, human.</div>
+  </div>
+  <div class="promise"><span class="kick">Our promise to you</span>
+    <p>Ten minutes to a live call for papers. Every score and comment on one page. And you can always change your mind — it remembers everything.</p>
+    <div class="note">Three product truths in one breath.</div>
+  </div>
+  <div class="promise"><span class="kick">The house rule</span>
+    <p>Speakers never fight the tool, reviewers never hunt for context, and organizers never lose the thread.</p>
+    <div class="note">One line per hat — rhymes with the welcome.</div>
+  </div>
+</div>
+
+</body>
+</html>

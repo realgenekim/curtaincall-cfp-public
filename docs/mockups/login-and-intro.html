@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Login + post-login intro — mockups</title>
+<style>
+  :root {
+    --paper:#FAF7F2; --paper-deep:#F1EADD; --card:#FFFFFF;
+    --ink:#221E17; --ink-soft:#3B342A; --muted:#7C7264; --muted-2:#948A7B;
+    --kicker:#9C9284; --line:#E9E1D5; --line-soft:#EFE8DC;
+    --field-line:#DDD4C6; --placeholder:#B4A996;
+    --link:#1E62A8; --go:#1B7A4B; --go-ink:#fff; --danger:#B3261E;
+    --highlight:#FFF1B8; --focus-line:#B9924A;
+    --ghost-line:#DFD5C4; --ghost-ink:#C4B9A6;
+    --radius:7px; --radius-lg:12px;
+    --font-display:'Fraunces','Iowan Old Style','Palatino Linotype',Georgia,serif;
+    --font-ui:'Source Sans 3',system-ui,'Seravek','Avenir Next','Segoe UI',sans-serif;
+  }
+  @font-face { font-family:'Fraunces';
+    src:url('http://localhost:20501/vendor/fraunces-latin.woff2') format('woff2');
+    font-weight:100 900; font-style:normal; font-display:swap; }
+  @font-face { font-family:'Source Sans 3';
+    src:url('http://localhost:20501/vendor/source-sans-3-latin.woff2') format('woff2');
+    font-weight:200 900; font-style:normal; font-display:swap; }
+
+  * { box-sizing:border-box; margin:0; }
+  body { background:#EDE7DC; font-family:var(--font-ui); color:var(--ink); padding:28px; }
+  h1 { font-family:var(--font-display); font-size:26px; margin-bottom:4px; }
+  .sub { color:var(--muted); margin-bottom:24px; font-size:14.5px; }
+  .mock-label { font-family:var(--font-display); font-weight:700; font-size:17px;
+                margin:30px 0 3px; }
+  .mock-why { color:var(--muted); font-size:12.5px; margin-bottom:12px; max-width:640px; }
+
+  a { color:var(--link); text-decoration:none; }
+  .btn { display:inline-block; border-radius:var(--radius); font-weight:600;
+         font-size:15px; padding:10px 18px; border:none; cursor:pointer;
+         font-family:var(--font-ui); }
+  .btn-primary { background:var(--link); color:#fff; }
+  .btn-go { background:var(--go); color:var(--go-ink); }
+  .kick { font-size:11.5px; letter-spacing:.1em; text-transform:uppercase;
+          color:var(--kicker); font-weight:600; }
+
+  /* ═══ LOGIN ═══ */
+  .login-page { background:var(--paper); border:1px solid var(--line); border-radius:14px;
+                max-width:920px; overflow:hidden; display:grid;
+                grid-template-columns: 1.05fr .95fr; }
+  .lp-left { padding:44px 44px 40px; }
+  .lp-brand { font-family:var(--font-display); font-weight:700; font-size:17px; margin-bottom:34px; }
+  .lp-left h2 { font-family:var(--font-display); font-size:30px; line-height:1.15; margin-bottom:10px; }
+  .lp-thesis { color:var(--ink-soft); font-size:15.5px; line-height:1.5; max-width:38ch; margin-bottom:26px; }
+  .lp-google { display:flex; align-items:center; gap:10px; background:var(--link); color:#fff;
+               border-radius:var(--radius); padding:11px 18px; font-weight:600; font-size:15px;
+               width:fit-content; }
+  .lp-google .g { background:#fff; color:var(--link); border-radius:3px; width:20px; height:20px;
+                  display:inline-flex; align-items:center; justify-content:center;
+                  font-weight:800; font-family:Georgia,serif; }
+  .lp-hint { color:var(--muted); font-size:12.5px; margin:7px 0 22px; }
+  .lp-or { display:flex; align-items:center; gap:10px; color:var(--muted-2); font-size:12px;
+           text-transform:uppercase; letter-spacing:.08em; margin-bottom:14px; max-width:340px; }
+  .lp-or::before,.lp-or::after { content:""; flex:1; border-top:1px solid var(--line); }
+  .lp-email { display:flex; gap:8px; max-width:360px; }
+  .lp-email input { flex:1; border:1px solid var(--field-line); border-radius:var(--radius);
+                    padding:10px 12px; font-size:15px; font-family:var(--font-ui);
+                    background:var(--card); color:var(--ink); }
+  .lp-email input::placeholder { color:var(--placeholder); }
+  .lp-foot { margin-top:26px; padding-top:16px; border-top:1px solid var(--line);
+             font-size:13.5px; color:var(--muted); max-width:44ch; }
+  .lp-right { background:var(--paper-deep); border-left:1px solid var(--line);
+              padding:44px 36px; }
+  .lp-right .kick { margin-bottom:14px; display:block; }
+  .hat { padding:13px 0; border-top:1px solid var(--line); }
+  .hat:first-of-type { border-top:none; padding-top:0; }
+  .hat b { font-family:var(--font-display); font-size:15.5px; display:block; margin-bottom:2px; }
+  .hat span { color:var(--muted); font-size:13.5px; line-height:1.45; display:block; }
+  .lp-quote { margin-top:22px; border-left:3px solid var(--focus-line); padding-left:12px;
+              font-style:italic; color:var(--ink-soft); font-size:13.5px; }
+
+  /* ═══ INTRO (post-login /events) ═══ */
+  .intro-page { background:var(--paper); border:1px solid var(--line); border-radius:14px;
+                max-width:1180px; padding:18px; display:flex; gap:20px; }
+  /* rail (V4r condensed) */
+  .rail { width:250px; flex:none; }
+  .sb-top { display:flex; justify-content:space-between; font-size:13.5px; margin-bottom:2px; }
+  .sect { background:var(--card); border:1px solid var(--line); border-radius:var(--radius-lg);
+          padding:9px 11px; margin-top:11px; }
+  .role { font-family:var(--font-display); font-weight:700; font-size:14px;
+          padding-bottom:6px; margin-bottom:3px; border-bottom:1px solid var(--line-soft); }
+  .role small { display:block; font-family:var(--font-ui); font-weight:400;
+                font-size:11px; color:var(--muted); }
+  .sb-group { font-size:10.5px; letter-spacing:.09em; text-transform:uppercase;
+              color:var(--kicker); margin:9px 0 1px 1px; }
+  .sb-item { display:block; font-size:14px; color:var(--muted); padding:4px 2px; }
+  .sb-item.lnk { color:var(--link); }
+  .ghost-box { border:1.5px dashed var(--ghost-line); border-radius:var(--radius);
+               padding:8px 10px; margin:5px 0 2px; }
+  .ghost-box b { font-family:var(--font-display); font-size:14px; color:var(--muted); display:block; }
+  .ghost-box a { font-size:12.5px; }
+  .tour { color:var(--go); font-weight:600; font-size:13px; padding:5px 2px; display:block; }
+  .quiet { margin-top:12px; padding-top:10px; border-top:1px solid var(--line);
+           font-size:12px; color:var(--muted); }
+
+  /* content column */
+  .intro-main { flex:1; padding:10px 8px 4px 6px; }
+  .intro-topline { display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; }
+  .intro-topline h2 { font-family:var(--font-display); font-size:24px; }
+  .intro-topline .acts { display:flex; gap:10px; align-items:center; }
+  .intro-grid { display:grid; grid-template-columns: 1.1fr .9fr; gap:26px; }
+  .greet { font-family:var(--font-display); font-size:26px; margin-bottom:6px; }
+  .thesis { color:var(--muted); font-size:15px; max-width:44ch; margin-bottom:18px; }
+  /* door cards echo the rail's role cards — same language, bigger */
+  .door { background:var(--card); border:1px solid var(--line); border-radius:var(--radius-lg);
+          padding:15px 17px; margin-bottom:13px; }
+  .door .kick { display:block; margin-bottom:5px; }
+  .door p { color:var(--ink-soft); font-size:14.5px; line-height:1.5; margin-bottom:10px; }
+  .door .doors { display:flex; flex-direction:column; gap:5px; font-size:14.5px; }
+  .showcase { background:var(--card); border:1px solid var(--line); border-radius:var(--radius-lg);
+              padding:16px 18px; }
+  .showcase .kick { display:block; margin-bottom:10px; }
+  .showcase h3 { font-family:var(--font-display); font-size:19px; margin-bottom:8px; }
+  .stats { display:flex; gap:14px; font-size:14px; margin-bottom:6px; }
+  .stats b { font-size:16px; }
+  .cov { color:var(--muted); font-size:13px; margin-bottom:12px; }
+  .talk { display:flex; gap:8px; font-size:13.5px; margin-bottom:6px; align-items:baseline; }
+  .talk .st { color:var(--focus-line); font-weight:700; white-space:nowrap; }
+  .quote { margin-top:16px; border-left:3px solid var(--focus-line); padding-left:12px;
+           font-style:italic; color:var(--ink-soft); font-size:13.5px; }
+</style>
+</head>
+<body>
+<h1>Login + post-login intro</h1>
+<p class="sub">Both pages in one design language: the login door sells the three hats before you're in; the intro screen's door cards echo the rail's role cards — same idiom at two scales.</p>
+
+<p class="mock-label">1 · The login page</p>
+<p class="mock-why">Split door: left is the act (Google first, magic-link fallback, no-account-needed note), right is the pitch — the three hats, so a stranger knows what signing in buys BEFORE they commit. Replaces the bare "Sign in" form.</p>
+
+<div class="login-page">
+  <div class="lp-left">
+    <div class="lp-brand">Curtain Call</div>
+    <h2>Sign in — or sign up.<br>Same door.</h2>
+    <p class="lp-thesis">No passwords, no account forms. Signing in <b>is</b> creating
+      your account — one account, three hats.</p>
+    <div class="lp-google"><span class="g">G</span> Sign in with Google</div>
+    <div class="lp-hint">New or returning — any Google account works.</div>
+    <div class="lp-or">or use email</div>
+    <div class="lp-email">
+      <input placeholder="you@example.com">
+      <button class="btn btn-primary">Send link</button>
+    </div>
+    <div class="lp-foot">Just submitting a talk? <b>No sign-in needed</b> —
+      the call-for-speakers page is public. An account happens when you press submit.</div>
+  </div>
+  <div class="lp-right">
+    <span class="kick">One account, three hats</span>
+    <div class="hat"><b>🎪 Organizer</b><span>Zero to open call-for-papers in ten minutes. Committee, form, public URL — live.</span></div>
+    <div class="hat"><b>🎤 Speaker</b><span>One profile that follows you to every conference. Every submission, one portal.</span></div>
+    <div class="hat"><b>🧐 Reviewer</b><span>One click from an invite email to the shared board. No new tool to learn.</span></div>
+    <div class="lp-quote">"They built software for a queue.<br>We built it for a table."</div>
+  </div>
+</div>
+
+<p class="mock-label">2 · The intro screen (first thing after sign-in)</p>
+<p class="mock-why">The V4r rail composed with the welcome. The three door cards use the SAME card language as the rail's role cards — the page teaches the sidebar. Live showcase panel on the right proves it's real.</p>
+
+<div class="intro-page">
+  <div class="rail">
+    <div class="sb-top"><a href="#">All events</a><a href="#">+ New event</a></div>
+    <div class="sect">
+      <div class="role">As an organizer<small>run the whole call on one calm page</small></div>
+      <div class="ghost-box"><b>Your event will live here</b><a href="#">Create it →</a></div>
+      <div class="sb-group">Create CFP — 3 steps</div>
+      <a class="sb-item lnk" href="#">① Create event</a>
+      <a class="sb-item" href="#">② Create CFP form</a>
+      <a class="sb-item" href="#">③ Create review committee</a>
+      <div class="sb-group">Review CFP proposals</div>
+      <a class="sb-item" href="#">Review Board</a>
+      <div class="sb-group">Decide &amp; tell</div>
+      <a class="sb-item" href="#">Inform Speakers</a>
+      <div class="sb-group">The show</div>
+      <a class="sb-item" href="#">Schedule</a>
+      <a class="sb-item" href="#">Public agenda</a>
+      <a class="sb-item" href="#">Exports &amp; API</a>
+      <a class="tour" href="#">▶ Replay a real CFP</a>
+    </div>
+    <div class="sect">
+      <div class="role">As a reviewer<small>every score &amp; comment, one table</small></div>
+      <a class="sb-item" href="#">Review Board</a>
+    </div>
+    <div class="sect">
+      <div class="role">As a speaker<small>one profile, every conference</small></div>
+      <a class="sb-item lnk" href="#">Update your profile</a>
+      <a class="sb-item lnk" href="#">Your submissions</a>
+    </div>
+    <div class="quiet">Comms · Log · Settings</div>
+  </div>
+
+  <div class="intro-main">
+    <div class="intro-topline">
+      <h2>Events</h2>
+      <div class="acts"><a href="#">▶ Start AIE replay demo</a>
+        <button class="btn btn-primary">Create event</button></div>
+    </div>
+    <div class="intro-grid">
+      <div>
+        <div class="greet">Welcome, Marvin 👋</div>
+        <p class="thesis">One account, three hats — organizer, speaker, reviewer.
+          There's no role to pick: just walk through a door.</p>
+        <div class="door">
+          <span class="kick">🎪 Running an event?</span>
+          <p>Create it here and you get a Program Committee, a seeded CFP form,
+            and a public call-for-speakers URL — live in minutes, not days.</p>
+          <button class="btn btn-primary">Create your first event →</button>
+        </div>
+        <div class="door">
+          <span class="kick">🎤 Speaking at one?</span>
+          <p>One profile, every conference — your bio, headshot, and links follow
+            you, so you never type them twice.</p>
+          <div class="doors"><a href="#">Update your speaker profile →</a>
+            <a href="#">Your submissions &amp; their statuses →</a></div>
+        </div>
+        <div class="door">
+          <span class="kick">🧐 Reviewing for a committee?</span>
+          <p>Organizers invite you — one click from the invite email lands you on
+            the shared board. Want to feel it first?</p>
+          <div class="doors"><a href="#">See a live review board →</a></div>
+        </div>
+        <div class="quote">"They built software for a queue. We built it for a table."
+          <a href="#">&nbsp;Read why we built this →</a></div>
+      </div>
+      <div>
+        <div class="showcase">
+          <span class="kick">A real one, running right now</span>
+          <h3>AI Engineer Code Summit</h3>
+          <div class="stats"><span><b>502</b> submissions</span><span><b>899</b> ratings</span></div>
+          <div class="cov">69% coverage</div>
+          <div class="talk"><span class="st">★ 4.8</span><span>What 18 Months of AI Code Review Did to Our Change Failure Rate</span></div>
+          <div class="talk"><span class="st">★ 4.3</span><span>Rebuilding Underwriting Around an LLM Without Rewriting the Mainframe</span></div>
+          <a href="#" style="display:inline-block;margin-top:8px;">See its public agenda →</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

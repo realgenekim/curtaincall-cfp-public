@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# Fast filesystem contract checks for evidence consolidation.
+set -euo pipefail
+
+repo_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+script="$repo_root/bin/consolidate-hill-climb"
+schema="$repo_root/resources/sbek-judgement.schema.json"
+test_root="$(mktemp -d "${TMPDIR:-/tmp}/fleet-consolidate-test.XXXXXX")"
+trap 'rm -rf -- "$test_root"' EXIT
+
+base_kit="$test_root/base-kit"
+run_dir="$test_root/run"
+mkdir -p "$base_kit/node_modules" "$run_dir/inputs" "$run_dir/app/bin" \
+  "$run_dir/app/resources" "$run_dir/slots/slot-0/CNT-S1/kit/runs/a/CNT-S1/screenshots"
+mkdir -p "$run_dir/slots/slot-1/ABS-S1/kit/runs/b/ABS-S1/screenshots"
+printf '{}\n' > "$base_kit/evalconfig.json"
+printf 'kit instructions\n' > "$base_kit/AGENTS.md"
+git init -q "$base_kit"
+git -C "$base_kit" config user.name fixture
+git -C "$base_kit" config user.email fixture@example.com
+# evalconfig.json is a pinned runtime input, not part of the evaluator archive.
+git -C "$base_kit" add AGENTS.md
+git -C "$base_kit" commit -qm eval-kit
+eval_kit_sha=$(git -C "$base_kit" rev-parse HEAD)
+install -m 0400 "$base_kit/evalconfig.json" "$run_dir/inputs/evalconfig.json"
+eval_config_sha=$(shasum -a 256 "$run_dir/inputs/evalconfig.json" | awk '{print $1}')
+cp "$repo_root/bin/capture-lineage" "$run_dir/app/bin/capture-lineage"
+cp "$repo_root/bin/hill-climb-judgement-fold" "$run_dir/app/bin/hill-climb-judgement-fold"
+cp "$repo_root/resources/hill-climb-predicate-registry.json" \
+  "$run_dir/app/resources/hill-climb-predicate-registry.json"
+printf '{}\n' > "$run_dir/slots/slot-0/CNT-S1/kit/runs/a/CNT-S1/evidence.json"
+printf 'image\n' > "$run_dir/slots/slot-0/CNT-S1/kit/runs/a/CNT-S1/screenshots/one.jpg"
+printf '{}\n' > "$run_dir/slots/slot-1/ABS-S1/kit/runs/b/ABS-S1/evidence.json"
+printf 'image\n' > "$run_dir/slots/slot-1/ABS-S1/kit/runs/b/ABS-S1/screenshots/two.jpg"
+python3 - "$run_dir/manifest.json" "$eval_kit_sha" "$eval_config_sha" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "w", encoding="utf-8") as stream:
+    json.dump({"scenarios": ["CNT-S1", "ABS-S1"], "stateful_area_lanes": ["CNT", "ABS"],
+               "capture_lineage_schema": "capture-lineage.v1",
+               "eval_kit_sha": sys.argv[2], "eval_kit_archive_sha256": "a" * 64,
+               "eval_config_sha256": sys.argv[3]}, stream)
+PY
+
+FLEET_EVAL_KIT="$base_kit" FLEET_CONSOLIDATE_EVIDENCE_ONLY=true \
+  "$script" "$run_dir" >/dev/null
+
+consolidated="$run_dir/consolidated-kit"
+[ "$(cat "$consolidated/.sbek-current-run")" = "runs/fleet-consolidated" ]
+[ -f "$consolidated/runs/fleet-consolidated/CNT-S1/screenshots/one.jpg" ]
+[ -f "$consolidated/runs/fleet-consolidated/ABS-S1/screenshots/two.jpg" ]
+[ "$(wc -l < "$consolidated/runs/fleet-consolidated/evidence-manifest.tsv" | tr -d ' ')" = 2 ]
+[ -d "$consolidated/node_modules" ]
+[ ! -L "$consolidated/node_modules" ]
+[ "$(shasum -a 256 "$consolidated/evalconfig.json" | awk '{print $1}')" = "$eval_config_sha" ]
+
+bad_lineage_run="$test_root/bad-lineage-run"
+cp -a "$run_dir" "$bad_lineage_run"
+rm -rf "$bad_lineage_run/consolidated-kit" "$bad_lineage_run/slots"
+mkdir -p "$bad_lineage_run/slots/slot-0/CFP/kit/runs/a/CFP-S1"
+printf '{"scenarioId":"CFP-S1","outcome":"completed"}\n' \
+  > "$bad_lineage_run/slots/slot-0/CFP/kit/runs/a/CFP-S1/evidence.json"
+python3 - "$bad_lineage_run/manifest.json" <<'PY'
+import json
+import sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    manifest = json.load(stream)
+manifest["scenarios"] = ["CFP-S1"]
+manifest["stateful_area_lanes"] = ["CFP"]
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(manifest, stream)
+PY
+if FLEET_EVAL_KIT="$base_kit" FLEET_CONSOLIDATE_EVIDENCE_ONLY=true \
+    "$script" "$bad_lineage_run" >"$bad_lineage_run/out" 2>"$bad_lineage_run/err"; then
+  echo "FAIL: CFP evidence without an immutable lineage receipt reached consolidation" >&2
+  exit 1
+fi
+grep -q 'capture lineage verification failed before judging' "$bad_lineage_run/err" || {
+  echo "FAIL: missing CFP lineage receipt did not fail at the typed pre-judge gate" >&2
+  cat "$bad_lineage_run/err" >&2
+  exit 1
+}
+
+judge_adapter_body="$(sed -n '/^run_judge_agent() {/,/^}/p' "$script")"
+default_executor_assignment="fleet_executor=\"\${FLEET_EXECUTOR:-codex}\""
+if ! grep -Fq "$default_executor_assignment" "$script"; then
+  echo "FAIL: Codex is not the default judge executor" >&2
+  exit 1
+fi
+for executor in codex claude; do
+  if ! grep -q "$executor)" <<< "$judge_adapter_body"; then
+    echo "FAIL: judge adapter does not support $executor" >&2
+    exit 1
+  fi
+done
+for codex_guard in --ephemeral --output-schema --output-last-message \
+    --dangerously-bypass-approvals-and-sandbox model_reasoning_effort env\ -u\ OPENAI_API_KEY; do
+  if ! grep -q -- "$codex_guard" <<< "$judge_adapter_body"; then
+    echo "FAIL: Codex judge is missing guard: $codex_guard" >&2
+    exit 1
+  fi
+done
+python3 - "$schema" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    schema = json.load(stream)
+assert schema["properties"]["items"]["minItems"] == 1
+PY
+
+if FLEET_EVAL_KIT="$base_kit" FLEET_CONSOLIDATE_EVIDENCE_ONLY=true \
+    "$script" "$run_dir" >/dev/null 2>&1; then
+  echo "FAIL: consolidation overwrote an existing result" >&2
+  exit 1
+fi
+
+FLEET_EVAL_KIT="$base_kit" FLEET_CONSOLIDATE_EVIDENCE_ONLY=true \
+  FLEET_CONSOLIDATE_RESUME=true "$script" "$run_dir" >/dev/null
+[ -f "$consolidated/runs/fleet-consolidated/CNT-S1/screenshots/one.jpg" ]
+
+echo "PASS fleet consolidation: evidence is immutable and scoring is resumable"

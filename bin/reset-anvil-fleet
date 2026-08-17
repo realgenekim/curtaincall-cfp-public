@@ -1,0 +1,499 @@
+#!/usr/bin/env bash
+# Skiff control-plane wrapper. It resolves the latest successful staging deploy,
+# ships files intact, starts tester@anvil with one command, and waits for proof.
+# Remote paths and verified deployment values intentionally expand on the client.
+# shellcheck disable=SC2029
+set -euo pipefail
+
+repo_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+anvil_host="${ANVIL_HOST:-root@ANVIL-TAILNET-HOST}"
+tester_home="${ANVIL_TESTER_HOME:-/home/tester}"
+install_authority_root="/var/lib/eval-harness-install"
+wait_seconds="${ANVIL_FLEET_WAIT_SECONDS:-900}"
+# How long a start may go without producing its own new immutable run before we
+# stop waiting. Sitting out the full readiness window on a start that never
+# happened is how a broken cycle looked like a slow one.
+start_grace_seconds="${ANVIL_FLEET_START_GRACE_SECONDS:-180}"
+slots="${FLEET_SLOTS:-8}"
+scenario_selection="${FLEET_SCENARIOS:-}"
+evidence_only="${FLEET_CONSOLIDATE_EVIDENCE_ONLY:-false}"
+fleet_executor="${FLEET_EXECUTOR:-codex}"
+worker_executor="${FLEET_WORKER_EXECUTOR:-$fleet_executor}"
+judge_executor="${FLEET_JUDGE_EXECUTOR:-$fleet_executor}"
+worker_model="${FLEET_WORKER_MODEL:-}"
+judge_model="${FLEET_JUDGE_MODEL:-}"
+worker_reasoning_effort="${FLEET_WORKER_REASONING_EFFORT:-}"
+judge_reasoning_effort="${FLEET_JUDGE_REASONING_EFFORT:-}"
+scenario_turn_budget="${FLEET_MAX_TURNS_PER_SCENARIO:-}"
+deployment_sha_override="${FLEET_SHA:-}"
+deployment_run_url_override="${FLEET_DEPLOYMENT_RUN_URL:-}"
+harness_sha_override="${FLEET_HARNESS_SHA:-}"
+installer_sha_override="${FLEET_INSTALLER_SHA:-}"
+ship_dir=""
+
+cleanup() {
+  if [ -n "$ship_dir" ] && [ -d "$ship_dir" ]; then
+    rm -rf -- "$ship_dir"
+  fi
+}
+trap cleanup EXIT
+
+fail() {
+  echo "ERROR reset-anvil-fleet: $*" >&2
+  exit 1
+}
+
+# Emits SHA \t RUN_URL \t PIN_SOURCE. An explicitly passed pin always wins over
+# the standalone resolver, and the mode travels with the pin so the remote run
+# manifest can name which one produced it.
+resolve_deployment() {
+  if [ -n "$deployment_sha_override" ] || [ -n "$deployment_run_url_override" ]; then
+    if [ -z "$deployment_sha_override" ] || [ -z "$deployment_run_url_override" ]; then
+      fail "FLEET_SHA and FLEET_DEPLOYMENT_RUN_URL must be provided together"
+    fi
+    printf '%s\t%s\t%s\n' "$deployment_sha_override" "$deployment_run_url_override" explicit-pin
+    return
+  fi
+  gh run list --workflow build-and-deploy.yml --branch staging --limit 30 \
+    --json conclusion,headSha,url,createdAt \
+    --jq '[.[] | select(.conclusion == "success")][0] | [.headSha, .url, "resolver"] | @tsv'
+}
+
+# Facts only: what the immutable current run says right now. No verdicts here.
+remote_run_facts() {
+  ssh "$anvil_host" "sudo -iu tester python3 - '$tester_home'" <<'PY'
+import json
+import pathlib
+import sys
+
+home = pathlib.Path(sys.argv[1])
+current = home / "fleet-runs" / "current"
+fact = {"run_id": "", "code_sha": "", "status": "unavailable", "quarantine": "", "ready_slots": 0, "error": ""}
+try:
+    run = current.resolve(strict=True)
+    fact["run_id"] = run.name
+    try:
+        manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+        fact["code_sha"] = manifest.get("code_sha", "")
+    except Exception as error:
+        fact["error"] = str(error)
+    try:
+        state = json.loads((run / "state.json").read_text(encoding="utf-8"))
+        fact["status"] = state.get("status", "unknown")
+    except Exception as error:
+        fact["error"] = str(error)
+    try:
+        readiness = json.loads((run / "readiness.json").read_text(encoding="utf-8"))
+        fact["ready_slots"] = len(readiness.get("slots", []))
+    except Exception:
+        pass
+    try:
+        for line in (run / "events.log").read_text(encoding="utf-8", errors="replace").splitlines():
+            if "LINEAGE_FAILED" in line or ("DISPOSITION" in line and "status=failed" in line):
+                fact["quarantine"] = line.strip()
+                break
+    except Exception:
+        pass
+except Exception as error:
+    fact["error"] = str(error)
+print(json.dumps(fact, separators=(",", ":")))
+PY
+}
+
+# Pure fold: facts in, one verdict token out. No I/O, so it is unit-testable.
+readiness_verdict() {
+  [ "$#" -ge 6 ] || fail "usage: readiness_verdict PINNED_SHA PRE_RUN_ID RUN_ID CODE_SHA STATUS QUARANTINE [READY_SLOTS]"
+  local pinned_sha="$1" pre_run_id="$2" run_id="$3" code_sha="$4" status="$5" quarantine="$6" ready_slots="${7:-6}"
+  if [ -z "$run_id" ] || [ "$run_id" = "$pre_run_id" ]; then
+    printf 'wait\tno new immutable run yet\n'
+    return
+  fi
+  if [ -z "$code_sha" ]; then
+    printf 'wait\trun %s has not written its manifest yet\n' "$run_id"
+    return
+  fi
+  if [ "$code_sha" != "$pinned_sha" ]; then
+    printf 'pin-drift\trun %s is pinned to %s but this start requested %s\n' \
+      "$run_id" "$code_sha" "$pinned_sha"
+    return
+  fi
+  if [ "$ready_slots" -lt 4 ]; then
+    printf 'wait\trun %s readiness quorum is %s/6; need at least 4\n' "$run_id" "$ready_slots"
+    return
+  fi
+  case "$status" in
+    running|complete)
+      if [ -n "$quarantine" ]; then
+        printf 'ready\trun %s status=%s; named zero pending: %s\n' "$run_id" "$status" "$quarantine"
+      else
+        printf 'ready\trun %s status=%s\n' "$run_id" "$status"
+      fi
+      ;;
+    failed) printf 'failed\trun %s reported status=failed\n' "$run_id" ;;
+    *) printf 'wait\trun %s status=%s\n' "$run_id" "$status" ;;
+  esac
+}
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+sha256_git_blob() {
+  local commit=$1 path=$2
+  if command -v sha256sum >/dev/null 2>&1; then
+    git -C "$repo_root" show "$commit:$path" | sha256sum | awk '{print $1}'
+  else
+    git -C "$repo_root" show "$commit:$path" | shasum -a 256 | awk '{print $1}'
+  fi
+}
+
+tree_blob_hash_or_absent() {
+  local commit=$1 path=$2
+  if git -C "$repo_root" cat-file -e "$commit:$path" 2>/dev/null; then
+    sha256_git_blob "$commit" "$path"
+  else
+    printf 'absent\n'
+  fi
+}
+
+find_common_preimage_commit() {
+  local harness_sha=$1 script_hash=$2 lineage_hash=$3 candidate
+  while IFS= read -r candidate; do
+    if [ "$(tree_blob_hash_or_absent "$candidate" bin/hill-climb-fleet)" = "$script_hash" ] \
+        && [ "$(tree_blob_hash_or_absent "$candidate" bin/capture-lineage)" = "$lineage_hash" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done < <(git -C "$repo_root" rev-list "$harness_sha" -- bin/hill-climb-fleet bin/capture-lineage)
+  return 1
+}
+
+recover_pending_preimage() {
+  local operation_hash=$1 observed_script=$2 observed_lineage=$3 harness_sha=$4 installer_sha=$5
+  local new_script_hash=$6 new_lineage_hash=$7 leaf_hash=$8
+  local expected_authority_uid=0
+  [ "$install_authority_root" = /var/lib/eval-harness-install ] \
+    || expected_authority_uid="$(id -u)"
+  ssh "$anvil_host" python3 - "$install_authority_root/pending/$operation_hash.json" \
+    "$expected_authority_uid" \
+    "$operation_hash" "$observed_script" "$observed_lineage" "$harness_sha" "$installer_sha" \
+    "$new_script_hash" "$new_lineage_hash" "$leaf_hash" <<'PY'
+import json
+import os
+import stat
+import sys
+
+(path, expected_uid, operation, observed_script, observed_lineage, harness, installer,
+ new_script, new_lineage, leaf) = sys.argv[1:]
+mode = os.lstat(path).st_mode
+if not stat.S_ISREG(mode) or os.stat(path).st_uid != int(expected_uid):
+    raise SystemExit('pending install intent lacks root authority')
+with open(path, encoding='utf-8') as stream:
+    value = json.load(stream)
+required = {
+    'schema', 'operation_sha256', 'manifest_sha256', 'preimage_commit',
+    'harness_sha', 'installer_sha', 'previous_script_sha256',
+    'previous_lineage_sha256', 'installed_script_sha256',
+    'installed_lineage_sha256', 'installer_leaf_sha256',
+}
+if set(value) != required \
+        or value.get('schema') != 'eval-harness-install-pending.v1' \
+        or value.get('operation_sha256') != operation \
+        or value.get('harness_sha') != harness \
+        or value.get('installer_sha') != installer \
+        or value.get('installed_script_sha256') != new_script \
+        or value.get('installed_lineage_sha256') != new_lineage \
+        or value.get('installer_leaf_sha256') != leaf \
+        or (observed_script, observed_lineage) not in {
+            (value.get('previous_script_sha256'), value.get('previous_lineage_sha256')),
+            (new_script, new_lineage),
+        }:
+    raise SystemExit('runtime pair is not an authorized boundary state of the pending operation')
+print('\t'.join([
+    value['preimage_commit'], value['previous_script_sha256'],
+    value['previous_lineage_sha256'], value['manifest_sha256'],
+]))
+PY
+}
+
+observe_installed_preimages() {
+  ssh "$anvil_host" "if test -L '$install_authority_root/current'; then active=\$(readlink -f '$install_authority_root/current'); case \"\$active\" in '$install_authority_root/runtime/'*) ;; *) exit 40 ;; esac; else active='$tester_home/bin'; fi; script=\"\$active/hill-climb-fleet\"; lineage=\"\$active/capture-lineage\"; test -f \"\$script\" && test ! -L \"\$script\" || exit 41; script_sha=\$(sha256sum \"\$script\" | cut -d ' ' -f1); if test -e \"\$lineage\" || test -L \"\$lineage\"; then test -f \"\$lineage\" && test ! -L \"\$lineage\" || exit 42; lineage_sha=\$(sha256sum \"\$lineage\" | cut -d ' ' -f1); else lineage_sha=absent; fi; printf '%s\\t%s\\n' \"\$script_sha\" \"\$lineage_sha\"" \
+    || fail "installed eval harness preimage is absent, non-regular, or symlinked"
+}
+
+verify_installed_harness() {
+  local harness_sha=$1 expected_script_hash expected_lineage_hash remote_script
+  git -C "$repo_root" cat-file -e "$harness_sha:bin/hill-climb-fleet" \
+    || fail "harness commit lacks bin/hill-climb-fleet: $harness_sha"
+  git -C "$repo_root" cat-file -e "$harness_sha:bin/capture-lineage" \
+    || fail "harness commit lacks bin/capture-lineage: $harness_sha"
+  expected_script_hash="$(sha256_git_blob "$harness_sha" bin/hill-climb-fleet)"
+  expected_lineage_hash="$(sha256_git_blob "$harness_sha" bin/capture-lineage)"
+  remote_script="$install_authority_root/current/hill-climb-fleet"
+  ssh "$anvil_host" "sudo -iu tester env FLEET_EXPECTED_HARNESS_SHA='$harness_sha' FLEET_EXPECTED_SCRIPT_SHA256='$expected_script_hash' FLEET_EXPECTED_LINEAGE_SHA256='$expected_lineage_hash' '$remote_script' verify-install" >/dev/null \
+    || fail "installed eval harness is not receipted at pinned deployment $harness_sha; install that exact pin first"
+  printf '%s\t%s\t%s\n' "$harness_sha" "$expected_script_hash" "$expected_lineage_hash"
+}
+
+select_harness_for_pin() {
+  local pin_sha=$1
+  if [ -n "$harness_sha_override" ] && [ "$harness_sha_override" != "$pin_sha" ]; then
+    fail "FLEET_HARNESS_SHA must equal the deployment pin: pin=$pin_sha harness=$harness_sha_override"
+  fi
+  printf '%s\n' "$pin_sha"
+}
+
+resolve_integrated_harness() {
+  local harness_sha
+  git -C "$repo_root" fetch --quiet origin staging
+  harness_sha="${harness_sha_override:-$(git -C "$repo_root" rev-parse origin/staging)}"
+  git -C "$repo_root" cat-file -e "$harness_sha^{commit}" \
+    || fail "fleet harness commit is unavailable locally: $harness_sha"
+  git -C "$repo_root" merge-base --is-ancestor "$harness_sha" origin/staging \
+    || fail "fleet harness commit is not integrated on origin/staging: $harness_sha"
+  printf '%s\n' "$harness_sha"
+}
+
+install_remote() {
+  command -v scp >/dev/null 2>&1 || fail "scp is required"
+  command -v ssh >/dev/null 2>&1 || fail "ssh is required"
+
+  local harness_sha installer_sha wrapper_hash committed_wrapper_hash observed_preimages preimage_commit
+  local old_script_hash old_lineage_hash new_script_hash new_lineage_hash leaf_hash
+  local operation_path operation_hash manifest_path manifest_hash remote_upload remote_leaf receipt recovery
+
+  git -C "$repo_root" fetch --quiet origin staging
+  harness_sha="${harness_sha_override:-$(git -C "$repo_root" rev-parse origin/staging)}"
+  installer_sha="${installer_sha_override:-$(git -C "$repo_root" rev-parse HEAD)}"
+  for commit in "$harness_sha" "$installer_sha"; do
+    git -C "$repo_root" cat-file -e "$commit^{commit}" \
+      || fail "install commit is unavailable locally: $commit"
+    git -C "$repo_root" merge-base --is-ancestor "$commit" origin/staging \
+      || fail "install commit is not integrated on origin/staging: $commit"
+  done
+
+  wrapper_hash="$(sha256_file "$repo_root/bin/reset-anvil-fleet")"
+  committed_wrapper_hash="$(sha256_git_blob "$installer_sha" bin/reset-anvil-fleet)"
+  [ "$wrapper_hash" = "$committed_wrapper_hash" ] \
+    || fail "running installer differs from FLEET_INSTALLER_SHA $installer_sha"
+
+  git -C "$repo_root" cat-file -e "$harness_sha:bin/hill-climb-fleet" \
+    || fail "harness commit lacks bin/hill-climb-fleet"
+  git -C "$repo_root" cat-file -e "$harness_sha:bin/capture-lineage" \
+    || fail "harness commit lacks bin/capture-lineage"
+
+  ship_dir="$(mktemp -d "${TMPDIR:-/tmp}/anvil-harness-install.XXXXXX")"
+  git -C "$repo_root" archive "$harness_sha" bin/hill-climb-fleet bin/capture-lineage \
+    | tar -x -C "$ship_dir"
+  git -C "$repo_root" archive "$installer_sha" resources/bash/eval-harness-install-remote \
+    | tar -x -C "$ship_dir"
+
+  new_script_hash="$(sha256_file "$ship_dir/bin/hill-climb-fleet")"
+  new_lineage_hash="$(sha256_file "$ship_dir/bin/capture-lineage")"
+  leaf_hash="$(sha256_file "$ship_dir/resources/bash/eval-harness-install-remote")"
+  operation_path="$ship_dir/install-operation.txt"
+  printf '%s\n' \
+    'schema=eval-harness-install-operation.v1' \
+    "harness_sha=$harness_sha" \
+    "installer_sha=$installer_sha" \
+    "new_script_sha=$new_script_hash" \
+    "new_lineage_sha=$new_lineage_hash" \
+    "leaf_sha=$leaf_hash" \
+    'target_script=runtime/hill-climb-fleet' \
+    'target_lineage=runtime/capture-lineage' \
+    'target_mode=0555' >"$operation_path"
+  operation_hash="$(sha256_file "$operation_path")"
+
+  observed_preimages="$(observe_installed_preimages)"
+  IFS=$'\t' read -r old_script_hash old_lineage_hash <<< "$observed_preimages"
+  if recovery="$(recover_pending_preimage "$operation_hash" "$old_script_hash" "$old_lineage_hash" \
+      "$harness_sha" "$installer_sha" "$new_script_hash" "$new_lineage_hash" "$leaf_hash" 2>/dev/null)"; then
+    IFS=$'\t' read -r preimage_commit old_script_hash old_lineage_hash manifest_hash <<< "$recovery"
+  elif preimage_commit="$(find_common_preimage_commit "$harness_sha" "$old_script_hash" "$old_lineage_hash")"; then
+    :
+  else
+    fail "installed runner/helper pair is neither a committed preimage nor an authorized pending install"
+  fi
+  manifest_path="$ship_dir/install-manifest.txt"
+  printf '%s\n' \
+    'schema=eval-harness-install-manifest.v2' \
+    "operation_sha=$operation_hash" \
+    "preimage_commit=$preimage_commit" \
+    "harness_sha=$harness_sha" \
+    "installer_sha=$installer_sha" \
+    "old_script_sha=$old_script_hash" \
+    "old_lineage_sha=$old_lineage_hash" \
+    "new_script_sha=$new_script_hash" \
+    "new_lineage_sha=$new_lineage_hash" \
+    "leaf_sha=$leaf_hash" \
+    'target_script=runtime/hill-climb-fleet' \
+    'target_lineage=runtime/capture-lineage' \
+    'target_mode=0555' >"$manifest_path"
+  if [ -n "${manifest_hash:-}" ]; then
+    [ "$(sha256_file "$manifest_path")" = "$manifest_hash" ] \
+      || fail "pending install manifest cannot be reconstructed byte-exact"
+  else
+    manifest_hash="$(sha256_file "$manifest_path")"
+  fi
+
+  remote_upload="$(ssh "$anvil_host" "mktemp -d '/tmp/eval-harness-upload.$manifest_hash.XXXXXX'")"
+  case "$remote_upload" in
+    /tmp/eval-harness-upload."$manifest_hash".*) ;;
+    *) fail "remote upload root is not content-bound: $remote_upload" ;;
+  esac
+  remote_leaf="$remote_upload/eval-harness-install-remote"
+  scp "$ship_dir/bin/hill-climb-fleet" "$anvil_host:$remote_upload/hill-climb-fleet"
+  scp "$ship_dir/bin/capture-lineage" "$anvil_host:$remote_upload/capture-lineage"
+  scp "$ship_dir/resources/bash/eval-harness-install-remote" "$anvil_host:$remote_leaf"
+  scp "$manifest_path" "$anvil_host:$remote_upload/install-manifest.txt"
+  ssh "$anvil_host" "chmod 0444 '$remote_upload/hill-climb-fleet' '$remote_upload/capture-lineage' '$remote_leaf' '$remote_upload/install-manifest.txt' && chmod 0555 '$remote_upload'"
+
+  if ! receipt="$(ssh "$anvil_host" "bash '$remote_leaf' '$remote_upload' '$manifest_hash' '$operation_hash' '$preimage_commit' '$harness_sha' '$installer_sha' '$old_script_hash' '$old_lineage_hash' '$new_script_hash' '$new_lineage_hash' '$leaf_hash' tester '$tester_home' '$install_authority_root'")"; then
+    ssh "$anvil_host" "chmod 0700 '$remote_upload' && rm -rf -- '$remote_upload'" || true
+    fail "remote harness install refused"
+  fi
+  ssh "$anvil_host" "chmod 0700 '$remote_upload' && rm -rf -- '$remote_upload'"
+  printf '%s\n' "$receipt"
+}
+
+start_remote() {
+  command -v gh >/dev/null 2>&1 || fail "gh is required to resolve the deployed commit"
+  command -v scp >/dev/null 2>&1 || fail "scp is required"
+  command -v ssh >/dev/null 2>&1 || fail "ssh is required"
+  case "$slots" in ''|*[!0-9]*) fail "FLEET_SLOTS must be numeric" ;; esac
+  case "$scenario_selection" in *[!A-Z0-9,\ -]*) fail "FLEET_SCENARIOS contains unsupported characters" ;; esac
+  case "$evidence_only" in true|false) ;; *) fail "FLEET_CONSOLIDATE_EVIDENCE_ONLY must be true or false" ;; esac
+  case "$fleet_executor" in codex|claude) ;; *) fail "FLEET_EXECUTOR must be codex or claude" ;; esac
+  case "$worker_executor" in codex|claude) ;; *) fail "FLEET_WORKER_EXECUTOR must be codex or claude" ;; esac
+  case "$judge_executor" in codex|claude) ;; *) fail "FLEET_JUDGE_EXECUTOR must be codex or claude" ;; esac
+  case "$worker_reasoning_effort" in ''|minimal|low|medium|high|xhigh) ;; *) fail "FLEET_WORKER_REASONING_EFFORT is invalid" ;; esac
+  case "$judge_reasoning_effort" in ''|minimal|low|medium|high|xhigh) ;; *) fail "FLEET_JUDGE_REASONING_EFFORT is invalid" ;; esac
+  case "$scenario_turn_budget" in ''|*[!0-9]*) [ -z "$scenario_turn_budget" ] || fail "FLEET_MAX_TURNS_PER_SCENARIO must be numeric" ;; esac
+
+  command -v jq >/dev/null 2>&1 || fail "jq is required to read remote run facts"
+
+  local deployment sha harness_sha run_url pin_source remote_script installed_identity
+  local expected_script_hash expected_lineage_hash
+  deployment="$(resolve_deployment)"
+  [ -n "$deployment" ] || fail "no successful staging deployment was found"
+  IFS=$'\t' read -r sha run_url pin_source <<< "$deployment"
+  if [ -z "$sha" ] || [ -z "$run_url" ] || [ -z "$pin_source" ]; then
+    fail "deployment proof is incomplete"
+  fi
+
+  git -C "$repo_root" fetch --quiet origin staging
+  git -C "$repo_root" cat-file -e "$sha^{commit}" \
+    || fail "successful deployed commit is unavailable locally: $sha"
+  git -C "$repo_root" merge-base --is-ancestor "$sha" origin/staging \
+    || fail "successful deployed commit is not on origin/staging: $sha"
+  harness_sha="$(select_harness_for_pin "$sha")"
+  git -C "$repo_root" cat-file -e "$harness_sha^{commit}" \
+    || fail "fleet harness commit is unavailable locally: $harness_sha"
+  git -C "$repo_root" merge-base --is-ancestor "$harness_sha" origin/staging \
+    || fail "fleet harness commit is not on origin/staging: $harness_sha"
+
+  remote_script="$install_authority_root/current/hill-climb-fleet"
+  installed_identity="$(verify_installed_harness "$harness_sha")"
+  IFS=$'\t' read -r harness_sha expected_script_hash expected_lineage_hash <<< "$installed_identity"
+
+  local pre_start_run_id
+  pre_start_run_id="$(jq -r '.run_id // ""' <<< "$(remote_run_facts)")"
+
+  ssh "$anvil_host" "sudo -iu tester setsid env FLEET_EXPECTED_HARNESS_SHA='$harness_sha' FLEET_EXPECTED_SCRIPT_SHA256='$expected_script_hash' FLEET_EXPECTED_LINEAGE_SHA256='$expected_lineage_hash' FLEET_SHA='$sha' FLEET_HARNESS_SHA='$harness_sha' FLEET_DEPLOYMENT_RUN_URL='$run_url' FLEET_PIN_SOURCE='$pin_source' FLEET_SLOTS='$slots' FLEET_SCENARIOS='$scenario_selection' FLEET_CONSOLIDATE_EVIDENCE_ONLY='$evidence_only' FLEET_EXECUTOR='$fleet_executor' FLEET_WORKER_EXECUTOR='$worker_executor' FLEET_WORKER_MODEL='$worker_model' FLEET_WORKER_REASONING_EFFORT='$worker_reasoning_effort' FLEET_JUDGE_EXECUTOR='$judge_executor' FLEET_JUDGE_MODEL='$judge_model' FLEET_JUDGE_REASONING_EFFORT='$judge_reasoning_effort' FLEET_MAX_TURNS_PER_SCENARIO='$scenario_turn_budget' '$remote_script' start >'$tester_home/fleet-bootstrap.log' 2>&1 </dev/null &"
+
+  echo "Started anvil fleet for deployed SHA $sha (pin source: $pin_source)"
+  echo "Fleet harness SHA: $harness_sha"
+  echo "Deployment proof: $run_url"
+  echo "Previous immutable run: ${pre_start_run_id:-none}"
+  echo "Waiting up to ${wait_seconds}s for immutable SUT + persona readiness..."
+  local deadline=$((SECONDS + wait_seconds))
+  local grace_deadline=$((SECONDS + start_grace_seconds))
+  local facts verdict reason run_id
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    facts="$(remote_run_facts || true)"
+    if ! jq -e . >/dev/null 2>&1 <<< "$facts"; then
+      sleep 5
+      continue
+    fi
+    run_id="$(jq -r '.run_id // ""' <<< "$facts")"
+    IFS=$'\t' read -r verdict reason <<< "$(readiness_verdict "$sha" "$pre_start_run_id" \
+      "$run_id" "$(jq -r '.code_sha // ""' <<< "$facts")" \
+      "$(jq -r '.status // ""' <<< "$facts")" "$(jq -r '.quarantine // ""' <<< "$facts")" \
+      "$(jq -r '.ready_slots // 0' <<< "$facts")")"
+    case "$verdict" in
+      ready)
+        ssh "$anvil_host" "sudo -iu tester '$remote_script' status"
+        return 0
+        ;;
+      pin-drift)
+        ssh "$anvil_host" "tail -80 '$tester_home/fleet-bootstrap.log'" || true
+        fail "pinned SHA was not honored by the fleet: $reason"
+        ;;
+      quarantine)
+        ssh "$anvil_host" "sudo -iu tester '$remote_script' status" || true
+        fail "fleet quarantined a slot during readiness: $reason"
+        ;;
+      failed)
+        ssh "$anvil_host" "sudo -iu tester '$remote_script' status" || true
+        ssh "$anvil_host" "tail -80 '$tester_home/fleet-bootstrap.log'" || true
+        fail "anvil fleet failed readiness: $reason"
+        ;;
+    esac
+    if [ "$run_id" = "$pre_start_run_id" ] && [ "$SECONDS" -ge "$grace_deadline" ]; then
+      ssh "$anvil_host" "tail -80 '$tester_home/fleet-bootstrap.log'" || true
+      fail "remote start never created a new immutable run within ${start_grace_seconds}s; current is still ${pre_start_run_id:-none}"
+    fi
+    sleep 5
+  done
+  ssh "$anvil_host" "tail -80 '$tester_home/fleet-bootstrap.log'" || true
+  fail "timed out waiting for anvil fleet readiness"
+}
+
+resume_remote() {
+  command -v ssh >/dev/null 2>&1 || fail "ssh is required"
+  case "$fleet_executor" in codex|claude) ;; *) fail "FLEET_EXECUTOR must be codex or claude" ;; esac
+  case "$worker_executor" in codex|claude) ;; *) fail "FLEET_WORKER_EXECUTOR must be codex or claude" ;; esac
+  case "$judge_executor" in codex|claude) ;; *) fail "FLEET_JUDGE_EXECUTOR must be codex or claude" ;; esac
+
+  local harness_sha installed_identity expected_script_hash expected_lineage_hash
+  harness_sha="$(remote_run_facts | jq -r '.code_sha // ""')"
+  [ -n "$harness_sha" ] || fail "current immutable run does not name its deployment pin"
+  installed_identity="$(verify_installed_harness "$harness_sha")"
+  IFS=$'\t' read -r harness_sha expected_script_hash expected_lineage_hash <<< "$installed_identity"
+  ssh "$anvil_host" "sudo -iu tester setsid env FLEET_EXPECTED_HARNESS_SHA='$harness_sha' FLEET_EXPECTED_SCRIPT_SHA256='$expected_script_hash' FLEET_EXPECTED_LINEAGE_SHA256='$expected_lineage_hash' FLEET_EXECUTOR='$fleet_executor' FLEET_WORKER_EXECUTOR='$worker_executor' FLEET_JUDGE_EXECUTOR='$judge_executor' FLEET_MAX_TURNS_PER_SCENARIO='$scenario_turn_budget' '$install_authority_root/current/hill-climb-fleet' resume >'$tester_home/fleet-resume.log' 2>&1 </dev/null &"
+  echo "Resumed only missing journeys in the current immutable run."
+  echo "Monitor with: make anvil-fleet-status"
+}
+
+score_remote() {
+  command -v ssh >/dev/null 2>&1 || fail "ssh is required"
+  local harness_sha installed_identity expected_script_hash expected_lineage_hash
+  harness_sha="$(remote_run_facts | jq -r '.code_sha // ""')"
+  [ -n "$harness_sha" ] || fail "current immutable run does not name its deployment pin"
+  installed_identity="$(verify_installed_harness "$harness_sha")"
+  IFS=$'\t' read -r harness_sha expected_script_hash expected_lineage_hash <<< "$installed_identity"
+  ssh "$anvil_host" "sudo -iu tester env FLEET_EXPECTED_HARNESS_SHA='$harness_sha' FLEET_EXPECTED_SCRIPT_SHA256='$expected_script_hash' FLEET_EXPECTED_LINEAGE_SHA256='$expected_lineage_hash' FLEET_EXECUTOR='$fleet_executor' FLEET_WORKER_EXECUTOR='$worker_executor' FLEET_JUDGE_EXECUTOR='$judge_executor' '$install_authority_root/current/hill-climb-fleet' score"
+}
+
+case "${1:-start}" in
+  _test-find-preimage) [ "$#" -eq 4 ] || fail "usage: _test-find-preimage HARNESS SCRIPT_SHA LINEAGE_SHA"; find_common_preimage_commit "$2" "$3" "$4" ;;
+  _test-readiness-verdict) shift; readiness_verdict "$@" ;;
+  _test-resolve-deployment) resolve_deployment ;;
+  _test-select-harness) [ "$#" -eq 2 ] || fail "usage: _test-select-harness PIN_SHA"; select_harness_for_pin "$2" ;;
+  _test-recover-pending)
+    [ "$#" -eq 10 ] || fail "usage: _test-recover-pending AUTHORITY OPERATION OBSERVED_SCRIPT OBSERVED_LINEAGE HARNESS INSTALLER NEW_SCRIPT NEW_LINEAGE LEAF"
+    install_authority_root=$2
+    recover_pending_preimage "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}"
+    ;;
+  install) install_remote ;;
+  start) start_remote ;;
+  resume) resume_remote ;;
+  status) ssh "$anvil_host" "sudo -iu tester '$install_authority_root/current/hill-climb-fleet' status" ;;
+  score) score_remote ;;
+  stop) ssh "$anvil_host" "sudo -iu tester '$install_authority_root/current/hill-climb-fleet' stop" ;;
+  *) fail "usage: reset-anvil-fleet [install|start|resume|score|status|stop]" ;;
+esac

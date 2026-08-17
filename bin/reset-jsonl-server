@@ -1,0 +1,358 @@
+#!/usr/bin/env bash
+# Restore the immutable Judge Sandbox world, replace the local JSONL server,
+# wait for readiness, and prove every configured judge persona can sign in.
+set -euo pipefail
+
+repo_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+port="${PORT:-20500}"
+golden="${JUDGE_SANDBOX_GOLDEN:-$repo_root/resources/judge-sandbox/events.jsonl}"
+runtime_store="${JUDGE_SANDBOX_RUNTIME:-$repo_root/data/store/judge-sandbox/events.jsonl}"
+run_dir="${JSONL_RUN_DIR:-$repo_root/data/run/jsonl-server-$port}"
+log_path="$run_dir/server.log"
+pid_path="$run_dir/server.pid"
+receipt_path="$run_dir/receipt.json"
+auth_dir="$run_dir/auth"
+ready_timeout="${READY_TIMEOUT_SECONDS:-180}"
+jvm_min_heap="${JVM_MIN_HEAP:-64m}"
+jvm_max_heap="${JVM_MAX_HEAP:-512m}"
+clear_classes="${JSONL_CLEAR_CLASSES:-true}"
+inherit_process_group="${JSONL_INHERIT_PROCESS_GROUP:-false}"
+base_url="http://127.0.0.1:$port"
+started_pid=""
+
+fail() {
+  local cleanup_pid=""
+  echo "ERROR reset-jsonl-server: $*" >&2
+  if [ -s "$log_path" ]; then
+    echo "--- last 40 server log lines ($log_path) ---" >&2
+    tail -40 "$log_path" >&2
+  fi
+  if [ -n "$started_pid" ]; then
+    cleanup_pid="$(listener_pid)"
+    if [ -n "$cleanup_pid" ] && listener_is_safe_jsonl_app "$cleanup_pid"; then
+      kill "$cleanup_pid" 2>/dev/null || true
+    fi
+  fi
+  exit 1
+}
+
+case "$port" in
+  ''|*[!0-9]*) fail "PORT must be numeric; got '$port'" ;;
+esac
+if [ "$port" -lt 1024 ] || [ "$port" -gt 65535 ]; then
+  fail "PORT must be between 1024 and 65535; got '$port'"
+fi
+case "$ready_timeout" in
+  ''|*[!0-9]*) fail "READY_TIMEOUT_SECONDS must be numeric; got '$ready_timeout'" ;;
+esac
+case "$clear_classes" in
+  true|false) ;;
+  *) fail "JSONL_CLEAR_CLASSES must be true or false; got '$clear_classes'" ;;
+esac
+case "$inherit_process_group" in
+  true|false) ;;
+  *) fail "JSONL_INHERIT_PROCESS_GROUP must be true or false; got '$inherit_process_group'" ;;
+esac
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+listener_pid() {
+  lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1 || true
+}
+
+listener_is_safe_jsonl_app() {
+  local pid="$1" cwd command_with_env
+  cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | awk '/^n/ {sub(/^n/, ""); print; exit}')"
+  [ "$cwd" = "$repo_root" ] || return 1
+  command_with_env="$(ps eww -p "$pid" -o command= 2>/dev/null || true)"
+  case "$command_with_env" in
+    *cfp-scheduler-killer.core*) ;;
+    *) return 1 ;;
+  esac
+  case "$command_with_env" in
+    *STORE_BACKEND=postgres*) return 1 ;;
+  esac
+  return 0
+}
+
+stop_pid() {
+  local pid="$1"
+  kill "$pid" 2>/dev/null || true
+  for _ in $(seq 1 50); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  fail "managed server pid $pid would not stop"
+}
+
+[ -s "$golden" ] || fail "golden fixture missing or empty: $golden"
+
+fixture_summary="$(python3 - "$golden" <<'PY'
+import collections
+import json
+import sys
+
+path = sys.argv[1]
+events = []
+with open(path, encoding="utf-8") as stream:
+    for number, line in enumerate(stream, 1):
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"invalid JSONL at line {number}: {exc}")
+
+counts = collections.Counter(event.get("type") for event in events)
+emails = {
+    event.get("payload", {}).get("email")
+    for event in events
+    if event.get("type") == "person.created"
+}
+required = {
+    "swyx@ai.engineer",
+    "maya.lindholm@example.com",
+    "amara.devlin+472@beaconloop.example.com",
+}
+missing = sorted(required - emails)
+if missing:
+    raise SystemExit("golden fixture is missing judge personas: " + ", ".join(missing))
+if counts["submission.created"] < 50:
+    raise SystemExit(
+        f"golden fixture has only {counts['submission.created']} submissions; expected at least 50"
+    )
+print(f"{len(events)}\t{counts['submission.created']}")
+PY
+)" || fail "golden fixture validation failed"
+event_count="${fixture_summary%%$'\t'*}"
+submission_count="${fixture_summary##*$'\t'}"
+golden_hash="$(sha256_file "$golden")"
+
+mkdir -p "$run_dir"
+existing_listener="$(listener_pid)"
+if [ -n "$existing_listener" ]; then
+  if ! listener_is_safe_jsonl_app "$existing_listener"; then
+    fail "port $port is owned by pid $existing_listener, which is not this checkout's JSONL app; refusing to stop it"
+  fi
+  echo "Stopping existing local JSONL server pid=$existing_listener port=$port"
+  stop_pid "$existing_listener"
+fi
+
+if [ -s "$pid_path" ]; then
+  previous_pid="$(tr -cd '0-9' < "$pid_path")"
+  if [ -n "$previous_pid" ] && kill -0 "$previous_pid" 2>/dev/null; then
+    if listener_is_safe_jsonl_app "$previous_pid"; then
+      stop_pid "$previous_pid"
+    else
+      fail "pid file points to live non-JSONL process $previous_pid; refusing to stop it"
+    fi
+  fi
+fi
+
+mkdir -p "$(dirname "$runtime_store")"
+runtime_tmp="$runtime_store.tmp.$$"
+cp "$golden" "$runtime_tmp"
+cmp -s "$golden" "$runtime_tmp" || fail "runtime fixture copy differs from golden"
+mv "$runtime_tmp" "$runtime_store"
+
+rm -rf "$auth_dir"
+mkdir -p "$auth_dir"
+: > "$log_path"
+rm -f "$receipt_path" "$pid_path"
+if [ "$clear_classes" = "true" ]; then
+  rm -rf "$repo_root/target/classes"
+fi
+
+echo "Starting Judge Sandbox JSONL server port=$port store=$runtime_store"
+started_pid="$(python3 - "$repo_root" "$log_path" "$port" "$runtime_store" \
+  "$jvm_min_heap" "$jvm_max_heap" "$inherit_process_group" <<'PY'
+import os
+import subprocess
+import sys
+
+repo_root, log_path, port, store_path, min_heap, max_heap, inherit_group = sys.argv[1:]
+environment = os.environ.copy()
+environment.update(
+    {
+        "ENV": "dev",
+        "DEMO_MODE": "false",
+        "DEMO_PERSONAS": "on",
+        "PORT": port,
+        "STORE_BACKEND": "jsonl",
+        "STORE_PATH": store_path,
+    }
+)
+command = [
+    "clojure",
+    f"-J-Xms{min_heap}",
+    f"-J-Xmx{max_heap}",
+    "-J-Dguardrails.enabled=true",
+    "-A:dev",
+    "-M",
+    "-m",
+    "cfp-scheduler-killer.core",
+]
+with open(os.devnull, "rb") as stdin, open(log_path, "ab", buffering=0) as output:
+    process = subprocess.Popen(
+        command,
+        cwd=repo_root,
+        env=environment,
+        stdin=stdin,
+        stdout=output,
+        stderr=subprocess.STDOUT,
+        # Fleet capture owns the complete operation process group. Standalone
+        # reset keeps its historical detached-server behavior, while fleet
+        # explicitly keeps the SUT inside the receipted runtime lease.
+        start_new_session=inherit_group != "true",
+    )
+print(process.pid)
+PY
+)"
+
+deadline=$((SECONDS + ready_timeout))
+ready_code=""
+while [ "$SECONDS" -lt "$deadline" ]; do
+  if ! kill -0 "$started_pid" 2>/dev/null; then
+    fail "server process $started_pid exited before readiness"
+  fi
+  ready_code="$(curl -sS -m 2 -o /dev/null -w '%{http_code}' "$base_url/login" 2>/dev/null || true)"
+  [ "$ready_code" = "200" ] && break
+  sleep 1
+done
+[ "$ready_code" = "200" ] || fail "timed out after ${ready_timeout}s waiting for $base_url/login"
+
+server_pid="$(listener_pid)"
+[ -n "$server_pid" ] || fail "login returned 200 but no listener owns port $port"
+listener_is_safe_jsonl_app "$server_pid" || fail "ready listener pid $server_pid failed the JSONL ownership check"
+printf '%s\n' "$server_pid" > "$pid_path"
+
+verify_persona() {
+  local role="$1" expected_name="$2"
+  local headers="$auth_dir/$role.headers" cookies="$auth_dir/$role.cookies"
+  local body="$auth_dir/$role.html" status final_status final_url location destination
+
+  status="$(curl -sS -m 15 -D "$headers" -c "$cookies" -o /dev/null \
+    -w '%{http_code}' --data-urlencode "role=$role" "$base_url/api/demo-login")"
+  case "$status" in
+    302|303) ;;
+    *) fail "persona $role login returned HTTP $status (expected redirect)" ;;
+  esac
+  grep -qi '^set-cookie:' "$headers" || fail "persona $role login set no session cookie"
+  location="$(awk 'tolower($1) == "location:" {sub(/\r$/, "", $2); print $2; exit}' "$headers")"
+  [ -n "$location" ] || fail "persona $role login returned no Location header"
+  case "$location" in
+    http://*|https://*) destination="$location" ;;
+    /*) destination="$base_url$location" ;;
+    *) destination="$base_url/$location" ;;
+  esac
+
+  read -r final_status final_url <<EOF
+$(curl -sS -m 30 -L -b "$cookies" -c "$cookies" -o "$body" \
+  -w '%{http_code} %{url_effective}' "$destination")
+EOF
+  [ "$final_status" = "200" ] || fail "persona $role destination returned HTTP $final_status"
+  grep -Fqi "$expected_name" "$body" || fail "persona $role destination did not identify $expected_name"
+  printf '%s\t%s\t%s\t%s\n' "$role" "$status" "$location" "$final_url" >> "$auth_dir/results.tsv"
+  echo "  persona=$role login=$status destination=$final_status identity=$expected_name"
+}
+
+: > "$auth_dir/results.tsv"
+echo "Verifying Judge Sandbox personas"
+verify_persona organizer "swyx"
+verify_persona reviewer "Maya Lindholm"
+verify_persona speaker "Amara Devlin"
+
+post_auth_summary="$(python3 - "$golden" "$runtime_store" <<'PY'
+import json
+import sys
+
+golden_path, runtime_path = sys.argv[1:]
+golden = open(golden_path, "rb").read()
+runtime = open(runtime_path, "rb").read()
+if not runtime.startswith(golden):
+    raise SystemExit("runtime no longer has the exact golden fixture as its prefix")
+
+appended = [json.loads(line) for line in runtime[len(golden):].splitlines() if line.strip()]
+expected_actors = {
+    "swyx@ai.engineer",
+    "maya.lindholm@example.com",
+    "amara.devlin+472@beaconloop.example.com",
+}
+if len(appended) != 3:
+    raise SystemExit(f"expected 3 persona auth facts after golden restore; found {len(appended)}")
+if {event.get("type") for event in appended} != {"auth.session-started"}:
+    raise SystemExit("non-auth events were appended during readiness verification")
+if {event.get("actor") for event in appended} != expected_actors:
+    raise SystemExit("persona auth actors did not match the three Judge Sandbox identities")
+print(f"{len(runtime.splitlines())}\t{len(appended)}")
+PY
+)" || fail "post-auth runtime validation failed"
+runtime_event_count="${post_auth_summary%%$'\t'*}"
+auth_event_count="${post_auth_summary##*$'\t'}"
+
+python3 - "$receipt_path" "$server_pid" "$port" "$runtime_store" "$log_path" \
+  "$golden_hash" "$event_count" "$submission_count" "$runtime_event_count" \
+  "$auth_event_count" "$auth_dir/results.tsv" <<'PY'
+import datetime
+import json
+import sys
+
+(
+    receipt_path,
+    server_pid,
+    port,
+    store_path,
+    log_path,
+    golden_hash,
+    event_count,
+    submission_count,
+    runtime_event_count,
+    auth_event_count,
+    results_path,
+) = sys.argv[1:]
+
+personas = {}
+with open(results_path, encoding="utf-8") as stream:
+    for line in stream:
+        role, status, location, final_url = line.rstrip("\n").split("\t")
+        personas[role] = {
+            "authenticated": True,
+            "login_status": int(status),
+            "location": location,
+            "final_url": final_url,
+        }
+
+receipt = {
+    "schema": "reset-jsonl-server.v1",
+    "status": "ready",
+    "verified_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "pid": int(server_pid),
+    "port": int(port),
+    "store_path": store_path,
+    "log_path": log_path,
+    "golden_sha256": golden_hash,
+    "golden_restored": True,
+    "event_count": int(event_count),
+    "submission_count": int(submission_count),
+    "runtime_event_count": int(runtime_event_count),
+    "auth_event_count": int(auth_event_count),
+    "personas": personas,
+}
+with open(receipt_path, "w", encoding="utf-8") as stream:
+    json.dump(receipt, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+print(json.dumps(receipt, sort_keys=True))
+PY
+
+echo "READY $base_url/login"
+echo "Receipt: $receipt_path"
+echo "Log: $log_path"

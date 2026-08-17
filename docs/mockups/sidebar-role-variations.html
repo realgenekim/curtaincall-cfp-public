@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ghost sidebar — role-section variations</title>
+<style>
+  /* Tokens lifted verbatim from resources/public/css/app.css */
+  :root {
+    --paper:#FAF7F2; --paper-deep:#F1EADD; --card:#FFFFFF;
+    --ink:#221E17; --ink-soft:#3B342A; --muted:#7C7264; --muted-2:#948A7B;
+    --kicker:#9C9284; --line:#E9E1D5; --line-soft:#EFE8DC;
+    --link:#1E62A8; --go:#1B7A4B; --highlight:#FFF1B8; --focus-line:#B9924A;
+    --ghost-paper:#F4EFE6; --ghost-line:#DFD5C4; --ghost-ink:#C4B9A6;
+    --radius:7px; --radius-lg:12px;
+    --font-display:'Fraunces','Iowan Old Style','Palatino Linotype',Georgia,serif;
+    --font-ui:'Source Sans 3',system-ui,'Seravek','Avenir Next','Segoe UI',sans-serif;
+  }
+  @font-face { font-family:'Fraunces';
+    src:url('http://localhost:20501/vendor/fraunces-latin.woff2') format('woff2');
+    font-weight:100 900; font-style:normal; font-display:swap; }
+  @font-face { font-family:'Source Sans 3';
+    src:url('http://localhost:20501/vendor/source-sans-3-latin.woff2') format('woff2');
+    font-weight:200 900; font-style:normal; font-display:swap; }
+
+  * { box-sizing:border-box; margin:0; }
+  body { background:#EDE7DC; font-family:var(--font-ui); color:var(--ink);
+         padding:28px; }
+  h1 { font-family:var(--font-display); font-size:26px; margin-bottom:4px; }
+  .sub { color:var(--muted); margin-bottom:24px; font-size:14.5px; }
+  .row { display:flex; gap:22px; align-items:flex-start; flex-wrap:wrap; }
+  .variant { width:272px; }
+  .vname { font-family:var(--font-display); font-weight:700; font-size:16px;
+           margin:0 0 2px; }
+  .vwhy { color:var(--muted); font-size:12.5px; line-height:1.45;
+          margin-bottom:10px; min-height:52px; }
+  .rail { background:var(--paper); border:1px solid var(--line);
+          border-radius:14px; padding:16px 14px 14px; }
+
+  /* ── shared sidebar idiom (matches app.css) ─────────────────── */
+  .sb-top { display:flex; justify-content:space-between; font-size:14px;
+            margin-bottom:6px; }
+  .sb-top a { color:var(--link); text-decoration:none; }
+  .sb-group { font-size:11.5px; letter-spacing:.09em; text-transform:uppercase;
+              color:var(--kicker); margin:13px 0 2px 2px; }
+  .sb-item { display:block; font-size:15px; color:var(--ink-soft);
+             padding:5px 3px; text-decoration:none; }
+  .sb-item.ghost { color:var(--muted); }
+  .sb-item.lnk { color:var(--link); }
+  .sb-step { display:flex; gap:8px; align-items:baseline; }
+  .sb-step-n { background:var(--line-soft); color:var(--muted); font-size:11px;
+               font-weight:700; width:18px; height:18px; border-radius:999px;
+               display:inline-flex; align-items:center; justify-content:center;
+               flex:none; transform:translateY(-1px); }
+  .sb-step-n.active { background:var(--highlight); color:var(--ink); }
+  .ghost-card { border:1px dashed var(--ghost-line); border-radius:var(--radius-lg);
+                background:var(--ghost-paper); margin:8px 0 4px; padding:10px 12px; }
+  .ghost-card b { font-family:var(--font-display); font-size:15.5px;
+                  color:var(--muted); display:block; }
+  .ghost-card a { font-size:13px; color:var(--link); text-decoration:none; }
+  .tour { color:var(--go); font-weight:600; font-size:14px; padding:6px 3px;
+          display:block; text-decoration:none; }
+  .quiet { margin-top:16px; padding-top:12px; border-top:1px solid var(--line);
+           font-size:13px; color:var(--muted); }
+  .quiet i { color:var(--ghost-ink); font-style:normal; padding:0 5px; }
+
+  /* ── V1 current: rule + tick ────────────────────────────────── */
+  .v1 .role { margin:16px 0 2px; padding-top:13px; border-top:1px solid var(--line); }
+  .v1 .role span { border-left:3px solid var(--highlight); padding-left:8px;
+                   font-family:var(--font-display); font-weight:700; font-size:14.5px; }
+
+  /* ── V2 band: tinted wash behind the role title ─────────────── */
+  .v2 .role { margin:16px -14px 4px; padding:7px 14px;
+              background:var(--paper-deep);
+              border-top:1px solid var(--line); border-bottom:1px solid var(--line);
+              font-family:var(--font-display); font-weight:700; font-size:14px;
+              letter-spacing:.02em; }
+  .v2 .role em { font-style:normal; color:var(--muted); font-family:var(--font-ui);
+                 font-weight:400; font-size:11px; text-transform:uppercase;
+                 letter-spacing:.1em; display:block; }
+
+  /* ── V3 rail: continuous left line holds each role section ──── */
+  .v3 .sect { border-left:3px solid var(--line); padding-left:11px;
+              margin:14px 0 0 2px; }
+  .v3 .sect.org { border-left-color:var(--focus-line); }
+  .v3 .sect.rev { border-left-color:var(--focus-line); }
+  .v3 .sect.spk { border-left-color:var(--focus-line); }
+  .v3 .role { font-family:var(--font-display); font-weight:700; font-size:14.5px;
+              margin-bottom:2px; }
+
+  /* ── V4 cards: each role is a card ──────────────────────────── */
+  .v4 .sect { background:var(--card); border:1px solid var(--line);
+              border-radius:var(--radius-lg); padding:10px 12px; margin-top:12px; }
+  .v4 .role { font-family:var(--font-display); font-weight:700; font-size:14.5px;
+              padding-bottom:7px; margin-bottom:4px;
+              border-bottom:1px solid var(--line-soft); }
+  .v4 .role small { display:block; font-family:var(--font-ui); font-weight:400;
+                    font-size:11.5px; color:var(--muted); margin-top:1px; }
+  .v4 .ghost-card { margin-top:2px; }
+</style>
+</head>
+<body>
+<h1>Ghost sidebar — role-section variations</h1>
+<p class="sub">Same content, four treatments, all in the app's own tokens. Fonts load from the dev server (start it if the serifs look wrong).</p>
+
+<div class="row">
+
+  <!-- V1 — current -->
+  <div class="variant">
+    <p class="vname">V1 — Rule + tick <span style="color:var(--muted);font-weight:400">(current)</span></p>
+    <p class="vwhy">What's live now. Quietest; the role titles can still be mistaken for group labels at a glance.</p>
+    <div class="rail v1">
+      <div class="sb-top"><a href="#">All events</a><a href="#">+ New event</a></div>
+      <div class="role"><span>As an organizer</span></div>
+      <div class="ghost-card"><b>Your event will live here</b><a href="#">Create it →</a></div>
+      <div class="sb-group">Create CFP — 3 steps</div>
+      <a class="sb-item lnk" href="#"><span class="sb-step"><span class="sb-step-n active">1</span>Create event</span></a>
+      <a class="sb-item ghost" href="#"><span class="sb-step"><span class="sb-step-n">2</span>Create CFP form</span></a>
+      <a class="sb-item ghost" href="#"><span class="sb-step"><span class="sb-step-n">3</span>Create review committee</span></a>
+      <div class="sb-group">Decide &amp; tell</div>
+      <a class="sb-item ghost" href="#">Inform Speakers</a>
+      <div class="sb-group">The show</div>
+      <a class="sb-item ghost" href="#">Schedule</a>
+      <a class="sb-item ghost" href="#">Public agenda</a>
+      <a class="sb-item ghost" href="#">Exports &amp; API</a>
+      <a class="tour" href="#">▶ Replay a real CFP</a>
+      <div class="role"><span>As a reviewer</span></div>
+      <a class="sb-item ghost" href="#">Review Board</a>
+      <div class="role"><span>As a speaker</span></div>
+      <a class="sb-item lnk" href="#">Update your profile</a>
+      <a class="sb-item lnk" href="#">Your submissions</a>
+      <div class="quiet">Comms<i>·</i>Log<i>·</i>Settings</div>
+    </div>
+  </div>
+
+  <!-- V2 — band -->
+  <div class="variant">
+    <p class="vname">V2 — Tinted band</p>
+    <p class="vwhy">Full-bleed paper-deep band per role, with a tiny eyebrow. Unmistakably a section header — nothing else in the rail looks like it.</p>
+    <div class="rail v2">
+      <div class="sb-top"><a href="#">All events</a><a href="#">+ New event</a></div>
+      <div class="role"><em>You, the</em>Organizer</div>
+      <div class="ghost-card"><b>Your event will live here</b><a href="#">Create it →</a></div>
+      <div class="sb-group">Create CFP — 3 steps</div>
+      <a class="sb-item lnk" href="#"><span class="sb-step"><span class="sb-step-n active">1</span>Create event</span></a>
+      <a class="sb-item ghost" href="#"><span class="sb-step"><span class="sb-step-n">2</span>Create CFP form</span></a>
+      <a class="sb-item ghost" href="#"><span class="sb-step"><span class="sb-step-n">3</span>Create review committee</span></a>
+      <div class="sb-group">Decide &amp; tell</div>
+      <a class="sb-item ghost" href="#">Inform Speakers</a>
+      <div class="sb-group">The show</div>
+      <a class="sb-item ghost" href="#">Schedule</a>
+      <a class="sb-item ghost" href="#">Public agenda</a>
+      <a class="sb-item ghost" href="#">Exports &amp; API</a>
+      <a class="tour" href="#">▶ Replay a real CFP</a>
+      <div class="role"><em>You, the</em>Reviewer</div>
+      <a class="sb-item ghost" href="#">Review Board</a>
+      <div class="role"><em>You, the</em>Speaker</div>
+      <a class="sb-item lnk" href="#">Update your profile</a>
+      <a class="sb-item lnk" href="#">Your submissions</a>
+      <div class="quiet">Comms<i>·</i>Log<i>·</i>Settings</div>
+    </div>
+  </div>
+
+  <!-- V3 — rail line -->
+  <div class="variant">
+    <p class="vname">V3 — Rail line</p>
+    <p class="vwhy">A continuous amber line physically CONTAINS each role's items — you can see where a role starts and ends without reading anything.</p>
+    <div class="rail v3">
+      <div class="sb-top"><a href="#">All events</a><a href="#">+ New event</a></div>
+      <div class="sect org">
+        <div class="role">As an organizer</div>
+        <div class="ghost-card"><b>Your event will live here</b><a href="#">Create it →</a></div>
+        <div class="sb-group">Create CFP — 3 steps</div>
+        <a class="sb-item lnk" href="#"><span class="sb-step"><span class="sb-step-n active">1</span>Create event</span></a>
+        <a class="sb-item ghost" href="#"><span class="sb-step"><span class="sb-step-n">2</span>Create CFP form</span></a>
+        <a class="sb-item ghost" href="#"><span class="sb-step"><span class="sb-step-n">3</span>Create review committee</span></a>
+        <div class="sb-group">Decide &amp; tell</div>
+        <a class="sb-item ghost" href="#">Inform Speakers</a>
+        <div class="sb-group">The show</div>
+        <a class="sb-item ghost" href="#">Schedule</a>
+        <a class="sb-item ghost" href="#">Public agenda</a>
+        <a class="sb-item ghost" href="#">Exports &amp; API</a>
+        <a class="tour" href="#">▶ Replay a real CFP</a>
+      </div>
+      <div class="sect rev">
+        <div class="role">As a reviewer</div>
+        <a class="sb-item ghost" href="#">Review Board</a>
+      </div>
+      <div class="sect spk">
+        <div class="role">As a speaker</div>
+        <a class="sb-item lnk" href="#">Update your profile</a>
+        <a class="sb-item lnk" href="#">Your submissions</a>
+      </div>
+      <div class="quiet">Comms<i>·</i>Log<i>·</i>Settings</div>
+    </div>
+  </div>
+
+  <!-- V4 — cards -->
+  <div class="variant">
+    <p class="vname">V4 — Role cards</p>
+    <p class="vwhy">Each role in a white card with a one-line promise under the title. Strongest separation; heaviest visually; matches the event-masthead-card idiom.</p>
+    <div class="rail v4">
+      <div class="sb-top"><a href="#">All events</a><a href="#">+ New event</a></div>
+      <div class="sect">
+        <div class="role">As an organizer<small>run the whole call on one calm page</small></div>
+        <div class="ghost-card"><b>Your event will live here</b><a href="#">Create it →</a></div>
+        <div class="sb-group">Create CFP — 3 steps</div>
+        <a class="sb-item lnk" href="#"><span class="sb-step"><span class="sb-step-n active">1</span>Create event</span></a>
+        <a class="sb-item ghost" href="#"><span class="sb-step"><span class="sb-step-n">2</span>Create CFP form</span></a>
+        <a class="sb-item ghost" href="#"><span class="sb-step"><span class="sb-step-n">3</span>Create review committee</span></a>
+        <div class="sb-group">Decide &amp; tell</div>
+        <a class="sb-item ghost" href="#">Inform Speakers</a>
+        <div class="sb-group">The show</div>
+        <a class="sb-item ghost" href="#">Schedule</a>
+        <a class="sb-item ghost" href="#">Public agenda</a>
+        <a class="sb-item ghost" href="#">Exports &amp; API</a>
+        <a class="tour" href="#">▶ Replay a real CFP</a>
+      </div>
+      <div class="sect">
+        <div class="role">As a reviewer<small>every score &amp; comment, one shared table</small></div>
+        <a class="sb-item ghost" href="#">Review Board</a>
+      </div>
+      <div class="sect">
+        <div class="role">As a speaker<small>one profile, every conference</small></div>
+        <a class="sb-item lnk" href="#">Update your profile</a>
+        <a class="sb-item lnk" href="#">Your submissions</a>
+      </div>
+      <div class="quiet">Comms<i>·</i>Log<i>·</i>Settings</div>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>

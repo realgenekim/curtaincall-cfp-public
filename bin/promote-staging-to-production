@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+project=${GCP_PROJECT:-swyx-cfp-saas-killer}
+region=${GCP_REGION:-us-west1}
+services=${SERVICE_NAMES:-"swyx-cfp-saas-killer curtaincallcfp"}
+receipt_root=${PROMOTION_RECEIPT_DIR:-.promotion-receipts}
+mode=${1:-}
+work_temp_dir=''
+
+cleanup() {
+  if [ -n "$work_temp_dir" ] && [ -d "$work_temp_dir" ]; then
+    rm -rf -- "$work_temp_dir"
+  fi
+}
+trap cleanup EXIT
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  bin/promote-staging-to-production verify <expected-git-sha>
+  PROMOTE=YES bin/promote-staging-to-production promote <expected-git-sha>
+  ROLLBACK=YES bin/promote-staging-to-production rollback <receipt-directory>
+
+The promote command moves both Cloud Run services to the exact revisions that
+were verified at their staging tag URLs. It records the previous production
+revisions and rolls back automatically if the transaction fails partway.
+EOF
+  exit 2
+}
+
+service_value() {
+  local service=$1
+  local format=$2
+  gcloud run services describe "$service" \
+    --project="$project" --region="$region" --format="$format" | head -1
+}
+
+staging_revision() {
+  service_value "$1" "value(status.traffic.filter(tag='staging').extract(revisionName).flatten())"
+}
+
+staging_url() {
+  service_value "$1" "value(status.traffic.filter(tag='staging').extract(url).flatten())"
+}
+
+production_revision() {
+  service_value "$1" "value(status.traffic.filter(percent=100).extract(revisionName).flatten())"
+}
+
+service_url() {
+  service_value "$1" "value(status.url)"
+}
+
+page_identity() {
+  local url=$1
+  local html
+  local sha
+  local deployed_at
+  html=$(curl --fail --silent --show-error --retry 3 "$url/")
+  sha=$(printf '%s' "$html" | sed -n 's/.*data-build-sha="\([^"]*\)".*/\1/p')
+  deployed_at=$(printf '%s' "$html" | sed -n 's/.*data-build-time="\([^"]*\)".*/\1/p')
+  test -n "$sha" || { echo "✗ $url has no visible build SHA" >&2; return 1; }
+  test -n "$deployed_at" || { echo "✗ $url has no visible deployment time" >&2; return 1; }
+  printf '%s\t%s\n' "$sha" "$deployed_at"
+}
+
+verify_smoke_paths() {
+  local base_url=$1
+  test "$(curl --fail --silent --show-error --retry 3 "$base_url/ping")" = "pong"
+  curl --fail --silent --show-error --retry 3 --output /dev/null \
+    "$base_url/cfp/enterprise-ai-summit-charlotte-2026"
+  curl --fail --silent --show-error --retry 3 --output /dev/null \
+    "$base_url/program/enterprise-ai-summit-charlotte-2026"
+}
+
+resolve_expected_sha() {
+  local requested=$1
+  local full
+  full=$(git rev-parse --verify "${requested}^{commit}" 2>/dev/null) \
+    || { echo "✗ EXPECTED_SHA is not a local commit: $requested" >&2; return 1; }
+  git rev-parse --short=7 "$full"
+}
+
+build_plan() {
+  local expected_short=$1
+  local plan_file=$2
+  local service
+  local staged_revision
+  local staged_url
+  local serving_revision
+  local live_service_url
+  local identity
+  local staged_sha
+  local deployed_at
+
+  : > "$plan_file"
+  for service in $services; do
+    staged_revision=$(staging_revision "$service")
+    staged_url=$(staging_url "$service")
+    serving_revision=$(production_revision "$service")
+    live_service_url=$(service_url "$service")
+    test -n "$staged_revision" || { echo "✗ $service has no staging-tagged revision" >&2; return 1; }
+    test -n "$staged_url" || { echo "✗ $service has no staging tag URL" >&2; return 1; }
+    test -n "$serving_revision" || { echo "✗ $service has no 100% production revision" >&2; return 1; }
+    identity=$(page_identity "$staged_url")
+    IFS=$'\t' read -r staged_sha deployed_at <<< "$identity"
+    test "$staged_sha" = "$expected_short" || {
+      echo "✗ $service staging serves $staged_sha, expected $expected_short" >&2
+      return 1
+    }
+    verify_smoke_paths "$staged_url"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$service" "$staged_revision" "$serving_revision" "$staged_url" \
+      "$live_service_url" "$deployed_at" >> "$plan_file"
+  done
+}
+
+print_plan() {
+  local plan_file=$1
+  printf '%-24s %-34s %-34s %s\n' SERVICE STAGING_REVISION CURRENT_PRODUCTION DEPLOYED_AT
+  while IFS=$'\t' read -r service staged previous _staging_url _service_url deployed_at; do
+    printf '%-24s %-34s %-34s %s\n' "$service" "$staged" "$previous" "$deployed_at"
+  done < "$plan_file"
+}
+
+rollback_promoted() {
+  local promoted_file=$1
+  local service
+  local previous
+  test -s "$promoted_file" || return 0
+  echo "! promotion failed; restoring services already moved" >&2
+  while IFS=$'\t' read -r service previous; do
+    gcloud run services update-traffic "$service" \
+      --project="$project" --region="$region" \
+      --to-revisions="${previous}=100" --quiet \
+      && echo "↩ restored $service to $previous" >&2
+  done < "$promoted_file"
+}
+
+verify_current_release() {
+  local url=$1
+  local expected_short=$2
+  local identity
+  local actual_sha
+  local _deployed_at
+  identity=$(page_identity "$url")
+  IFS=$'\t' read -r actual_sha _deployed_at <<< "$identity"
+  test "$actual_sha" = "$expected_short" || {
+    echo "✗ $url serves $actual_sha after promotion, expected $expected_short" >&2
+    return 1
+  }
+}
+
+verify_or_promote() {
+  local requested_sha=${1:-}
+  local expected_short
+  local plan_file
+  local promoted_file
+  local receipt_dir
+  local stamp
+  local service
+  local staged
+  local previous
+  local _staging_url_value
+  local service_url_value
+  local _deployed_at
+
+  test -n "$requested_sha" || usage
+  expected_short=$(resolve_expected_sha "$requested_sha")
+  work_temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/curtain-call-promotion.XXXXXX")
+  plan_file="$work_temp_dir/plan.tsv"
+  promoted_file="$work_temp_dir/promoted.tsv"
+  : > "$promoted_file"
+
+  build_plan "$expected_short" "$plan_file"
+  print_plan "$plan_file"
+  echo "✓ both staging revisions serve build $expected_short and pass smoke checks"
+
+  if [ "$mode" = "verify" ]; then
+    echo "✓ verification only; production traffic was not changed"
+    return 0
+  fi
+
+  test "${PROMOTE:-}" = "YES" || {
+    echo "✗ promotion refused: rerun with PROMOTE=YES" >&2
+    return 2
+  }
+
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  receipt_dir="$receipt_root/${stamp}-${expected_short}"
+  mkdir -p "$receipt_dir"
+  cp "$plan_file" "$receipt_dir/plan.tsv"
+  printf '%s\n' "$expected_short" > "$receipt_dir/expected-sha.txt"
+  printf 'started\n' > "$receipt_dir/status.txt"
+
+  on_error() {
+    local code=$?
+    trap - ERR
+    set +e
+    rollback_promoted "$promoted_file"
+    printf 'rolled-back-after-failure\n' > "$receipt_dir/status.txt"
+    echo "receipt: $receipt_dir" >&2
+    exit "$code"
+  }
+  trap on_error ERR
+
+  while IFS=$'\t' read -r service staged previous _staging_url_value service_url_value _deployed_at; do
+    gcloud run services update-traffic "$service" \
+      --project="$project" --region="$region" \
+      --to-revisions="${staged}=100" --quiet
+    printf '%s\t%s\n' "$service" "$previous" >> "$promoted_file"
+    test "$(production_revision "$service")" = "$staged"
+    verify_current_release "$service_url_value" "$expected_short"
+    echo "✓ $service now serves $staged"
+  done < "$plan_file"
+
+  verify_current_release "https://curtaincallcfp.com" "$expected_short"
+  verify_smoke_paths "https://curtaincallcfp.com"
+  printf 'complete\n' > "$receipt_dir/status.txt"
+  ln -sfn "$(basename "$receipt_dir")" "$receipt_root/latest"
+  trap - ERR
+  echo "✓ production now serves build $expected_short on both services"
+  echo "receipt: $receipt_dir"
+}
+
+rollback_receipt() {
+  local receipt_dir=${1:-}
+  local plan_file
+  local service
+  local _staged
+  local previous
+  local _staging_url
+  local _service_url
+  local _deployed_at
+
+  test -n "$receipt_dir" || usage
+  test "${ROLLBACK:-}" = "YES" || {
+    echo "✗ rollback refused: rerun with ROLLBACK=YES" >&2
+    return 2
+  }
+  plan_file="$receipt_dir/plan.tsv"
+  test -s "$plan_file" || { echo "✗ missing promotion receipt: $plan_file" >&2; return 1; }
+
+  while IFS=$'\t' read -r service _staged previous _staging_url _service_url _deployed_at; do
+    gcloud run services update-traffic "$service" \
+      --project="$project" --region="$region" \
+      --to-revisions="${previous}=100" --quiet
+    test "$(production_revision "$service")" = "$previous"
+    echo "↩ $service restored to $previous"
+  done < "$plan_file"
+  printf 'rolled-back-manually\n' > "$receipt_dir/status.txt"
+}
+
+case "$mode" in
+  verify) verify_or_promote "${2:-}" ;;
+  promote) verify_or_promote "${2:-}" ;;
+  rollback) rollback_receipt "${2:-}" ;;
+  *) usage ;;
+esac

@@ -1,0 +1,896 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(mktemp -d)
+trap 'rm -rf "$root"' EXIT
+tool="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/hill-climb-score-one"
+source_repo="$root/source"
+remote="$root/remote.git"
+fleet_root="$root/fleet-runs"
+state_root="$root/score-state"
+fake="$root/fake-fleet"
+eval_kit="$root/eval-kit"
+fake_bin="$root/fake-bin"
+deployment_receipts="$root/deployment-receipts"
+run_url=https://github.com/realgenekim/curtaincall-cfp/actions/runs/12345
+
+git init -q --bare "$remote"
+git init -q "$source_repo"
+git -C "$source_repo" config user.name fixture
+git -C "$source_repo" config user.email fixture@example.com
+mkdir -p "$source_repo/bin" "$source_repo/resources/judge-sandbox"
+printf '#!/usr/bin/env bash\nexit 99\n' >"$source_repo/bin/hill-climb-fleet"
+chmod +x "$source_repo/bin/hill-climb-fleet"
+printf '{"fixture":true}\n' >"$source_repo/resources/judge-sandbox/events.jsonl"
+git -C "$source_repo" add .
+git -C "$source_repo" commit -qm base
+git -C "$source_repo" branch -M staging
+git -C "$source_repo" remote add origin "$remote"
+git -C "$source_repo" push -q -u origin staging
+git -C "$remote" symbolic-ref HEAD refs/heads/staging
+git init -q "$eval_kit"
+git -C "$eval_kit" config user.name fixture
+git -C "$eval_kit" config user.email fixture@example.com
+printf '{"eval":true}\n' >"$eval_kit/evalconfig.json"
+printf 'honest\n' >"$eval_kit/score-mode"
+printf 'archive-only-sentinel export-ignore\n' >"$eval_kit/.gitattributes"
+printf 'must-not-execute\n' >"$eval_kit/archive-only-sentinel"
+# evalconfig.json is intentionally a required untracked runtime input. This is
+# the production shape that exact Git-archive copying previously broke.
+git -C "$eval_kit" add .gitattributes archive-only-sentinel score-mode
+git -C "$eval_kit" commit -qm eval-kit
+mkdir -p "$eval_kit/node_modules"
+
+cat >"$fake" <<'FAKE'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  stop) exit 0 ;;
+  start) ;;
+  *) exit 64 ;;
+esac
+run="$FLEET_STATE_ROOT/run-${FLEET_SHA:0:12}-$$"
+mkdir -p "$run/inputs" "$run/consolidated-kit/runs/fleet-consolidated/judgements"
+install -m 0400 "$FLEET_EVAL_CONFIG" "$run/inputs/evalconfig.json"
+install -m 0600 "$FLEET_EVAL_CONFIG" "$run/consolidated-kit/evalconfig.json"
+cp "$FLEET_EVAL_KIT/score-mode" "$run/consolidated-kit/score-mode"
+[[ ! -e "$FLEET_EVAL_KIT/archive-only-sentinel" ]]
+ln -sfn "$run" "$FLEET_STATE_ROOT/current"
+printf '%s\n' "$$" >"$run/supervisor.pid"
+fixture=$(git -C "$FLEET_SOURCE_REPO" show "$FLEET_SHA:resources/judge-sandbox/events.jsonl" | shasum -a 256 | awk '{print $1}')
+eval_sha=$(git -C "$FLEET_EVAL_KIT" rev-parse HEAD)
+eval_archive=$(git -C "$FLEET_EVAL_KIT" archive "$eval_sha" | shasum -a 256 | awk '{print $1}')
+eval_config=$(shasum -a 256 "$FLEET_EVAL_CONFIG" | awk '{print $1}')
+[[ "$eval_config" == "$FLEET_EVAL_CONFIG_SHA256" ]]
+[[ -s "$FLEET_EVAL_CONFIG" ]]
+jq -n --arg sha "$FLEET_SHA" --arg harness "$FLEET_HARNESS_SHA" \
+  --arg fixture "$fixture" --arg worker "$FLEET_WORKER_MODEL" --arg judge "$FLEET_JUDGE_MODEL" \
+  --arg worker_effort "$FLEET_WORKER_REASONING_EFFORT" --arg judge_effort "$FLEET_JUDGE_REASONING_EFFORT" \
+  --arg run_url "$FLEET_DEPLOYMENT_RUN_URL" --arg eval_sha "$eval_sha" --arg eval_archive "$eval_archive" \
+  --arg eval_config "$eval_config" \
+  --argjson turns "$FLEET_MAX_TURNS_PER_SCENARIO" --argjson samples "$FLEET_JUDGE_SAMPLE_COUNT" \
+  '{schema:"hill-climb-fleet-manifest.v1",code_sha:$sha,harness_sha:$harness,dirty:false,
+    deployment_run_url:$run_url,
+    evidence_only:false,worker_executor:"codex",worker_model:$worker,
+    worker_reasoning_effort:$worker_effort,judge_executor:"codex",judge_model:$judge,
+    judge_reasoning_effort:$judge_effort,judge_sample_count:$samples,
+    max_turns_per_scenario:$turns,slots:6,
+    scenarios:["CFP-S1","CFP-S2","CFP-S3","CFP-S4","ABS-S1","ABS-S2","ABS-S3",
+      "SPK-S1","SPK-S2","SPK-S3","CNT-S1","CNT-S2","CNT-S3","AIA-S1","AIA-S2",
+      "EMB-S1","EMB-S2","EMB-S3"],golden_fixture_sha256:$fixture,
+    eval_kit_sha:$eval_sha,eval_kit_archive_sha256:$eval_archive,
+    eval_config_sha256:$eval_config}' >"$run/manifest.json"
+jq -n --arg sha "$FLEET_SHA" --arg fixture "$fixture" \
+  '{schema:"hill-climb-fleet-readiness.v1",status:"ready",code_sha:$sha,
+    slots:([
+      {slot:0,port:20500,lane:"CFP",scenarios:["CFP-S1","CFP-S2","CFP-S3","CFP-S4"]},
+      {slot:1,port:20501,lane:"ABS",scenarios:["ABS-S1","ABS-S2","ABS-S3"]},
+      {slot:2,port:20502,lane:"SPK",scenarios:["SPK-S1","SPK-S2","SPK-S3"]},
+      {slot:3,port:20503,lane:"CNT",scenarios:["CNT-S1","CNT-S2","CNT-S3"]},
+      {slot:4,port:20504,lane:"AIA",scenarios:["AIA-S1","AIA-S2"]},
+      {slot:5,port:20505,lane:"EMB",scenarios:["EMB-S1","EMB-S2","EMB-S3"]}
+    ] | map(. + {schema:"hill-climb-slot-ready.v1",code_sha:$sha,
+      golden_sha256:$fixture,submissions:502,personas:["organizer","reviewer","speaker"]}))}' \
+  >"$run/readiness.json"
+jq -n '{schema:"hill-climb-fleet-state.v1",status:"running"}' >"$run/state.json"
+: >"$run/events.log"
+sleep "${FAKE_FLEET_DELAY:-0}"
+if [[ "${FAKE_FLEET_ORPHAN_CHILD:-false}" == true ]]; then
+  sleep 60 &
+  printf '%s\n' "$!" >"$FLEET_STATE_ROOT/orphan-child.pid"
+  exit 9
+fi
+if [[ "${FAKE_FLEET_FAIL:-false}" == true ]]; then
+  jq -n '{schema:"hill-climb-fleet-state.v1",status:"failed"}' >"$run/state.json"
+  exit 9
+fi
+for scenario in CFP-S1 CFP-S2 CFP-S3 CFP-S4 ABS-S1 ABS-S2 ABS-S3 SPK-S1 SPK-S2 SPK-S3 CNT-S1 CNT-S2 CNT-S3 AIA-S1 AIA-S2 EMB-S1 EMB-S2 EMB-S3; do
+  mkdir -p "$run/consolidated-kit/runs/fleet-consolidated/$scenario/screenshots"
+  printf '2026-01-01T00:00:00Z CAPTURED scenario=%s\n' "$scenario" >>"$run/events.log"
+  proof="$run/consolidated-kit/runs/fleet-consolidated/$scenario/screenshots/proof.txt"
+  if [[ "$scenario" == CFP-S1 && "${FAKE_LARGE_EVIDENCE_MB:-0}" -gt 0 ]]; then
+    python3 - "$proof" "$FAKE_LARGE_EVIDENCE_MB" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+remaining = int(sys.argv[2])
+with path.open("wb") as stream:
+    for _ in range(remaining):
+        stream.write(b"x" * (1024 * 1024))
+PY
+  else
+    printf 'fixture screenshot bytes for %s\n' "$scenario" >"$proof"
+  fi
+  jq -n --arg scenario "$scenario" \
+    '{scenarioId:$scenario,outcome:"completed",observations:["fixture observation"],
+      transcript:[{turn:7,kind:"observation",detail:"fixture observation"}],turns:7,
+      screenshots:[{path:"screenshots/proof.txt",label:"fixture",turn:7}]}' \
+    >"$run/consolidated-kit/runs/fleet-consolidated/$scenario/evidence.json"
+done
+for entry in call-for-papers:CFP abstract-management:ABS speaker-management:SPK content-management:CNT ai-agenda:AIA public-widgets:EMB; do
+  area=${entry%%:*}
+  code=${entry##*:}
+  jq -n --arg code "$code" \
+    '{items:[{id:($code+"-01"),verdict:"pass",confidence:"high",reasoning:"fixture",
+      evidence_refs:["CFP-S1/screenshots/proof.txt"]}],
+      defects:[],area_notes:"fixture"}' \
+    >"$run/consolidated-kit/runs/fleet-consolidated/judgements/$area.json"
+  mkdir -p "$run/judgement-candidates/$area" "$run/judgement-inputs/$area"
+  printf 'fixture rubric %s\n' "$area" >"$run/judgement-inputs/$area/brief.txt"
+  printf 'fixture input %s\n' "$area" >"$run/judgement-inputs/$area/input.sha256"
+  rubric_sha=$(shasum -a 256 "$run/judgement-inputs/$area/brief.txt" | awk '{print $1}')
+  input_sha=$(shasum -a 256 "$run/judgement-inputs/$area/input.sha256" | awk '{print $1}')
+  rows='[]'
+  for sample in 1 2 3; do
+    attempt="$run/judgement-candidates/$area/attempt-$(printf '%04d' "$sample")"
+    mkdir -p "$attempt"
+    printf 'fixture exact prompt %s\n' "$area" >"$attempt/prompt.txt"
+    prompt_sha=$(shasum -a 256 "$attempt/prompt.txt" | awk '{print $1}')
+    cp "$run/consolidated-kit/runs/fleet-consolidated/judgements/$area.json" \
+      "$attempt/judgement.json"
+    judgement_output_sha=$(shasum -a 256 "$attempt/judgement.json" | awk '{print $1}')
+    printf '{"fixture":"candidate-report"}\n' >"$attempt/candidate-report.json"
+    report_sha=$(shasum -a 256 "$attempt/candidate-report.json" | awk '{print $1}')
+    jq -n --arg area "$area" --arg model "$FLEET_JUDGE_MODEL" \
+      --arg effort "$FLEET_JUDGE_REASONING_EFFORT" --arg prompt "$prompt_sha" \
+      --arg input "$input_sha" --arg rubric "$rubric_sha" --arg archive "$eval_archive" \
+      --arg config "$eval_config" --argjson sample "$sample" \
+      '{schema:"hill-climb-judge-invocation.v1",area:$area,sample:$sample,
+        executor:"codex",model:$model,reasoning_effort:$effort,prompt_sha256:$prompt,
+        input_sha256:$input,rubric_sha256:$rubric,eval_kit_archive_sha256:$archive,
+        eval_config_sha256:$config}' >"$attempt/invocation.json"
+    jq -n --arg area "$area" --arg sha "$judgement_output_sha" --argjson sample "$sample" \
+      '{schema:"hill-climb-judge-output.v1",area:$area,sample:$sample,
+        path:"judgement.json",sha256:$sha}' >"$attempt/judgement-receipt.json"
+    jq -n --arg area "$area" --arg judgement "$judgement_output_sha" \
+      --arg report "$report_sha" --arg archive "$eval_archive" --arg config "$eval_config" \
+      --argjson sample "$sample" \
+      '{schema:"hill-climb-candidate-score.v1",area:$area,sample:$sample,
+        judgement_sha256:$judgement,computed_score_pct:100,score_pct:100,coverage_pct:100,
+        report_sha256:$report,score_code_sha256:$archive,eval_config_sha256:$config}' \
+      >"$attempt/score-receipt.json"
+    invocation_sha=$(shasum -a 256 "$attempt/invocation.json" | awk '{print $1}')
+    judgement_sha=$(shasum -a 256 "$attempt/judgement-receipt.json" | awk '{print $1}')
+    score_sha=$(shasum -a 256 "$attempt/score-receipt.json" | awk '{print $1}')
+    jq -n --arg area "$area" --arg attempt "attempt-$(printf '%04d' "$sample")" \
+      --arg invocation "$invocation_sha" --arg judgement "$judgement_sha" --arg score "$score_sha" \
+      --argjson sample "$sample" \
+      '{schema:"hill-climb-judgement-candidate.v1",status:"enrolled",area:$area,
+        sample:$sample,attempt:$attempt,receipts:{invocation_sha256:$invocation,
+        judgement_sha256:$judgement,score_sha256:$score}}' >"$attempt/candidate.json"
+    candidate_sha=$(shasum -a 256 "$attempt/candidate.json" | awk '{print $1}')
+    rows=$(jq -c --arg candidate "$candidate_sha" --arg invocation "$invocation_sha" \
+      --arg judgement "$judgement_sha" --arg score "$score_sha" --argjson sample "$sample" \
+      '. + [{sample:$sample,candidate_sha256:$candidate,invocation_sha256:$invocation,
+             judgement_sha256:$judgement,score_sha256:$score}]' <<<"$rows")
+  done
+  mkdir -p "$run/judgement-folds"
+  output_sha=$(shasum -a 256 \
+    "$run/consolidated-kit/runs/fleet-consolidated/judgements/$area.json" | awk '{print $1}')
+  jq -n --arg area "$area" --arg output "$output_sha" --arg model "$FLEET_JUDGE_MODEL" \
+    --arg effort "$FLEET_JUDGE_REASONING_EFFORT" --arg archive "$eval_archive" \
+    --arg config "$eval_config" --argjson rows "$rows" --arg prompt "$prompt_sha" \
+    --arg input "$input_sha" --arg rubric "$rubric_sha" \
+    '{schema:"hill-climb-judgement-fold.v1",area:$area,fold:"median-candidate-by-area-score",
+      fold_status:"complete",requested_n:3,enrolled_n:3,valid_score_n:3,
+      coverage_gate_failures:[],candidate_receipts:$rows,predicate_results:[],
+      invocation_tuple:{executor:"codex",model:$model,reasoning_effort:$effort,
+        prompt_sha256:$prompt,input_sha256:$input,rubric_sha256:$rubric,
+        eval_kit_archive_sha256:$archive,eval_config_sha256:$config},
+      scores_pct:[100,100,100],computed_scores_pct:[100,100,100],
+      coverage_pct:[100,100,100],selected_sample:2,
+      selected_judgement_sha256:$output,output_sha256:$output}' \
+    >"$run/judgement-folds/$area.json"
+done
+jq -n '{schema:"hill-climb-fleet-summary.v1",status:"complete",expected:18,captured:18,complete:18,failed_or_missing:0}' >"$run/summary.json"
+(cd "$run/consolidated-kit" && npx --yes pnpm@9 run --silent sbek -- score --run runs/fleet-consolidated)
+cp "$run/consolidated-kit/runs/fleet-consolidated/report.json" "$run/report.json"
+if [[ "${FAKE_FLEET_SYMLINK_REPORT:-false}" == true ]]; then
+  mv "$run/report.json" "$run/report.real.json"
+  ln -s report.real.json "$run/report.json"
+fi
+jq -n '{schema:"hill-climb-fleet-state.v1",status:"complete"}' >"$run/state.json"
+FAKE
+chmod +x "$fake"
+
+# The production command extracts the harness from the exact product commit.
+# Seal this fixture harness into that commit so the test uses the same path.
+cp "$fake" "$source_repo/bin/hill-climb-fleet"
+git -C "$source_repo" add bin/hill-climb-fleet
+git -C "$source_repo" commit --amend -qm base
+git -C "$source_repo" push -q --force origin staging
+sha=$(git -C "$source_repo" rev-parse HEAD)
+
+mkdir -p "$fake_bin"
+cat >"$fake_bin/curl" <<'CURL'
+#!/usr/bin/env bash
+set -euo pipefail
+jq -nc --arg sha "$TEST_DEPLOY_SHA" --arg url "$TEST_DEPLOY_URL" \
+  '{head_sha:$sha,status:"completed",conclusion:"success",html_url:$url,
+    path:".github/workflows/build-and-deploy.yml"}'
+CURL
+chmod +x "$fake_bin/curl"
+cat >"$fake_bin/gh" <<'GH'
+#!/usr/bin/env bash
+exit 1
+GH
+chmod +x "$fake_bin/gh"
+cat >"$fake_bin/npx" <<'NPX'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ " $* " == *" install "* ]]; then
+  exit 0
+fi
+[[ -s "$PWD/evalconfig.json" ]]
+if [[ -n "${TEST_VERIFIER_SENTINEL:-}" && "$PWD" != "${TEST_RUN_PREFIX:-}"* ]]; then
+  : >"$TEST_VERIFIER_SENTINEL"
+fi
+python3 - "$PWD/runs/fleet-consolidated" <<'PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+mode = (root.parents[1] / "score-mode").read_text().strip()
+areas = [
+    ("call-for-papers", 20), ("abstract-management", 20),
+    ("speaker-management", 15), ("content-management", 15),
+    ("ai-agenda", 10), ("public-widgets", 20),
+]
+result = []
+for area, weight in areas:
+    judgement = json.loads((root / "judgements" / f"{area}.json").read_text())
+    items = judgement["items"]
+    judgeable = [item for item in items if item["verdict"] != "cannot_judge"]
+    earned = sum(1 for item in judgeable if item["verdict"] == "pass")
+    pct = 100 * earned / len(judgeable) if judgeable else 0
+    coverage = 100 * len(judgeable) / len(items)
+    result.append({"area": area, "title": area, "optional": False,
+        "areaWeight": weight, "earned": earned, "judgeable": len(judgeable),
+        "totalWeight": len(items), "byType": {}, "pct": pct,
+        "coveragePct": coverage, "pendingManual": [], "items": items,
+        "defects": judgement["defects"], "notes": judgement["area_notes"],
+        "scenarios": []})
+overall = sum(area["pct"] * area["areaWeight"] for area in result) / 100
+coverage = sum(area["coveragePct"] * area["areaWeight"] for area in result) / 100
+if mode == "dirty":
+    overall = 99.9
+report = {"scoreWithheld": False, "overallPct": overall,
+          "overallCoveragePct": coverage, "areas": result,
+          "byType": {}, "manualPending": [], "models": {}, "kitVersion": "fixture",
+          "targetUrl": "fixture", "startedAt": "one", "finishedAt": "two"}
+(root / "report.json").write_text(json.dumps(report, sort_keys=True) + "\n")
+PY
+sleep "${FAKE_SCORE_DELAY:-0}"
+NPX
+chmod +x "$fake_bin/npx"
+
+mkdir -p "$deployment_receipts"
+chmod 0700 "$deployment_receipts"
+cat >"$deployment_receipts/deploy.job" <<EOF
+pushed-sha: $sha
+deploy-run: $run_url
+deploy-result: success
+EOF
+chmod 0644 "$deployment_receipts/deploy.job"
+printf 'deploy-result: success\n' >"$deployment_receipts/legacy.job"
+chmod 0644 "$deployment_receipts/legacy.job"
+
+common=(
+  PATH="$fake_bin:$PATH"
+  TEST_DEPLOY_SHA="$sha"
+  TEST_DEPLOY_URL="$run_url"
+  SCORE_ONE_STATE_ROOT="$state_root"
+  SCORE_ONE_JUDGE_SAMPLE_COUNT=3
+  SCORE_ONE_HEARTBEAT_SECONDS=1
+  SCORE_ONE_STALE_SECONDS=2
+  FLEET_SOURCE_REPO="$source_repo"
+  FLEET_STATE_ROOT="$fleet_root"
+  FLEET_EVAL_KIT="$eval_kit"
+)
+
+# The credential-free private-repository path consumes the merger's own
+# exact-SHA deployment receipt and rejects weak ownership or malformed fields.
+"$tool" _test-local-deployment-proof "$deployment_receipts" "$(id -un)" "$sha" "$run_url" |
+  jq -e '.source == "merger-done-receipt" and .head_sha == $sha' --arg sha "$sha" >/dev/null
+chmod 0777 "$deployment_receipts"
+if "$tool" _test-local-deployment-proof "$deployment_receipts" "$(id -un)" "$sha" "$run_url" \
+    >/dev/null 2>&1; then
+  printf 'expected writable deployment receipt directory to fail\n' >&2
+  exit 1
+fi
+chmod 0700 "$deployment_receipts"
+printf 'deploy-result: success\n' >>"$deployment_receipts/deploy.job"
+if "$tool" _test-local-deployment-proof "$deployment_receipts" "$(id -un)" "$sha" "$run_url" \
+    >/dev/null 2>&1; then
+  printf 'expected duplicate deployment receipt field to fail\n' >&2
+  exit 1
+fi
+sed -i.bak '$d' "$deployment_receipts/deploy.job"
+rm "$deployment_receipts/deploy.job.bak"
+printf 'pushed-sha: %s\n' "$sha" >"$deployment_receipts/partial-target.job"
+chmod 0644 "$deployment_receipts/partial-target.job"
+if "$tool" _test-local-deployment-proof "$deployment_receipts" "$(id -un)" "$sha" "$run_url" \
+    >/dev/null 2>&1; then
+  printf 'expected partial target deployment receipt to fail\n' >&2
+  exit 1
+fi
+rm "$deployment_receipts/partial-target.job"
+cat >"$deployment_receipts/wrong-url.job" <<EOF
+pushed-sha: $sha
+deploy-run: https://github.com/realgenekim/curtaincall-cfp/actions/runs/99999
+deploy-result: success
+EOF
+chmod 0644 "$deployment_receipts/wrong-url.job"
+if "$tool" _test-local-deployment-proof "$deployment_receipts" "$(id -un)" "$sha" "$run_url" \
+    >/dev/null 2>&1; then
+  printf 'expected target SHA with contradictory URL to fail\n' >&2
+  exit 1
+fi
+rm "$deployment_receipts/wrong-url.job"
+cat >"$deployment_receipts/wrong-sha.job" <<EOF
+pushed-sha: $(printf '0%.0s' {1..40})
+deploy-run: $run_url
+deploy-result: success
+EOF
+chmod 0644 "$deployment_receipts/wrong-sha.job"
+if "$tool" _test-local-deployment-proof "$deployment_receipts" "$(id -un)" "$sha" "$run_url" \
+    >/dev/null 2>&1; then
+  printf 'expected target URL with contradictory SHA to fail\n' >&2
+  exit 1
+fi
+rm "$deployment_receipts/wrong-sha.job"
+
+# The live evaluator checkout may be dirty, but execution must come from the
+# exact Git archive identity recorded in the receipt.
+printf 'dirty\n' >"$eval_kit/score-mode"
+env -u OPENAI_API_KEY -u CODEX_API_KEY "${common[@]}" FAKE_FLEET_DELAY=2 \
+  "$tool" run "$sha" "$run_url" >"$root/first-receipt.json" &
+first_pid=$!
+for _ in $(seq 1 50); do
+  status=$(env "${common[@]}" "$tool" status 2>/dev/null || true)
+  [[ "$(jq -r .lock_held <<<"$status")" == true ]] && break
+  sleep 0.05
+done
+for _ in $(seq 1 100); do
+  pinned_config=$(find "$state_root/attempts" -name evalconfig.json -type f 2>/dev/null | head -1 || true)
+  [[ -n "$pinned_config" ]] && break
+  sleep 0.02
+done
+[[ -n "${pinned_config:-}" ]]
+cp "$eval_kit/evalconfig.json" "$root/evalconfig.good.json"
+printf '{"changed_after_pin":true}\n' >"$eval_kit/evalconfig.json"
+set +e
+env -u OPENAI_API_KEY -u CODEX_API_KEY "${common[@]}" \
+  "$tool" run "$sha" "$run_url" >"$root/overlap.out" 2>"$root/overlap.err"
+overlap_rc=$?
+set -e
+[[ "$overlap_rc" -eq 75 ]]
+wait "$first_pid"
+git -C "$eval_kit" checkout -- score-mode
+cp "$root/evalconfig.good.json" "$eval_kit/evalconfig.json"
+jq -e --arg sha "$sha" \
+  '.status == "complete" and .sha == $sha and .score == 100 and .captured == 18 and
+   .judges == 6 and .instrument.judge_sample_count == 3 and
+   (.artifacts | length) == 192 and
+   (.deployment.status == "completed") and (.instrument.evidence_only == false) and
+   (.eval_kit.sha | length) == 40 and (.eval_kit.eval_config_sha256 | length) == 64 and
+   (.artifact_set_sha256 | length) == 64' \
+  "$root/first-receipt.json" >/dev/null
+
+status=$(env "${common[@]}" "$tool" status)
+[[ "$(jq -r .lock_held <<<"$status")" == false ]]
+[[ "$(jq -r .fleet_state <<<"$status")" == complete ]]
+[[ "$(jq -r .qualified_complete <<<"$status")" == true ]]
+run=$(readlink "$fleet_root/current")
+
+# Ordinary completion uses the same shared verifier as recovery. A symlink
+# that the permissive validator can follow must still prevent publication.
+complete_before=$(grep -c '"event":"complete"' "$state_root/events.jsonl")
+set +e
+env -u OPENAI_API_KEY -u CODEX_API_KEY "${common[@]}" FAKE_FLEET_SYMLINK_REPORT=true \
+  "$tool" run "$sha" "$run_url" >"$root/symlink-run.out" 2>"$root/symlink-run.err"
+symlink_run_rc=$?
+set -e
+[[ "$symlink_run_rc" -ne 0 ]]
+[[ "$(grep -c '"event":"complete"' "$state_root/events.jsonl")" == "$complete_before" ]]
+grep -q 'shared verifier' "$root/symlink-run.err"
+ln -sfn "$run" "$fleet_root/current"
+
+cp "$run/manifest.json" "$root/manifest.good.json"
+
+# A completed directory is not a score until a matching complete event and
+# hash-bound attempt receipt prove it.
+cp -a "$run" "$fleet_root/unbound-complete"
+ln -sfn "$fleet_root/unbound-complete" "$fleet_root/current"
+set +e
+unbound=$(env "${common[@]}" "$tool" status)
+unbound_rc=$?
+set -e
+[[ "$unbound_rc" -eq 2 ]]
+[[ "$(jq -r .qualified_complete <<<"$unbound")" == false ]]
+jq -e '.errors | any(contains("no matching complete"))' <<<"$unbound" >/dev/null
+ln -sfn "$run" "$fleet_root/current"
+
+# Standalone validation independently rechecks the immutable source fixture,
+# deployment, all evidence, all judgements, and the exact instrument.
+jq '.judge_model="wrong"' "$root/manifest.good.json" >"$run/manifest.json"
+if env "${common[@]}" "$tool" validate "$run" >/dev/null 2>&1; then
+  printf 'expected provenance mismatch to fail\n' >&2
+  exit 1
+fi
+cp "$root/manifest.good.json" "$run/manifest.json"
+
+chmod 0600 "$run/inputs/evalconfig.json"
+if env "${common[@]}" "$tool" validate "$run" >/dev/null 2>&1; then
+  printf 'expected writable run eval config artifact to fail validation\n' >&2
+  exit 1
+fi
+chmod 0400 "$run/inputs/evalconfig.json"
+
+# Standalone validation derives the expected config digest from the immutable
+# run artifact, never from a manifest self-claim.
+jq '.eval_config_sha256=("0"*64)' "$root/manifest.good.json" >"$run/manifest.json"
+if env "${common[@]}" "$tool" validate "$run" >/dev/null 2>&1; then
+  printf 'expected self-claimed eval config hash to fail validation\n' >&2
+  exit 1
+fi
+cp "$root/manifest.good.json" "$run/manifest.json"
+
+jq '.scenarios += ["EMB-S3"]' "$root/manifest.good.json" >"$run/manifest.json"
+if env "${common[@]}" "$tool" validate "$run" >/dev/null 2>&1; then
+  printf 'expected duplicate scenario to fail validation\n' >&2
+  exit 1
+fi
+cp "$root/manifest.good.json" "$run/manifest.json"
+
+evidence="$run/consolidated-kit/runs/fleet-consolidated/ABS-S1/evidence.json"
+mv "$evidence" "$evidence.missing"
+if env "${common[@]}" "$tool" validate "$run" >/dev/null 2>&1; then
+  printf 'expected missing evidence to fail validation\n' >&2
+  exit 1
+fi
+mv "$evidence.missing" "$evidence"
+
+judgement="$run/consolidated-kit/runs/fleet-consolidated/judgements/abstract-management.json"
+cp "$judgement" "$root/judgement.good.json"
+printf '{}\n' >"$judgement"
+if env "${common[@]}" "$tool" validate "$run" >/dev/null 2>&1; then
+  printf 'expected invalid judgement to fail validation\n' >&2
+  exit 1
+fi
+cp "$root/judgement.good.json" "$judgement"
+cp "$run/report.json" "$root/report.good.json"
+
+set_abstract_refs() {
+  local references=$1
+  jq --argjson references "$references" \
+    '(.items[0].evidence_refs)=$references' "$root/judgement.good.json" >"$judgement"
+  jq --argjson references "$references" \
+    '(.areas[] | select(.area == "abstract-management") | .items[0].evidence_refs)=$references' \
+    "$root/report.good.json" >"$run/report.json"
+  output_sha=$(shasum -a 256 "$judgement" | awk '{print $1}')
+  jq --arg output "$output_sha" '.output_sha256=$output' \
+    "$run/judgement-folds/abstract-management.json" \
+    >"$run/judgement-folds/abstract-management.json.tmp"
+  mv "$run/judgement-folds/abstract-management.json.tmp" \
+    "$run/judgement-folds/abstract-management.json"
+}
+
+assert_bad_abstract_refs() {
+  local references=$1 label=$2
+  set_abstract_refs "$references"
+  if env "${common[@]}" "$tool" validate "$run" >/dev/null 2>&1; then
+    printf 'expected %s evidence reference to fail validation\n' "$label" >&2
+    exit 1
+  fi
+}
+
+# Judgement evidence references are capabilities over an immutable inventory,
+# not arbitrary paths or unverified prose. Traversal, empty, and invented
+# symbolic references all refuse before report linkage can launder them.
+assert_bad_abstract_refs '["ABS-S3/../../manifest.json"]' "parent-traversal"
+assert_bad_abstract_refs '["ABS-S3/screenshots/../ABS-S1/screenshots/proof.txt"]' "cross-scenario-traversal"
+assert_bad_abstract_refs '[]' "empty"
+assert_bad_abstract_refs '["obs: invented observation","turn 999"]' "arbitrary-symbolic"
+
+# Exact screenshot membership and exact observation/turn inventory membership
+# are both accepted. Keep report and judgement structurally linked for these
+# positive validation fixtures.
+set_abstract_refs '["ABS-S3/screenshots/proof.txt"]'
+env "${common[@]}" "$tool" validate "$run" >/dev/null
+set_abstract_refs '["obs: fixture observation","turn 7"]'
+env "${common[@]}" "$tool" validate "$run" >/dev/null
+cp "$root/judgement.good.json" "$judgement"
+cp "$root/report.good.json" "$run/report.json"
+output_sha=$(shasum -a 256 "$judgement" | awk '{print $1}')
+jq --arg output "$output_sha" '.output_sha256=$output' \
+  "$run/judgement-folds/abstract-management.json" \
+  >"$run/judgement-folds/abstract-management.json.tmp"
+mv "$run/judgement-folds/abstract-management.json.tmp" \
+  "$run/judgement-folds/abstract-management.json"
+
+mkdir -p "$root/judgements.good"
+cp "$run/consolidated-kit/runs/fleet-consolidated/judgements/"*.json "$root/judgements.good/"
+for changed in "$run/consolidated-kit/runs/fleet-consolidated/judgements/"*.json; do
+  jq '(.items[].verdict)="fail"' "$changed" >"$changed.tmp"
+  mv "$changed.tmp" "$changed"
+done
+jq '.overallPct=99.9 | (.areas[].items[].verdict)="fail"' "$root/report.good.json" >"$run/report.json"
+if env "${common[@]}" "$tool" validate "$run" >/dev/null 2>&1; then
+  printf 'expected report/judgement score mismatch to fail validation\n' >&2
+  exit 1
+fi
+cp "$root/judgements.good/"*.json "$run/consolidated-kit/runs/fleet-consolidated/judgements/"
+cp "$root/report.good.json" "$run/report.json"
+
+# A run-local dirty scoring implementation cannot prove itself twice: the
+# verifier is reconstructed from the declared clean eval-kit Git archive.
+printf 'dirty\n' >"$run/consolidated-kit/score-mode"
+(cd "$run/consolidated-kit" && env "${common[@]}" npx --yes pnpm@9 run --silent sbek -- score --run runs/fleet-consolidated)
+cp "$run/consolidated-kit/runs/fleet-consolidated/report.json" "$run/report.json"
+if env "${common[@]}" "$tool" validate "$run" >/dev/null 2>&1; then
+  printf 'expected dirty run-local scoring engine to fail validation\n' >&2
+  exit 1
+fi
+printf 'honest\n' >"$run/consolidated-kit/score-mode"
+cp "$root/report.good.json" "$run/report.json"
+
+jq '.golden_fixture_sha256=("0"*64)' "$root/manifest.good.json" >"$run/manifest.json"
+if env "${common[@]}" "$tool" validate "$run" >/dev/null 2>&1; then
+  printf 'expected fixture mismatch to fail validation\n' >&2
+  exit 1
+fi
+cp "$root/manifest.good.json" "$run/manifest.json"
+
+# A failed-at-judge run with complete evidence and recovered judgements becomes
+# terminal only through a deterministic receipt + append-only complete event.
+# The original failed fleet state remains unchanged historical evidence.
+recovery_run="$fleet_root/recoverable-judge-failure"
+cp -a "$run" "$recovery_run"
+jq -n '{schema:"hill-climb-fleet-state.v1",status:"failed",
+  detail:"scenario evidence complete; consolidated judging failed"}' \
+  >"$recovery_run/state.json"
+ln -sfn "$recovery_run" "$fleet_root/current"
+recovery_state_sha_before=$(shasum -a 256 "$recovery_run/state.json" | awk '{print $1}')
+if env "${common[@]}" "$tool" validate "$recovery_run" >/dev/null 2>&1; then
+  printf 'expected ordinary validation to reject a failed fleet state\n' >&2
+  exit 1
+fi
+# Historical recovery reconstructs the evaluator from the run manifest, not
+# from an unrelated newer checkout HEAD.
+printf 'new evaluator head\n' >"$eval_kit/new-head.txt"
+git -C "$eval_kit" add new-head.txt
+git -C "$eval_kit" commit -qm new-head
+mv "$recovery_run/supervisor.pid" "$recovery_run/supervisor.pid.missing"
+if env -u OPENAI_API_KEY -u CODEX_API_KEY "${common[@]}" \
+    "$tool" recover "$recovery_run" "$recovery_state_sha_before" >/dev/null 2>&1; then
+  printf 'expected missing supervisor PID evidence to refuse recovery\n' >&2
+  exit 1
+fi
+mv "$recovery_run/supervisor.pid.missing" "$recovery_run/supervisor.pid"
+env -u OPENAI_API_KEY -u CODEX_API_KEY "${common[@]}" \
+  "$tool" recover "$recovery_run" "$recovery_state_sha_before" >"$root/recovery-receipt.json"
+jq -e --arg state_sha "$recovery_state_sha_before" \
+  --arg run "$(CDPATH='' cd -P -- "$recovery_run" && pwd)" \
+  --arg sha "$sha" \
+  '.status == "complete" and .captured == 18 and .judges == 6 and
+   .recovery.mode == "judge-only" and .recovery.from_state == "failed" and
+   .recovery.original_state_sha256 == $state_sha and
+   .recovery.approval == {kind:"explicit-recovery-v1",run:$run,sha:$sha,
+                          state_sha256:$state_sha}' \
+  "$root/recovery-receipt.json" >/dev/null
+[[ "$(shasum -a 256 "$recovery_run/state.json" | awk '{print $1}')" == \
+    "$recovery_state_sha_before" ]]
+recovery_status=$(env "${common[@]}" "$tool" status)
+[[ "$(jq -r .fleet_state <<<"$recovery_status")" == failed ]]
+[[ "$(jq -r .qualified_complete <<<"$recovery_status")" == true ]]
+[[ "$(jq -r .recovery.mode <<<"$recovery_status")" == judge-only ]]
+recovery_attempt=$(jq -r .attempt_id <<<"$recovery_status")
+
+# The shared checker regenerates the exact evidence inventory. Added bytes or
+# symlinks cannot hide outside the receipt's listed paths.
+printf 'late bytes\n' >"$recovery_run/consolidated-kit/runs/fleet-consolidated/ABS-S1/screenshots/late.txt"
+set +e
+late_status=$(env "${common[@]}" "$tool" status)
+late_rc=$?
+set -e
+[[ "$late_rc" -eq 2 && "$(jq -r .qualified_complete <<<"$late_status")" == false ]]
+[[ "$(jq -r .score <<<"$late_status")" == null ]]
+rm "$recovery_run/consolidated-kit/runs/fleet-consolidated/ABS-S1/screenshots/late.txt"
+[[ "$(jq -r .qualified_complete <<<"$(env "${common[@]}" "$tool" status)")" == true ]]
+
+# Entering through a symlink cannot substitute an adjacent exit-zero checker.
+# The main executable resolves its canonical directory before selecting the
+# trusted receipt verifier.
+symlink_dir="$root/symlink-entry"
+mkdir -p "$symlink_dir"
+ln -s "$tool" "$symlink_dir/hill-climb-score-one"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$symlink_dir/hill-climb-score-receipt-check"
+chmod 0755 "$symlink_dir/hill-climb-score-receipt-check"
+printf 'late through symlink\n' \
+  >"$recovery_run/consolidated-kit/runs/fleet-consolidated/ABS-S1/screenshots/late.txt"
+set +e
+symlink_status=$(env "${common[@]}" "$symlink_dir/hill-climb-score-one" status)
+symlink_status_rc=$?
+set -e
+[[ "$symlink_status_rc" -eq 2 && "$(jq -r .qualified_complete <<<"$symlink_status")" == false ]]
+rm "$recovery_run/consolidated-kit/runs/fleet-consolidated/ABS-S1/screenshots/late.txt"
+
+# Receipt/event hash rewriting cannot forge a different judge instrument.
+recovery_receipt_file="$state_root/receipts/$recovery_attempt.json"
+cp "$recovery_receipt_file" "$root/recovery-receipt.good.json"
+cp "$state_root/events.jsonl" "$root/recovery-events.good.jsonl"
+jq '.instrument.judge_model="forged"' "$recovery_receipt_file" \
+  >"$recovery_receipt_file.tmp"
+mv "$recovery_receipt_file.tmp" "$recovery_receipt_file"
+forged_receipt_sha=$(shasum -a 256 "$recovery_receipt_file" | awk '{print $1}')
+jq -c --arg attempt "$recovery_attempt" --arg receipt_sha "$forged_receipt_sha" \
+  'if .attempt_id == $attempt then
+     .detail=(.detail | sub("receipt_sha256=[0-9a-f]{64}"; "receipt_sha256="+$receipt_sha))
+   else . end' "$state_root/events.jsonl" >"$state_root/events.forged.jsonl"
+mv "$state_root/events.forged.jsonl" "$state_root/events.jsonl"
+set +e
+forged_status=$(env "${common[@]}" "$tool" status)
+forged_rc=$?
+set -e
+[[ "$forged_rc" -eq 2 && "$(jq -r .qualified_complete <<<"$forged_status")" == false ]]
+cp "$root/recovery-receipt.good.json" "$recovery_receipt_file"
+cp "$root/recovery-events.good.jsonl" "$state_root/events.jsonl"
+
+# A hash-consistent deployment envelope with the wrong workflow is still not
+# deployment authority.
+jq '.deployment.workflow="wrong.yml"' \
+  "$recovery_receipt_file" >"$root/deployment-forged.intermediate.json"
+forged_deployment_hash=$(jq -cS .deployment "$root/deployment-forged.intermediate.json" |
+  shasum -a 256 | awk '{print $1}')
+jq --arg proof_sha "$forged_deployment_hash" \
+  '.deployment_proof_sha256=$proof_sha' "$root/deployment-forged.intermediate.json" \
+  >"$recovery_receipt_file"
+forged_receipt_sha=$(shasum -a 256 "$recovery_receipt_file" | awk '{print $1}')
+jq -c --arg attempt "$recovery_attempt" --arg receipt_sha "$forged_receipt_sha" \
+  --arg proof_sha "$forged_deployment_hash" \
+  'if .attempt_id == $attempt then
+     .detail=(.detail | sub("receipt_sha256=[0-9a-f]{64}"; "receipt_sha256="+$receipt_sha)) |
+     .deployment_proof_sha256=$proof_sha
+   else . end' "$state_root/events.jsonl" >"$state_root/events.forged-deployment.jsonl"
+mv "$state_root/events.forged-deployment.jsonl" "$state_root/events.jsonl"
+set +e
+forged_deployment_status=$(env "${common[@]}" "$tool" status)
+forged_deployment_rc=$?
+set -e
+[[ "$forged_deployment_rc" -eq 2 && \
+   "$(jq -r .qualified_complete <<<"$forged_deployment_status")" == false ]]
+cp "$root/recovery-receipt.good.json" "$recovery_receipt_file"
+cp "$root/recovery-events.good.jsonl" "$state_root/events.jsonl"
+
+# A pre-existing event must match the receipt's full provenance. Matching only
+# its attempt and receipt digest is not sufficient for an idempotent replay.
+jq -c --arg attempt "$recovery_attempt" \
+  'if .attempt_id == $attempt then .instrument.judge_model="wrong-event-model" else . end' \
+  "$state_root/events.jsonl" >"$state_root/events.wrong-provenance.jsonl"
+mv "$state_root/events.wrong-provenance.jsonl" "$state_root/events.jsonl"
+if env -u OPENAI_API_KEY -u CODEX_API_KEY "${common[@]}" \
+    "$tool" recover "$recovery_run" "$recovery_state_sha_before" >/dev/null 2>&1; then
+  printf 'expected provenance-conflicting recovery event to refuse replay\n' >&2
+  exit 1
+fi
+cp "$root/recovery-events.good.jsonl" "$state_root/events.jsonl"
+
+# Simulate a crash after the atomic receipt rename but before the terminal
+# event append. Retry must reuse the receipt and append exactly one event.
+jq -c --arg attempt "$recovery_attempt" 'select(.attempt_id != $attempt)' \
+  "$state_root/events.jsonl" >"$state_root/events.without-recovery.jsonl"
+mv "$state_root/events.without-recovery.jsonl" "$state_root/events.jsonl"
+env -u OPENAI_API_KEY -u CODEX_API_KEY "${common[@]}" \
+  "$tool" recover "$recovery_run" "$recovery_state_sha_before" >"$root/recovery-receipt-retry.json"
+cmp "$root/recovery-receipt.json" "$root/recovery-receipt-retry.json"
+recovery_event_count_before=$(jq -s --arg attempt "$recovery_attempt" \
+  '[.[] | select(.attempt_id == $attempt and .event == "complete")] | length' \
+  "$state_root/events.jsonl")
+[[ "$recovery_event_count_before" -eq 1 ]]
+env -u OPENAI_API_KEY -u CODEX_API_KEY "${common[@]}" \
+  "$tool" recover "$recovery_run" "$recovery_state_sha_before" >"$root/recovery-receipt-retry-2.json"
+cmp "$root/recovery-receipt.json" "$root/recovery-receipt-retry-2.json"
+recovery_event_count_after=$(jq -s --arg attempt "$recovery_attempt" \
+  '[.[] | select(.attempt_id == $attempt and .event == "complete")] | length' \
+  "$state_root/events.jsonl")
+[[ "$recovery_event_count_after" -eq 1 ]]
+
+cp "$recovery_run/state.json" "$root/recovery-state.good.json"
+jq '.detail="scenario capture failed"' "$root/recovery-state.good.json" \
+  >"$recovery_run/state.json"
+if env -u OPENAI_API_KEY -u CODEX_API_KEY "${common[@]}" \
+    "$tool" recover "$recovery_run" "$recovery_state_sha_before" >/dev/null 2>&1; then
+  printf 'expected recovery of a non-judge-stage failure to be refused\n' >&2
+  exit 1
+fi
+set +e
+mutated_recovery_status=$(env "${common[@]}" "$tool" status)
+mutated_recovery_rc=$?
+set -e
+[[ "$mutated_recovery_rc" -eq 2 ]]
+[[ "$(jq -r .qualified_complete <<<"$mutated_recovery_status")" == false ]]
+jq -e '.errors | any(contains("current artifact inventory differs"))' \
+  <<<"$mutated_recovery_status" >/dev/null
+cp "$root/recovery-state.good.json" "$recovery_run/state.json"
+[[ "$(jq -r .qualified_complete <<<"$(env "${common[@]}" "$tool" status)")" == true ]]
+ln -sfn "$run" "$fleet_root/current"
+
+# An internal invocation cannot bypass the kernel lock with a made-up FD.
+set +e
+env -u OPENAI_API_KEY -u CODEX_API_KEY "${common[@]}" SCORE_ONE_LOCK_FD=9 \
+  "$tool" _run "$sha" "$run_url" >/dev/null 2>"$root/closed-fd.err"
+closed_fd_rc=$?
+set -e
+[[ "$closed_fd_rc" -ne 0 ]]
+grep -q 'invalid inherited kernel lock' "$root/closed-fd.err"
+
+# A changed current symlink cannot substitute a different run after pinning.
+pinned_before_swap=$(jq -rs '[.[] | select(.event == "pinned")][-1].run // ""' \
+  "$state_root/events.jsonl")
+env -u OPENAI_API_KEY -u CODEX_API_KEY "${common[@]}" FAKE_FLEET_DELAY=5 \
+  "$tool" run "$sha" "$run_url" >"$root/swap.out" 2>"$root/swap.err" &
+swap_pid=$!
+swap_run=''
+for _ in $(seq 1 100); do
+  swap_run=$(jq -rs '[.[] | select(.event == "pinned")][-1].run // ""' \
+    "$state_root/events.jsonl" 2>/dev/null || true)
+  [[ -n "$swap_run" && "$swap_run" != "$pinned_before_swap" ]] && break
+  sleep 0.05
+done
+[[ -n "$swap_run" && "$swap_run" != "$pinned_before_swap" ]]
+ln -sfn "$run" "$fleet_root/current"
+set +e
+wait "$swap_pid"
+swap_rc=$?
+set -e
+[[ "$swap_rc" -ne 0 ]]
+grep -q 'current link changed away from pinned run' "$root/swap.err"
+ln -sfn "$run" "$fleet_root/current"
+
+# Replacing current during the slower independent score recomputation is also
+# detected before a terminal receipt or complete event can be published.
+verifier_sentinel="$root/verifier-started"
+run_prefix=$(CDPATH='' cd -P -- "$fleet_root" && pwd)
+env -u OPENAI_API_KEY -u CODEX_API_KEY "${common[@]}" FAKE_SCORE_DELAY=2 \
+  TEST_VERIFIER_SENTINEL="$verifier_sentinel" TEST_RUN_PREFIX="$run_prefix" \
+  "$tool" run "$sha" "$run_url" >"$root/terminal-swap.out" 2>"$root/terminal-swap.err" &
+terminal_swap_pid=$!
+for _ in $(seq 1 200); do
+  [[ -f "$verifier_sentinel" ]] && break
+  sleep 0.05
+done
+[[ -f "$verifier_sentinel" ]]
+ln -sfn "$run" "$fleet_root/current"
+set +e
+wait "$terminal_swap_pid"
+terminal_swap_rc=$?
+set -e
+[[ "$terminal_swap_rc" -ne 0 ]]
+if ! grep -q 'current link changed.*terminal validation' "$root/terminal-swap.err"; then
+  printf 'terminal-swap failure was not attributed to current-link fencing:\n' >&2
+  cat "$root/terminal-swap.err" >&2
+  exit 1
+fi
+ln -sfn "$run" "$fleet_root/current"
+
+# Status is a fail-closed envelope, never a traceback or false healthy state.
+cp "$state_root/events.jsonl" "$root/events.good.jsonl"
+printf '{broken\n' >>"$state_root/events.jsonl"
+set +e
+malformed=$(env "${common[@]}" "$tool" status)
+malformed_rc=$?
+set -e
+[[ "$malformed_rc" -eq 2 ]]
+[[ "$(jq -r .stale <<<"$malformed")" == true ]]
+jq -e '.errors | any(contains("malformed event"))' <<<"$malformed" >/dev/null
+cp "$root/events.good.jsonl" "$state_root/events.jsonl"
+
+set +e
+bad_threshold=$(env "${common[@]}" SCORE_ONE_STALE_SECONDS=banana "$tool" status)
+bad_threshold_rc=$?
+set -e
+[[ "$bad_threshold_rc" -eq 2 ]]
+jq -e '.errors | any(contains("invalid stale threshold"))' <<<"$bad_threshold" >/dev/null
+
+set +e
+env -u OPENAI_API_KEY -u CODEX_API_KEY "${common[@]}" \
+  TEST_DEPLOY_SHA="$(printf '0%.0s' {1..40})" \
+  "$tool" run "$sha" "$run_url" >/dev/null 2>"$root/wrong-deploy.err"
+wrong_deploy_rc=$?
+set -e
+[[ "$wrong_deploy_rc" -ne 0 ]]
+grep -q 'deployment receipt does not prove' "$root/wrong-deploy.err"
+
+# A failed supervisor can leave children behind; score-one owns and terminates
+# the whole process group before returning failure.
+set +e
+env -u OPENAI_API_KEY -u CODEX_API_KEY "${common[@]}" FAKE_FLEET_ORPHAN_CHILD=true \
+  "$tool" run "$sha" "$run_url" >/dev/null 2>"$root/orphan.err"
+orphan_rc=$?
+set -e
+[[ "$orphan_rc" -ne 0 ]]
+orphan_pid=$(cat "$fleet_root/orphan-child.pid")
+for _ in $(seq 1 50); do
+  kill -0 "$orphan_pid" 2>/dev/null || break
+  sleep 0.02
+done
+if kill -0 "$orphan_pid" 2>/dev/null; then
+  printf 'expected orphan child %s to be terminated\n' "$orphan_pid" >&2
+  exit 1
+fi
+ln -sfn "$run" "$fleet_root/current"
+
+jq -n '{schema:"hill-climb-fleet-state.v1",status:"running"}' >"$run/state.json"
+printf '99999999\n' >"$run/supervisor.pid"
+set +e
+stale=$(env "${common[@]}" "$tool" status)
+stale_rc=$?
+set -e
+[[ "$stale_rc" -eq 2 ]]
+[[ "$(jq -r .stale <<<"$stale")" == true ]]
+
+jq -n '{schema:"hill-climb-fleet-state.v1",status:"complete"}' >"$run/state.json"
+set +e
+env -u OPENAI_API_KEY -u CODEX_API_KEY "${common[@]}" FAKE_FLEET_FAIL=true \
+  "$tool" run "$sha" "$run_url" >/dev/null 2>"$root/fail.err"
+failed_rc=$?
+set -e
+[[ "$failed_rc" -ne 0 ]]
+env -u OPENAI_API_KEY -u CODEX_API_KEY "${common[@]}" \
+  "$tool" run "$sha" "$run_url" >"$root/retry-receipt.json"
+jq -e '.status == "complete"' "$root/retry-receipt.json" >/dev/null
+
+# The final current-link fence is after the final shared checker. A swap while
+# that checker is hashing a bounded large artifact must prevent success.
+verified_current=$(CDPATH='' cd -P -- "$(readlink "$fleet_root/current")" && pwd)
+complete_before=$(jq -rs '[.[] | select(.event == "complete")] | length' "$state_root/events.jsonl")
+env -u OPENAI_API_KEY -u CODEX_API_KEY "${common[@]}" FAKE_LARGE_EVIDENCE_MB=128 \
+  "$tool" run "$sha" "$run_url" >"$root/post-check-swap.out" 2>"$root/post-check-swap.err" &
+post_check_pid=$!
+post_check_run=''
+for _ in $(seq 1 1200); do
+  post_check_run=$(jq -rs --argjson before "$complete_before" '
+    [.[] | select(.event == "complete")]
+    | if length > $before then .[-1].run else "" end' "$state_root/events.jsonl" 2>/dev/null || true)
+  [[ -n "$post_check_run" ]] && break
+  sleep 0.01
+done
+[[ -n "$post_check_run" ]]
+checker_seen=false
+for _ in $(seq 1 400); do
+  if pgrep -f -- "hill-climb-score-receipt-check $post_check_run" >/dev/null; then
+    checker_seen=true
+    break
+  fi
+  sleep 0.005
+done
+[[ "$checker_seen" == true ]]
+ln -sfn "$verified_current" "$fleet_root/current"
+set +e
+wait "$post_check_pid"
+post_check_rc=$?
+set -e
+[[ "$post_check_rc" -ne 0 ]]
+grep -q 'current link changed after ordinary verification' "$root/post-check-swap.err"
+
+printf 'PASS hill-climb-score-one: kernel no-overlap/release; full provenance; stale visibility; valid terminal receipt\n'

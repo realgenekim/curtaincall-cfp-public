@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Treatment B, opened — inline vs modal</title>
+<style>
+  :root {
+    --paper:#FAF7F2; --paper-deep:#F1EADD; --card:#FFFFFF; --ink:#221E17;
+    --ink-soft:#3B342A; --muted:#7C7264; --muted-2:#948A7B; --line:#E9E1D5;
+    --line-soft:#EFE8DC; --field-line:#DDD4C6; --go:#1B7A4B; --go-ink:#fff;
+    --highlight:#FFF1B8; --focus-line:#B9924A; --pill:999px; --radius:7px; --radius-lg:12px;
+  }
+  body { font-family:'Source Sans 3',system-ui,sans-serif; background:var(--paper);
+         color:var(--ink); margin:0; padding:2.5rem 3rem; line-height:1.5; }
+  h1 { font-family:Georgia,serif; margin:0 0 0.2em; }
+  .note { color:var(--muted); max-width:48em; margin-bottom:2em; }
+  h2 { font-family:Georgia,serif; font-size:1.15em; margin:2.4em 0 0.15em; }
+  .verdict { color:var(--muted); font-size:0.9em; margin:0 0 0.8em; max-width:48em; }
+  table { width:100%; border-collapse:collapse; }
+  td { border-top:1px solid var(--line-soft); padding:0.6em 0.5em; vertical-align:middle; }
+  .face { width:44px;height:44px;border-radius:50%;background:var(--paper-deep);
+          display:inline-block; vertical-align:middle; border:1px solid var(--line); }
+  .who { display:inline-block; vertical-align:middle; margin-left:10px; }
+  .pname { font-weight:650; }
+  .pmeta { color:var(--muted); font-size:0.85em; }
+  .title-line { padding-left:54px; font-weight:650; }
+  .trk { color:var(--muted); font-weight:400; font-size:0.82em; margin-left:0.7em; }
+  .num { text-align:center; white-space:nowrap; }
+  .mean { font-family:Georgia,serif; font-size:1.05em; }
+  .state { background:var(--paper-deep); color:var(--muted); border-radius:var(--pill);
+           font-size:0.68em; font-weight:700; padding:0.2em 0.8em; }
+  .rate-zone { color:var(--focus-line); font-weight:700; font-size:0.8em;
+               text-decoration:none; white-space:nowrap; }
+  .rate-zone:hover { text-decoration:underline; }
+  .rate-zone .sep { color:var(--muted-2); font-weight:400; margin:0 0.35em; }
+  .read-link { color:var(--muted); font-weight:400; }
+
+  /* B1 — inline card under the row */
+  .inline-open td { border-top:none; padding-top:0; }
+  .rate-card { background:var(--card); border:1px solid var(--line-soft);
+               border-left:3px solid var(--highlight); border-radius:0 var(--radius) var(--radius) 0;
+               padding:0.8em 1em; margin:0.2em 0 0.6em 54px;
+               display:flex; align-items:center; gap:1em; flex-wrap:wrap;
+               box-shadow:0 2px 8px rgba(34,30,23,.06); }
+  .stars { display:inline-flex; gap:3px; }
+  .stars a { min-width:26px; height:26px; display:inline-flex; align-items:center;
+             justify-content:center; border:1px solid var(--field-line); border-radius:var(--radius);
+             font-size:0.78em; color:var(--muted); text-decoration:none; background:var(--card);
+             padding:0 4px; }
+  .stars a:hover { background:var(--highlight); border-color:var(--focus-line); color:var(--ink); }
+  .comment { border:1px solid var(--field-line); border-radius:var(--radius);
+             padding:0.35em 0.6em; font-size:0.9em; width:20em; font-family:inherit; }
+  .say { background:var(--go); color:var(--go-ink); border:none; border-radius:var(--pill);
+         font-weight:700; font-size:0.85em; padding:0.4em 1.2em; cursor:pointer; }
+  .card-close { color:var(--muted-2); text-decoration:none; font-size:1.05em; margin-left:auto; }
+
+  /* B2 — modal */
+  .modal-demo { position:relative; height:330px; border:1px solid var(--line);
+                border-radius:var(--radius-lg); overflow:hidden; background:var(--paper); }
+  .scrim { position:absolute; inset:0; background:rgba(34,30,23,.42); }
+  .modal { position:absolute; left:50%; top:38px; transform:translateX(-50%);
+           width:440px; background:var(--card); border-radius:var(--radius-lg);
+           box-shadow:0 18px 50px rgba(34,30,23,.28); padding:1.1em 1.3em; }
+  .modal h3 { font-family:Georgia,serif; margin:0 0 0.1em; font-size:1.05em; }
+  .modal .pmeta { margin-bottom:0.7em; }
+  .modal .stars { margin-bottom:0.7em; }
+  .modal textarea { width:100%; box-sizing:border-box; border:1px solid var(--field-line);
+                    border-radius:var(--radius); padding:0.5em; font-family:inherit;
+                    font-size:0.9em; min-height:4.2em; margin-bottom:0.7em; }
+  .modal-x { position:absolute; top:10px; right:14px; color:var(--muted-2); text-decoration:none; }
+</style>
+</head>
+<body>
+<h1>You clicked "Rate &amp; comment" — what opens?</h1>
+<p class="note">Both treatments assume the action zone reads
+<b style="color:#B9924A">Rate &amp; comment ▾</b> <span class="read-link">· Read →</span>
+— two verbs, always visible: the gold one acts here, the quiet one goes to the
+full submission page.</p>
+
+<h2>B1 — inline card under the row (recommended)</h2>
+<p class="verdict">The row exhales: a marker-edged card slides open right beneath the
+title, stars + comment + one green Say, ✕ tucks it away. You never lose the table —
+you rate WHILE comparing against the rows above and below, which is the whole point
+of a work queue. (And our server plumbing already works exactly this way.)</p>
+<table>
+<tr>
+  <td style="width:1%"><span class="face"></span><span class="who"><div class="pname">Nadia Okafor</div><div class="pmeta">VP Engineering · Gulfstream Power</div></span></td>
+  <td class="num"><span class="state">Pending</span></td>
+  <td class="num">&lt;1,000</td><td class="num">SME talk</td>
+  <td class="num">2</td><td class="num mean">4.2</td>
+  <td class="num"><a class="rate-zone" href="#">Rate &amp; comment ▴</a></td>
+</tr>
+<tr><td colspan="7" class="title-line">How Gulfstream Power Cut Onboarding Time by 50%<span class="trk">AI Models</span></td></tr>
+<tr class="inline-open"><td colspan="7">
+  <div class="rate-card">
+    <span class="stars">
+      <a href="#">1</a><a href="#">1.5</a><a href="#">2</a><a href="#">2.5</a><a href="#">3</a><a href="#">3.5</a><a href="#">4</a><a href="#">4.5</a><a href="#">5</a>
+    </span>
+    <input class="comment" placeholder="Add a comment…">
+    <button class="say">Say</button>
+    <a class="card-close" href="#" title="Close">✕</a>
+  </div>
+</td></tr>
+<tr>
+  <td style="width:1%"><span class="face"></span><span class="who"><div class="pname">Lars Tanaka</div><div class="pmeta">VP Claims · Metro Transit</div></span></td>
+  <td class="num"><span class="state">Pending</span></td>
+  <td class="num">&gt;10,000</td><td class="num">Experience Report</td>
+  <td class="num">3</td><td class="num mean">3.8</td>
+  <td class="num"><a class="rate-zone" href="#">Rate &amp; comment ▾</a></td>
+</tr>
+<tr><td colspan="7" class="title-line">From Pilot Purgatory to Production<span class="trk">Architecture</span></td></tr>
+</table>
+
+<h2>B2 — modal</h2>
+<p class="verdict">Focused and roomy — the talk's abstract could even sit in it. But it
+hides the table: every rating becomes open-act-close-reorient, ×81. Modals are for
+one-at-a-time acts (editing a form question); a review queue is a flow. I'd keep
+modals out of the board.</p>
+<div class="modal-demo">
+  <div class="scrim"></div>
+  <div class="modal">
+    <a class="modal-x" href="#">✕</a>
+    <h3>How Gulfstream Power Cut Onboarding Time by 50%</h3>
+    <div class="pmeta">Nadia Okafor · Gulfstream Power · SME talk</div>
+    <span class="stars">
+      <a href="#">1</a><a href="#">1.5</a><a href="#">2</a><a href="#">2.5</a><a href="#">3</a><a href="#">3.5</a><a href="#">4</a><a href="#">4.5</a><a href="#">5</a>
+    </span>
+    <textarea placeholder="Add a comment…"></textarea>
+    <button class="say">Say — and next talk →</button>
+  </div>
+</div>
+</body>
+</html>

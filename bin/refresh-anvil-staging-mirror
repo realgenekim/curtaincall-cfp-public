@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Refresh the anvil dev-seat git mirror from THIS machine's origin/staging.
+# Dev seats (dev-a/b/c) have NO GitHub credentials by design; they clone from
+# /tmp/curtaincall-staging.git on anvil. A stale mirror silently blocks every
+# seat ("required fresh base is unavailable"), so this ships current bytes via
+# a git bundle — no credentials ever touch anvil.
+#
+# Usage: bin/refresh-anvil-staging-mirror        (or: make refresh-anvil-mirror)
+# Exit 0 only when the mirror tip EQUALS local origin/staging (verified remote-side).
+set -euo pipefail
+
+ANVIL="${ANVIL_HOST:-root@ANVIL-TAILNET-HOST}"
+MIRROR="${ANVIL_MIRROR_PATH:-/tmp/curtaincall-staging.git}"
+BUNDLE_LOCAL="$(mktemp /tmp/staging-refresh.XXXXXX.bundle)"
+trap 'rm -f "$BUNDLE_LOCAL"' EXIT
+
+die() { printf 'ERROR refresh-anvil-staging-mirror: %s\n' "$*" >&2; exit 1; }
+
+git fetch origin staging --quiet || die "local fetch of origin/staging failed"
+want_sha="$(git rev-parse origin/staging)"
+
+git bundle create "$BUNDLE_LOCAL" origin/staging --quiet 2>/dev/null \
+  || git bundle create "$BUNDLE_LOCAL" origin/staging \
+  || die "bundle creation failed"
+
+scp -q "$BUNDLE_LOCAL" "$ANVIL:/tmp/staging-refresh.bundle" \
+  || die "scp of bundle to anvil failed"
+
+got_sha="$(ssh "$ANVIL" bash -s "$MIRROR" <<'REMOTE'
+set -euo pipefail
+MIRROR="$1"
+if [ ! -d "$MIRROR" ]; then
+  git init --bare "$MIRROR" >/dev/null
+fi
+owner="$(stat -c %U "$MIRROR")"
+runas() { if [ "$owner" = root ]; then "$@"; else sudo -u "$owner" "$@"; fi; }
+runas git -C "$MIRROR" fetch --quiet /tmp/staging-refresh.bundle \
+  '+refs/remotes/origin/staging:refs/heads/staging' 2>/dev/null \
+  || runas git -C "$MIRROR" fetch --quiet /tmp/staging-refresh.bundle \
+       '+staging:refs/heads/staging'
+# Dev seats clone read-only; make sure every uid can read the objects.
+chmod -R a+rX "$MIRROR"
+rm -f /tmp/staging-refresh.bundle
+runas git -C "$MIRROR" rev-parse refs/heads/staging
+REMOTE
+)" || die "remote mirror update failed"
+
+[ "$got_sha" = "$want_sha" ] \
+  || die "verification failed: mirror=$got_sha local=$want_sha"
+
+printf 'OK anvil mirror %s at %s (verified equal to local origin/staging)\n' \
+  "$MIRROR" "$got_sha"

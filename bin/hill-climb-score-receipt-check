@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""Pure fail-closed verifier for one terminal hill-climb score receipt."""
+
+import hashlib
+import json
+import math
+import os
+import pathlib
+import re
+import stat
+import sys
+
+
+EXPECTED_SCENARIOS = {
+    "CFP-S1", "CFP-S2", "CFP-S3", "CFP-S4",
+    "ABS-S1", "ABS-S2", "ABS-S3",
+    "SPK-S1", "SPK-S2", "SPK-S3",
+    "CNT-S1", "CNT-S2", "CNT-S3",
+    "AIA-S1", "AIA-S2", "EMB-S1", "EMB-S2", "EMB-S3",
+}
+EXPECTED_AREAS = {
+    "call-for-papers", "abstract-management", "speaker-management",
+    "content-management", "ai-agenda", "public-widgets",
+}
+BASE_ARTIFACTS = {
+    "manifest.json", "readiness.json", "summary.json", "state.json",
+    "report.json", "inputs/evalconfig.json",
+}
+RECEIPT_KEYS = {
+    "schema", "status", "run", "sha", "fixture_sha256", "deployment",
+    "deployment_proof_sha256", "instrument", "eval_kit", "score",
+    "coverage", "captured", "judges", "artifacts", "artifact_set_sha256",
+}
+RECOVERY_DETAILS = {
+    "scenario evidence complete; consolidated judging failed",
+    "scenario evidence complete; judge session quota exhausted; score is resumable",
+}
+
+
+def fail(message):
+    print(f"hill-climb-score-receipt-check: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def no_symlink_path(root, path):
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        fail(f"artifact escapes run: {path}")
+    current = root
+    for part in relative.parts:
+        current = current / part
+        try:
+            if stat.S_ISLNK(current.lstat().st_mode):
+                fail(f"symlink in artifact path: {current}")
+        except OSError as error:
+            fail(f"cannot inspect {current}: {error}")
+
+
+def regular(path, root=None):
+    if root is not None:
+        no_symlink_path(root, path)
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        fail(f"cannot inspect {path}: {error}")
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        fail(f"artifact is not a regular non-symlink file: {path}")
+    return path
+
+
+def load(path, root=None):
+    try:
+        return json.loads(regular(path, root).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        fail(f"cannot parse {path}: {error}")
+
+
+def finite_percentage(value):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and 0 <= value <= 100)
+
+
+def current_inventory(run):
+    manifest = load(run / "manifest.json", run)
+    judge_samples = manifest.get("judge_sample_count")
+    if (not isinstance(judge_samples, int) or isinstance(judge_samples, bool) or
+            judge_samples < 3 or judge_samples % 2 != 1):
+        fail("manifest judge sample count is invalid")
+    hashes = {name: digest(regular(run / name, run)) for name in BASE_ARTIFACTS}
+    consolidated = run / "consolidated-kit/runs/fleet-consolidated"
+    no_symlink_path(run, consolidated)
+    try:
+        scenario_dirs = {
+            path.name for path in consolidated.iterdir()
+            if path.is_dir() and not path.is_symlink() and "-S" in path.name
+        }
+    except OSError as error:
+        fail(f"cannot inspect consolidated evidence: {error}")
+    if scenario_dirs != EXPECTED_SCENARIOS:
+        fail("consolidated evidence does not contain the exact scenario directory set")
+    for scenario in sorted(EXPECTED_SCENARIOS):
+        root = consolidated / scenario
+        for artifact in sorted(root.rglob("*")):
+            metadata = artifact.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                fail(f"symlink in evidence tree: {artifact}")
+            if stat.S_ISDIR(metadata.st_mode):
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                fail(f"non-regular evidence artifact: {artifact}")
+            relative = artifact.relative_to(root).as_posix()
+            hashes[f"evidence/{scenario}/{relative}"] = digest(artifact)
+    judgement_root = consolidated / "judgements"
+    try:
+        entries = list(judgement_root.iterdir())
+    except OSError as error:
+        fail(f"cannot inspect judgement directory: {error}")
+    if {path.name for path in entries} != {f"{area}.json" for area in EXPECTED_AREAS}:
+        fail("judgement directory does not contain the exact six-area file set")
+    for area in sorted(EXPECTED_AREAS):
+        hashes[f"judgement/{area}"] = digest(regular(judgement_root / f"{area}.json", run))
+    fold_root = run / "judgement-folds"
+    try:
+        fold_entries = list(fold_root.iterdir())
+    except OSError as error:
+        fail(f"cannot inspect judgement folds: {error}")
+    if {path.name for path in fold_entries} != {f"{area}.json" for area in EXPECTED_AREAS}:
+        fail("judgement folds do not contain the exact six-area receipt set")
+    for area in sorted(EXPECTED_AREAS):
+        fold_path = regular(fold_root / f"{area}.json", run)
+        fold = load(fold_path, run)
+        rows = fold.get("candidate_receipts")
+        if (fold.get("schema") != "hill-climb-judgement-fold.v1" or
+                fold.get("area") != area or fold.get("fold_status") != "complete" or
+                fold.get("requested_n") != judge_samples or
+                fold.get("enrolled_n") != judge_samples or
+                fold.get("valid_score_n") != judge_samples or
+                fold.get("coverage_gate_failures") != [] or
+                not isinstance(rows, list) or len(rows) != judge_samples or
+                sorted(row.get("sample") for row in rows if isinstance(row, dict)) !=
+                list(range(1, judge_samples + 1)) or
+                fold.get("output_sha256") != hashes[f"judgement/{area}"]):
+            fail(f"invalid judgement fold for {area}")
+        hashes[f"judgement-fold/{area}"] = digest(fold_path)
+    for root_name in ("judgement-candidates", "judgement-inputs", "predicate-results"):
+        root = run / root_name
+        if not root.exists():
+            continue
+        no_symlink_path(run, root)
+        for artifact in sorted(root.rglob("*")):
+            metadata = artifact.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                fail(f"symlink in {root_name} receipt tree: {artifact}")
+            if stat.S_ISDIR(metadata.st_mode):
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                fail(f"non-regular {root_name} artifact: {artifact}")
+            relative = artifact.relative_to(root).as_posix()
+            hashes[f"{root_name}/{relative}"] = digest(artifact)
+    return hashes
+
+
+def main():
+    if len(sys.argv) != 3:
+        fail("usage: hill-climb-score-receipt-check RUN RECEIPT")
+    run = pathlib.Path(sys.argv[1]).resolve(strict=True)
+    receipt_path = pathlib.Path(sys.argv[2])
+    if not run.is_dir() or run.is_symlink():
+        fail("run is not a resolved directory")
+    receipt = load(receipt_path)
+    manifest = load(run / "manifest.json", run)
+    state = load(run / "state.json", run)
+    report = load(run / "report.json", run)
+    keys = set(receipt)
+    recovery = receipt.get("recovery")
+    expected_keys = RECEIPT_KEYS | ({"recovery"} if recovery is not None else set())
+    if keys != expected_keys:
+        fail("receipt does not have the exact terminal schema keys")
+    if (receipt.get("schema") != "hill-climb-score-receipt.v1" or
+            receipt.get("status") != "complete" or receipt.get("run") != str(run) or
+            receipt.get("sha") != manifest.get("code_sha") or
+            receipt.get("fixture_sha256") != manifest.get("golden_fixture_sha256") or
+            receipt.get("captured") != 18 or receipt.get("judges") != 6 or
+            receipt.get("score") != report.get("overallPct") or
+            receipt.get("coverage") != report.get("overallCoveragePct") or
+            not finite_percentage(receipt.get("score")) or
+            not finite_percentage(receipt.get("coverage"))):
+        fail("receipt identity, score, or terminal counts do not match run artifacts")
+    instrument = receipt.get("instrument")
+    expected_instrument = {
+        "worker_executor": manifest.get("worker_executor"),
+        "worker_model": manifest.get("worker_model"),
+        "worker_reasoning_effort": manifest.get("worker_reasoning_effort"),
+        "judge_executor": manifest.get("judge_executor"),
+        "judge_model": manifest.get("judge_model"),
+        "judge_reasoning_effort": manifest.get("judge_reasoning_effort"),
+        "judge_sample_count": manifest.get("judge_sample_count"),
+        "max_turns_per_scenario": manifest.get("max_turns_per_scenario"),
+        "sut_count": manifest.get("slots"),
+        "evidence_only": manifest.get("evidence_only"),
+    }
+    if instrument != expected_instrument:
+        fail("receipt instrument does not match the run manifest")
+    eval_kit = receipt.get("eval_kit")
+    expected_eval = {
+        "sha": manifest.get("eval_kit_sha"),
+        "archive_sha256": manifest.get("eval_kit_archive_sha256"),
+        "eval_config_sha256": manifest.get("eval_config_sha256"),
+    }
+    if eval_kit != expected_eval or digest(run / "inputs/evalconfig.json") != expected_eval["eval_config_sha256"]:
+        fail("receipt evaluator provenance does not match the immutable run input")
+    deployment = receipt.get("deployment")
+    github_keys = {"schema", "head_sha", "status", "conclusion", "url", "workflow"}
+    local_keys = github_keys | {"source", "receipt_path", "receipt_sha256"}
+    deployment_keys = set(deployment) if isinstance(deployment, dict) else set()
+    if (not isinstance(deployment, dict) or
+            (deployment_keys != github_keys and deployment_keys != local_keys) or
+            deployment.get("schema") != "hill-climb-deployment-proof.v1" or
+            deployment.get("workflow") != ".github/workflows/build-and-deploy.yml" or
+            deployment.get("head_sha") != receipt.get("sha") or
+            deployment.get("url") != manifest.get("deployment_run_url") or
+            deployment.get("status") != "completed" or deployment.get("conclusion") != "success"):
+        fail("receipt deployment proof does not match the run manifest")
+    if deployment_keys == local_keys:
+        receipt_path = deployment.get("receipt_path")
+        if (deployment.get("source") != "merger-done-receipt" or
+                not isinstance(receipt_path, str) or not pathlib.PurePath(receipt_path).is_absolute() or
+                re.fullmatch(r"[0-9a-f]{64}", deployment.get("receipt_sha256", "")) is None):
+            fail("local deployment proof has an invalid authority envelope")
+    deployment_hash = hashlib.sha256(json.dumps(
+        deployment, sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+    if deployment_hash != receipt.get("deployment_proof_sha256"):
+        fail("receipt deployment proof hash is inconsistent")
+    artifacts = current_inventory(run)
+    if artifacts != receipt.get("artifacts"):
+        fail("current artifact inventory differs from the receipt")
+    artifact_set = hashlib.sha256(json.dumps(
+        artifacts, sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+    if artifact_set != receipt.get("artifact_set_sha256"):
+        fail("receipt artifact-set hash is inconsistent")
+    if recovery is None:
+        if state.get("status") != "complete":
+            fail("ordinary receipt does not match complete fleet state")
+    else:
+        if (set(recovery) != {"mode", "from_state", "failure_detail", "original_state_sha256",
+                             "approval"} or recovery.get("mode") != "judge-only" or
+                recovery.get("from_state") != "failed" or state.get("status") != "failed" or
+                state.get("detail") not in RECOVERY_DETAILS or
+                recovery.get("failure_detail") != state.get("detail") or
+                recovery.get("original_state_sha256") != artifacts.get("state.json") or
+                recovery.get("approval") != {"kind": "explicit-recovery-v1",
+                                              "run": str(run),
+                                              "sha": receipt.get("sha"),
+                                              "state_sha256": artifacts.get("state.json")}):
+            fail("recovery receipt does not bind an explicitly approved judge-stage failure")
+    print(json.dumps({"ok": True, "artifact_set_sha256": artifact_set},
+                     sort_keys=True, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    main()

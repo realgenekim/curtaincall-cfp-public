@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Submission page — two treatments</title>
+<style>
+  :root {
+    --paper:#FAF7F2; --paper-deep:#F1EADD; --card:#FFFFFF; --ink:#221E17;
+    --ink-soft:#3B342A; --muted:#7C7264; --muted-2:#948A7B; --line:#E9E1D5;
+    --line-soft:#EFE8DC; --field-line:#DDD4C6; --go:#1B7A4B; --go-ink:#fff;
+    --highlight:#FFF1B8; --focus-line:#B9924A; --pill:999px; --radius:7px; --radius-lg:12px;
+  }
+  * { box-sizing:border-box; }
+  body { font-family:'Source Sans 3',system-ui,sans-serif; background:#E9E2D6;
+         color:var(--ink); margin:0; padding:2rem; line-height:1.55; }
+  .treatment-label { font-family:Georgia,serif; font-size:1.3em; margin:2.2rem 0 0.2rem; }
+  .treatment-note { color:#5c5346; max-width:52em; margin-bottom:1rem; }
+  .page { background:var(--paper); border-radius:14px; padding:2rem 2.4rem;
+          max-width:1080px; box-shadow:0 8px 30px rgba(34,30,23,.15); margin-bottom:1rem; }
+  h1.talk { font-family:Georgia,serif; font-size:1.7em; margin:0 0 0.1em; }
+  .crumb { color:var(--muted); font-size:0.85em; margin-bottom:0.4em; }
+  .layout { display:flex; gap:2.2rem; align-items:flex-start; }
+  .main { flex:3; min-width:0; }   /* ≈75% */
+  .rail { flex:1; min-width:220px; }
+
+  .kicker { text-transform:uppercase; letter-spacing:0.08em; font-size:0.72em;
+            color:var(--muted); font-weight:700; margin:1.4em 0 0.5em; }
+  .prose { max-width:46em; }
+  .prose p { margin:0 0 0.9em; }
+  .qa h4 { margin:1.1em 0 0.15em; font-size:0.95em; }
+  .qa p { margin:0 0 0.4em; color:var(--ink-soft); }
+
+  .card { background:var(--card); border:1px solid var(--line-soft);
+          border-radius:var(--radius-lg); padding:1em 1.2em;
+          box-shadow:0 1px 6px rgba(34,30,23,.05); margin-bottom:1.2rem; }
+  .speaker-photo { width:84px; height:84px; border-radius:50%; background:var(--paper-deep);
+                   border:1px solid var(--line); margin-bottom:0.5em; }
+  .sp-name { font-weight:700; font-size:1.05em; }
+  .sp-meta { color:var(--muted); font-size:0.88em; margin-bottom:0.6em; }
+  .sp-bio { font-size:0.88em; color:var(--ink-soft); }
+  .facts { font-size:0.85em; color:var(--muted); }
+  .facts b { color:var(--ink-soft); }
+
+  /* Bubbles */
+  .bubble { display:flex; gap:0.6em; margin-bottom:0.7em; }
+  .avatar { width:28px; height:28px; border-radius:50%; background:var(--highlight);
+            color:var(--ink); font-size:11px; font-weight:800; flex:none;
+            display:inline-flex; align-items:center; justify-content:center; }
+  .balloon { background:var(--card); border:1px solid var(--line-soft);
+             border-radius:2px 12px 12px 12px; padding:0.5em 0.85em; font-size:0.92em;
+             box-shadow:0 1px 4px rgba(34,30,23,.05); }
+  .balloon .who { font-weight:700; font-size:0.82em; margin-right:0.5em; }
+  .balloon .when { color:var(--muted-2); font-size:0.75em; }
+  .stars-inline { color:var(--focus-line); font-weight:700; }
+
+  .rate-strip { display:flex; align-items:center; gap:0.7em; flex-wrap:wrap;
+                background:var(--paper); border-left:3px solid var(--highlight);
+                border-radius:var(--radius); padding:0.6em 0.9em; }
+  .rate-strip .lbl { text-transform:uppercase; font-size:0.68em; letter-spacing:0.09em;
+                     color:var(--focus-line); font-weight:800; }
+  .stars { display:inline-flex; gap:3px; }
+  .stars a { min-width:24px; height:24px; display:inline-flex; align-items:center;
+             justify-content:center; border:1px solid var(--field-line);
+             border-radius:var(--radius); font-size:0.75em; color:var(--muted);
+             text-decoration:none; background:var(--card); padding:0 3px; }
+  .stars a:hover { background:var(--highlight); border-color:var(--focus-line); color:var(--ink); }
+  .cmt { border:1px solid var(--field-line); border-radius:var(--radius);
+         padding:0.35em 0.6em; font-size:0.9em; width:18em; font-family:inherit; }
+  .post { background:var(--go); color:var(--go-ink); border:none; border-radius:var(--pill);
+          font-weight:700; font-size:0.82em; padding:0.4em 1.1em; cursor:pointer; }
+
+  .verdict-line { display:flex; gap:1em; align-items:baseline; font-size:0.9em;
+                  color:var(--muted); margin-bottom:0.6em; }
+  .verdict-line .avg { font-family:Georgia,serif; font-size:1.3em; color:var(--ink); }
+  .peek { border:1px dashed var(--field-line); border-radius:var(--radius-lg);
+          padding:0.8em 1em; text-align:center; color:var(--muted); font-size:0.9em; }
+  .peek a { color:var(--focus-line); font-weight:700; text-decoration:none; }
+</style>
+</head>
+<body>
+
+<div class="treatment-label">A — "Judge for yourself" (committee tucked in the rail, below the speaker)</div>
+<p class="treatment-note">Reading order is deliberately: title → proposal → speaker → only
+then the committee. The committee box opens COLLAPSED behind a one-click peek — you rate
+unanchored, then see the room. (Openness kept: one click, nothing gated. The peek is a
+nudge, not a wall. After you rate, it opens itself.)</p>
+<div class="page">
+  <div class="crumb">Review Board › Submission</div>
+  <h1 class="talk">How Gulfstream Power Cut Onboarding Time by 50% with AI Agents</h1>
+  <div class="facts" style="margin-bottom:1rem;">Experience Report · <b>AI Models</b> · &gt;10,000 · Energy</div>
+  <div class="layout">
+    <div class="main">
+      <div class="kicker" style="margin-top:0;">The proposal</div>
+      <div class="prose">
+        <p>At Gulfstream Power we spent two years moving AI from demos into production
+        workflows. This talk covers the rollout that failed, the one that stuck, and the
+        numbers behind both: onboarding from six weeks to four days, deploy frequency 3×.</p>
+        <p>We close with the three decisions we would make differently, and the governance
+        model that let 40 teams adopt agents without a central bottleneck.</p>
+      </div>
+      <div class="qa">
+        <h4>When did your AI transformation begin, and what runs in production?</h4>
+        <p>Copilot pilots in 2024; today 40% of PRs are agent-assisted…</p>
+        <h4>Measurable outcomes</h4>
+        <p>Deploy frequency 3×; onboarding 6 weeks → 4 days; $2.8M annualized.</p>
+        <h4>What would you tell a peer CTO?</h4>
+        <p>Start with the workflow, not the model.</p>
+      </div>
+      <div class="kicker">Your take</div>
+      <div class="rate-strip">
+        <span class="lbl">Quick rate</span>
+        <span class="stars"><a href="#">1</a><a href="#">1.5</a><a href="#">2</a><a href="#">2.5</a><a href="#">3</a><a href="#">3.5</a><a href="#">4</a><a href="#">4.5</a><a href="#">5</a></span>
+        <input class="cmt" placeholder="Add a comment…"><button class="post">Post comment</button>
+      </div>
+    </div>
+    <div class="rail">
+      <div class="card">
+        <div class="speaker-photo"></div>
+        <div class="sp-name">Nadia Okafor</div>
+        <div class="sp-meta">VP Engineering · Gulfstream Power</div>
+        <div class="sp-bio">Nadia leads platform engineering at Gulfstream Power, where her
+        team of 240 ships grid and trading systems. Her AI-assisted delivery program won…</div>
+      </div>
+      <div class="peek">
+        <b>The committee so far</b> — 3 votes, 2 comments<br>
+        <a href="#">Peek after you've formed your own take →</a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="treatment-label">B — "Basecamp" (the conversation is the page's foot, full width)</div>
+<p class="treatment-note">Proposal + speaker exactly as A. The committee lives at the BOTTOM,
+full-width, as a real thread: ratings and comments interleaved as bubbles in the order they
+happened — the discussion happens under the artifact, Basecamp-style. Scrolling past the
+proposal to reach it IS the anti-anchoring: the layout makes you walk through the talk first.</p>
+<div class="page">
+  <div class="crumb">Review Board › Submission</div>
+  <h1 class="talk">How Gulfstream Power Cut Onboarding Time by 50% with AI Agents</h1>
+  <div class="facts" style="margin-bottom:1rem;">Experience Report · <b>AI Models</b> · &gt;10,000 · Energy</div>
+  <div class="layout">
+    <div class="main">
+      <div class="kicker" style="margin-top:0;">The proposal</div>
+      <div class="prose">
+        <p>At Gulfstream Power we spent two years moving AI from demos into production
+        workflows. This talk covers the rollout that failed, the one that stuck, and the
+        numbers behind both…</p>
+      </div>
+      <div class="qa">
+        <h4>Measurable outcomes</h4>
+        <p>Deploy frequency 3×; onboarding 6 weeks → 4 days; $2.8M annualized.</p>
+      </div>
+    </div>
+    <div class="rail">
+      <div class="card">
+        <div class="speaker-photo"></div>
+        <div class="sp-name">Nadia Okafor</div>
+        <div class="sp-meta">VP Engineering · Gulfstream Power</div>
+        <div class="sp-bio">Nadia leads platform engineering at Gulfstream Power…</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="kicker" style="border-top:1px solid var(--line); padding-top:1.2em;">The committee — the conversation so far</div>
+  <div class="verdict-line"><span class="avg">4.2</span> <span>3 votes</span> <span>·</span> <span>2 comments</span></div>
+  <div class="bubble"><span class="avatar">GK</span>
+    <div class="balloon"><span class="who">Gene Kim</span><span class="when">rated</span>
+      <span class="stars-inline">★ 4.5</span></div></div>
+  <div class="bubble"><span class="avatar">AP</span>
+    <div class="balloon"><span class="who">Ann Perry</span><span class="when">Aug 9, 9:14 PM</span><br>
+      Strong numbers — exactly the kind of specificity our audience asks for.</div></div>
+  <div class="bubble"><span class="avatar">AB</span>
+    <div class="balloon"><span class="who">Alex Broderick-Forster</span><span class="when">Aug 9, 9:51 PM</span><br>
+      Feels closer to a vendor pitch than an experience report. Second opinion?</div></div>
+  <div class="rate-strip" style="margin-top:0.9em;">
+    <span class="lbl">Your take</span>
+    <span class="stars"><a href="#">1</a><a href="#">1.5</a><a href="#">2</a><a href="#">2.5</a><a href="#">3</a><a href="#">3.5</a><a href="#">4</a><a href="#">4.5</a><a href="#">5</a></span>
+    <input class="cmt" placeholder="Add a comment…"><button class="post">Post comment</button>
+  </div>
+</div>
+
+</body>
+</html>

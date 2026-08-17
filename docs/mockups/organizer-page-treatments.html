@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Organizer page — treatments</title>
+<style>
+  :root {
+    --paper:#FAF7F2; --paper-deep:#F1EADD; --card:#FFFFFF;
+    --ink:#221E17; --ink-soft:#3B342A; --muted:#7C7264; --muted-2:#948A7B;
+    --kicker:#9C9284; --line:#E9E1D5; --line-soft:#EFE8DC;
+    --link:#1E62A8; --go:#1B7A4B; --highlight:#FFF1B8; --focus-line:#B9924A;
+    --radius:7px; --radius-lg:12px; --pill:999px;
+    --font-display:'Fraunces','Iowan Old Style','Palatino Linotype',Georgia,serif;
+    --font-ui:'Source Sans 3',system-ui,'Seravek','Avenir Next','Segoe UI',sans-serif;
+  }
+  @font-face { font-family:'Fraunces';
+    src:url('http://localhost:20501/vendor/fraunces-latin.woff2') format('woff2');
+    font-weight:100 900; font-style:normal; font-display:swap; }
+  @font-face { font-family:'Source Sans 3';
+    src:url('http://localhost:20501/vendor/source-sans-3-latin.woff2') format('woff2');
+    font-weight:200 900; font-style:normal; font-display:swap; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:#EDE7DC; font-family:var(--font-ui); color:var(--ink); padding:28px; }
+  h1 { font-family:var(--font-display); font-size:26px; margin-bottom:4px; }
+  .sub { color:var(--muted); margin-bottom:24px; font-size:14.5px; }
+  .lbl { font-family:var(--font-display); font-weight:700; font-size:17px; margin:34px 0 3px; }
+  .why { color:var(--muted); font-size:12.5px; margin-bottom:12px; max-width:640px; }
+  a { color:var(--link); text-decoration:none; }
+  .kick { font-size:11.5px; letter-spacing:.1em; text-transform:uppercase;
+          color:var(--kicker); font-weight:600; }
+  .pill-open { background:var(--go); color:#fff; font-size:11px; font-weight:700;
+               border-radius:var(--pill); padding:2px 10px; white-space:nowrap; }
+
+  /* H1 — playbill bio */
+  .h1t { background:var(--paper); border:1px solid var(--line); border-radius:14px;
+         max-width:640px; padding:46px 52px 38px; text-align:center; }
+  .h1t .kick { display:block; margin-bottom:10px; }
+  .h1t .name { font-family:var(--font-display); font-size:38px; font-weight:800;
+               margin-bottom:4px; }
+  .h1t .runs { color:var(--muted); font-size:14.5px; margin-bottom:26px; }
+  .h1t .trow { display:flex; align-items:baseline; gap:10px; padding:9px 2px;
+               border-top:1px solid var(--line-soft); font-size:15px; text-align:left; }
+  .h1t .trow b { font-family:var(--font-display); }
+  .h1t .dots { flex:1; border-bottom:1.5px dotted var(--line); }
+  .h1t .n { color:var(--ink-soft); white-space:nowrap; font-variant-numeric:tabular-nums; }
+  .h1t .back { display:inline-block; margin-top:26px; color:var(--muted); font-size:13px; }
+
+  /* H2 — directory profile */
+  .h2t { background:var(--paper); border:1px solid var(--line); border-radius:14px;
+         max-width:720px; padding:34px 38px; display:flex; gap:30px; }
+  .h2t .who { width:200px; flex:none; text-align:center; }
+  .h2t .ava { width:84px; height:84px; border-radius:50%; background:var(--paper-deep);
+              border:1px solid var(--line); display:flex; align-items:center;
+              justify-content:center; font-family:var(--font-display); font-size:30px;
+              font-weight:700; color:var(--muted); margin:0 auto 12px; }
+  .h2t .name { font-family:var(--font-display); font-size:21px; font-weight:700; }
+  .h2t .runs { color:var(--muted); font-size:12.5px; margin-top:3px; }
+  .h2t .evs { flex:1; }
+  .h2t .evs .kick { display:block; margin-bottom:8px; }
+  .h2t .ev { background:var(--card); border:1px solid var(--line);
+             border-radius:var(--radius-lg); padding:12px 15px; margin-bottom:10px; }
+  .h2t .ev b { font-family:var(--font-display); font-size:15.5px; display:block;
+               margin-bottom:3px; }
+  .h2t .ev .meta { display:flex; gap:14px; align-items:center; font-size:13px;
+                   color:var(--muted); }
+
+  /* H3 — marquee of shows */
+  .h3t { background:var(--paper); border:1px solid var(--line); border-radius:14px;
+         max-width:720px; overflow:hidden; }
+  .h3t .band { background:var(--paper-deep); border-bottom:1px solid var(--line);
+               padding:26px 38px; }
+  .h3t .band .kick { display:block; margin-bottom:4px; }
+  .h3t .band .name { font-family:var(--font-display); font-size:30px; font-weight:800; }
+  .h3t .shows { padding:22px 38px 28px; display:flex; gap:16px; }
+  .h3t .show { flex:1; background:var(--card); border:1px solid var(--line);
+               border-radius:var(--radius-lg); padding:16px 18px; }
+  .h3t .show b { font-family:var(--font-display); font-size:16px; display:block;
+                 margin-bottom:8px; }
+  .h3t .big { font-size:26px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .h3t .bigl { color:var(--muted); font-size:12.5px; margin-bottom:10px; }
+  .h3t .doors { display:flex; flex-direction:column; gap:4px; font-size:13.5px; }
+</style>
+</head>
+<body>
+<h1>The organizer page — three treatments</h1>
+<p class="sub">Reached by clicking a host's name anywhere. Public data only: name, their live events, agendas, open calls.</p>
+
+<p class="lbl">H1 — Playbill bio</p>
+<p class="why">Centered Fraunces name, then their events as the SAME dotted ticker rows the welcome uses — one idiom everywhere. Lightest to build; calmest.</p>
+<div class="h1t">
+  <span class="kick">Curtain Call · host</span>
+  <div class="name">Gene Kim</div>
+  <div class="runs">Runs 1 event on Curtain Call</div>
+  <div class="trow"><b>Enterprise AI Summit</b><span class="dots"></span>
+    <span class="n">81 submissions</span><a href="#">agenda →</a><span class="pill-open">call open</span></div>
+  <a class="back" href="#">← Curtain Call</a>
+</div>
+
+<p class="lbl">H2 — Directory profile</p>
+<p class="why">Avatar circle (initials until a headshot exists — the speaker profile's headshot slots straight in later), name, and event cards. Most "person-like"; sets up the cross-hat story: this host could ALSO show their speaker bio here one day.</p>
+<div class="h2t">
+  <div class="who">
+    <div class="ava">GK</div>
+    <div class="name">Gene Kim</div>
+    <div class="runs">Host on Curtain Call</div>
+  </div>
+  <div class="evs">
+    <span class="kick">Their events</span>
+    <div class="ev"><b>Enterprise AI Summit</b>
+      <div class="meta"><span>81 submissions</span><a href="#">agenda →</a><span class="pill-open">call open</span></div></div>
+  </div>
+</div>
+
+<p class="lbl">H3 — Marquee of shows</p>
+<p class="why">Name on a paper-deep band, each event a door card with the big number. Strongest for multi-event hosts (shown here as ai.engineer for contrast); heaviest for a one-event host.</p>
+<div class="h3t">
+  <div class="band"><span class="kick">Curtain Call · host</span>
+    <div class="name">ai.engineer</div></div>
+  <div class="shows">
+    <div class="show"><b>AI Engineer Code Summit</b>
+      <div class="big">502</div><div class="bigl">submissions</div>
+      <div class="doors"><a href="#">See the public agenda →</a><a href="#">Call for speakers →</a></div></div>
+    <div class="show" style="opacity:.45"><b>Their next event</b>
+      <div class="big">—</div><div class="bigl">future shows land here</div>
+      <div class="doors"><span style="color:var(--muted)">…</span></div></div>
+  </div>
+</div>
+
+</body>
+</html>

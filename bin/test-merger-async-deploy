@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "$0")/.." && pwd)
+controller="$repo_root/bin/merger-batch-controller"
+fixture=$(mktemp -d)
+trap 'rm -rf "$fixture"' EXIT
+
+fail() {
+  printf 'FAIL: %s\n' "$*" >&2
+  exit 1
+}
+
+assert_eq() {
+  [[ "$1" == "$2" ]] || fail "expected <$2>, got <$1>"
+}
+
+make_remote() {
+  local name=$1 bare seed
+  bare="$fixture/$name.git"
+  seed="$fixture/$name-seed"
+  git init -q --bare "$bare"
+  git init -q "$seed"
+  git -C "$seed" config user.name Test
+  git -C "$seed" config user.email test@example.com
+  printf 'base\n' >"$seed/app.txt"
+  git -C "$seed" add app.txt
+  git -C "$seed" commit -qm base
+  git -C "$seed" branch -M staging
+  git -C "$seed" remote add origin "$bare"
+  git -C "$seed" push -q -u origin staging
+  git -C "$bare" symbolic-ref HEAD refs/heads/staging
+  printf '%s\n' "$bare"
+}
+
+add_job() {
+  local seed=$1 inbox=$2 id=$3 content=$4 patch_sha
+  printf '%s\n' "$content" >"$seed/app.txt"
+  git -C "$seed" diff --binary >"$inbox/$id.patch"
+  git -C "$seed" restore app.txt
+  patch_sha=$(shasum -a 256 "$inbox/$id.patch" | awk '{print $1}')
+  printf 'job: %s — async fixture\npriority: P0\nverify: fixture\nproducer_model: gpt-5.6-sol\nproducer_reasoning_effort: high\nratchet: required\nratchet-invariant: fixture-%s\npatch_sha256: %s\n' \
+    "$id" "$id" "$patch_sha" >"$inbox/$id.job"
+}
+
+add_new_file_job() {
+  local seed=$1 inbox=$2 id=$3 path=$4 content=$5 patch_sha
+  printf '%s\n' "$content" >"$seed/$path"
+  git -C "$seed" add -N "$path"
+  git -C "$seed" diff --binary -- "$path" >"$inbox/$id.patch"
+  git -C "$seed" reset -q -- "$path"
+  rm "$seed/$path"
+  patch_sha=$(shasum -a 256 "$inbox/$id.patch" | awk '{print $1}')
+  printf 'job: %s — async fixture\npriority: P0\nverify: fixture\nproducer_model: gpt-5.6-sol\nproducer_reasoning_effort: high\nratchet: required\nratchet-invariant: fixture-%s\npatch_sha256: %s\n' \
+    "$id" "$id" "$patch_sha" >"$inbox/$id.job"
+}
+
+run_push() {
+  local inbox=$1 state=$2 remote=$3
+  MERGER_INBOX="$inbox" MERGER_STATE_DIR="$state" MERGER_REPO_URL="$remote" \
+    MERGER_STAGING_MIRROR="$state/staging.git" \
+    MERGER_COMPILE_COMMAND=true MERGER_TEST_COMMAND=true MERGER_PUSH_ENABLED=yes \
+    MERGER_DEPLOY_TIMEOUT_SECONDS=1 MERGER_DEPLOY_POLL_SECONDS=0 \
+    GENE_APPROVED_MERGER_CONTROLLER=yes "$controller" once
+}
+
+mark_push_pending() {
+  local batch=$1 batch_dir id job patch artifacts='[]'
+  batch_dir=${batch%/batch.json}
+  while IFS= read -r id; do
+    job="$batch_dir/ingest/$id/$id.job"
+    patch="$batch_dir/ingest/$id/$id.patch"
+    artifacts=$(jq -c --arg id "$id" \
+      --arg job_sha "$(shasum -a 256 "$job" | awk '{print $1}')" \
+      --arg patch_sha "$(shasum -a 256 "$patch" | awk '{print $1}')" \
+      '. + [{job_id:$id,job_sha256:$job_sha,patch_sha256:$patch_sha}]' <<<"$artifacts")
+  done < <(jq -r '.job_ids[]' "$batch")
+  jq --argjson artifacts "$artifacts" '.state="push-pending" | .artifacts=$artifacts' \
+    "$batch" >"$batch.tmp"
+  mv "$batch.tmp" "$batch"
+}
+
+remote=$(make_remote async)
+seed="$fixture/async-seed"
+inbox="$fixture/async-inbox"
+state="$fixture/async-state"
+fake_bin="$fixture/fake-bin"
+gh_called="$fixture/gh-called"
+mkdir -p "$inbox/done" "$inbox/rejected" "$state" "$fake_bin"
+printf '#!/usr/bin/env bash\nprintf called >%q\nexit 99\n' "$gh_called" >"$fake_bin/gh"
+chmod +x "$fake_bin/gh"
+
+# Local integration is terminal for SHIP. It must not invoke or wait for GHA.
+add_job "$seed" "$inbox" async-01 first
+PATH="$fake_bin:$PATH" run_push "$inbox" "$state" "$remote"
+first_batch=$(find "$state/batches" -name batch.json -print -quit)
+first_tip=$(jq -r '.tip_sha' "$first_batch")
+assert_eq "$(jq -r '.state' "$first_batch")" integrated
+assert_eq "$(git --git-dir="$remote" rev-parse refs/heads/staging)" "$first_tip"
+[[ -s "$state/integrated/async-01.json" ]] || fail "integrated receipt missing"
+assert_eq "$(git --git-dir="$state/staging.git" rev-parse refs/heads/staging)" "$first_tip"
+[[ ! -e "$inbox/done/async-01.job" ]] || fail "integration was mislabeled deployed/shipped"
+[[ ! -e "$gh_called" ]] || fail "merger invoked GHA on its critical path"
+assert_eq "$(MERGER_INBOX="$inbox" MERGER_STATE_DIR="$state" "$controller" scan)" ""
+
+# A producer may retry the identical artifact under the same id, but may not
+# reuse a completed id for different bytes. Reuse is a loud error, never a
+# silent dequeue.
+git -C "$seed" fetch -q origin staging
+git -C "$seed" reset -q --hard origin/staging
+add_job "$seed" "$inbox" async-01 reused-id-different-bytes
+set +e
+MERGER_INBOX="$inbox" MERGER_STATE_DIR="$state" "$controller" scan >/dev/null 2>&1
+reuse_rc=$?
+set -e
+[[ "$reuse_rc" -ne 0 ]] || fail "reused integrated job id silently dropped different bytes"
+rm "$inbox/async-01.job" "$inbox/async-01.patch"
+
+# A second batch can integrate while the deployment provider is unavailable.
+git -C "$seed" fetch -q origin staging
+git -C "$seed" reset -q --hard origin/staging
+add_job "$seed" "$inbox" async-02 second
+PATH="$fake_bin:$PATH" run_push "$inbox" "$state" "$remote"
+second_batch=$(find "$state/batches" -name batch.json -print | LC_ALL=C sort | tail -1)
+second_tip=$(jq -r '.tip_sha' "$second_batch")
+[[ "$second_tip" != "$first_tip" ]] || fail "second integration did not advance staging"
+[[ -s "$state/integrated/async-02.json" ]] || fail "second integrated receipt missing"
+assert_eq "$(git --git-dir="$state/staging.git" rev-parse refs/heads/staging)" "$second_tip"
+[[ ! -e "$gh_called" ]] || fail "second integration invoked GHA"
+
+# Mirror readiness is a pre-push gate. If the merger cannot create the shared
+# mirror, the remote branch must remain unchanged and no integration receipt
+# may be published.
+permission_remote=$(make_remote mirror-permission)
+permission_seed="$fixture/mirror-permission-seed"
+permission_inbox="$fixture/mirror-permission-inbox"
+permission_state="$fixture/mirror-permission-state"
+permission_parent="$fixture/mirror-parent-read-only"
+mkdir -p "$permission_inbox/done" "$permission_inbox/rejected" "$permission_state" "$permission_parent"
+chmod 0555 "$permission_parent"
+add_job "$permission_seed" "$permission_inbox" mirror-permission-01 blocked-before-push
+permission_before=$(git --git-dir="$permission_remote" rev-parse refs/heads/staging)
+set +e
+MERGER_INBOX="$permission_inbox" MERGER_STATE_DIR="$permission_state" \
+  MERGER_REPO_URL="$permission_remote" MERGER_STAGING_MIRROR="$permission_parent/staging.git" \
+  MERGER_COMPILE_COMMAND=true MERGER_TEST_COMMAND=true MERGER_PUSH_ENABLED=yes \
+  GENE_APPROVED_MERGER_CONTROLLER=yes "$controller" once >/dev/null 2>&1
+permission_rc=$?
+set -e
+chmod 0755 "$permission_parent"
+[[ "$permission_rc" -ne 0 ]] || fail "unwritable mirror parent was accepted"
+assert_eq "$(git --git-dir="$permission_remote" rev-parse refs/heads/staging)" "$permission_before"
+[[ ! -e "$permission_state/integrated/mirror-permission-01.json" ]] || fail "mirror failure forged integration"
+
+# Deployment visibility is a read-only ancestry projection. A running desired
+# SHA does not erase the last successful deployed ancestor, and a later success
+# advances the frontier without changing integration receipts.
+runs_file="$fixture/gha-runs.json"
+# Expansion belongs to the fake gh process.
+# shellcheck disable=SC2016
+printf '#!/usr/bin/env bash\ncat "$FAKE_GH_RUNS"\n' >"$fake_bin/gh"
+chmod +x "$fake_bin/gh"
+jq -n --arg first "$first_tip" --arg second "$second_tip" '[
+  {databaseId:1,headSha:$first,status:"completed",conclusion:"success",url:"https://example.test/1",createdAt:"2026-08-14T00:00:00Z",updatedAt:"2026-08-14T00:01:00Z"},
+  {databaseId:2,headSha:$second,status:"in_progress",conclusion:null,url:"https://example.test/2",createdAt:"2026-08-14T00:02:00Z",updatedAt:"2026-08-14T00:03:00Z"}
+]' >"$runs_file"
+status=$(FAKE_GH_RUNS="$runs_file" PATH="$fake_bin:$PATH" MERGER_REPO_URL="$remote" \
+  "$controller" deploy-status)
+assert_eq "$(jq -r '.desired_sha' <<<"$status")" "$second_tip"
+assert_eq "$(jq -r '.covered_frontier_sha' <<<"$status")" "$first_tip"
+assert_eq "$(jq -r '.desired_is_covered' <<<"$status")" false
+assert_eq "$(jq -r '.desired_active | length' <<<"$status")" 1
+jq '.[1].status="completed" | .[1].conclusion="success"' "$runs_file" >"$runs_file.tmp"
+mv "$runs_file.tmp" "$runs_file"
+status=$(FAKE_GH_RUNS="$runs_file" PATH="$fake_bin:$PATH" MERGER_REPO_URL="$remote" \
+  "$controller" deploy-status)
+assert_eq "$(jq -r '.covered_frontier_sha' <<<"$status")" "$second_tip"
+assert_eq "$(jq -r '.desired_is_covered' <<<"$status")" true
+
+# A later rerun of an older SHA may have promoted older code. Coverage remains
+# monotonic, but the status must show the last successful workflow separately
+# instead of mislabeling the coverage frontier as actual production.
+jq --arg first "$first_tip" '. + [{databaseId:3,headSha:$first,status:"completed",conclusion:"success",url:"https://example.test/3",createdAt:"2026-08-14T00:04:00Z",updatedAt:"2026-08-14T00:05:00Z"}]' \
+  "$runs_file" >"$runs_file.tmp"
+mv "$runs_file.tmp" "$runs_file"
+status=$(FAKE_GH_RUNS="$runs_file" PATH="$fake_bin:$PATH" MERGER_REPO_URL="$remote" \
+  "$controller" deploy-status)
+assert_eq "$(jq -r '.covered_frontier_sha' <<<"$status")" "$second_tip"
+assert_eq "$(jq -r '.last_successful_run.headSha' <<<"$status")" "$first_tip"
+assert_eq "$(jq -r '.production_matches_covered_frontier' <<<"$status")" false
+
+# No successful observation means production is unknown, not a positive match
+# between two null values.
+jq '[.[] | select(.conclusion != "success")]' "$runs_file" >"$runs_file.tmp"
+mv "$runs_file.tmp" "$runs_file"
+status=$(FAKE_GH_RUNS="$runs_file" PATH="$fake_bin:$PATH" MERGER_REPO_URL="$remote" \
+  "$controller" deploy-status)
+assert_eq "$(jq -r '.covered_frontier_sha' <<<"$status")" null
+assert_eq "$(jq -r '.last_successful_run.headSha // "null"' <<<"$status")" null
+assert_eq "$(jq -r '.production_matches_covered_frontier' <<<"$status")" false
+
+# An invalid marker is a loud control-plane error, never a dequeue signal.
+git -C "$seed" fetch -q origin staging
+git -C "$seed" reset -q --hard origin/staging
+add_job "$seed" "$inbox" corrupt-marker-01 third
+mkdir -p "$state/integrated"
+: >"$state/integrated/corrupt-marker-01.json"
+set +e
+MERGER_INBOX="$inbox" MERGER_STATE_DIR="$state" "$controller" scan >/dev/null 2>&1
+corrupt_rc=$?
+set -e
+[[ "$corrupt_rc" -ne 0 ]] || fail "zero-byte integrated marker silently dequeued work"
+rm "$state/integrated/corrupt-marker-01.json"
+rm "$inbox/corrupt-marker-01.job" "$inbox/corrupt-marker-01.patch"
+
+# A crash after the remote push but before the local receipt resumes without
+# another push, another test run, or GHA.
+resume_remote=$(make_remote resume)
+resume_seed="$fixture/resume-seed"
+resume_inbox="$fixture/resume-inbox"
+resume_state="$fixture/resume-state"
+mkdir -p "$resume_inbox/done" "$resume_inbox/rejected" "$resume_state"
+add_job "$resume_seed" "$resume_inbox" resume-01 resumed
+MERGER_INBOX="$resume_inbox" MERGER_STATE_DIR="$resume_state" MERGER_REPO_URL="$resume_remote" \
+  MERGER_COMPILE_COMMAND=true MERGER_TEST_COMMAND=true "$controller" once
+resume_batch=$(find "$resume_state/batches" -name batch.json -print -quit)
+resume_dir=${resume_batch%/batch.json}
+resume_tip=$(jq -r '.tip_sha' "$resume_batch")
+mark_push_pending "$resume_batch"
+git -C "$resume_dir/repo" push -q origin "$resume_tip:refs/heads/staging"
+git -C "$resume_seed" fetch -q origin staging
+git -C "$resume_seed" reset -q --hard origin/staging
+printf 'descendant\n' >"$resume_seed/after.txt"
+git -C "$resume_seed" add after.txt
+git -C "$resume_seed" commit -qm descendant
+git -C "$resume_seed" push -q origin staging
+resume_remote_head=$(git --git-dir="$resume_remote" rev-parse refs/heads/staging)
+PATH="$fake_bin:$PATH" run_push "$resume_inbox" "$resume_state" "$resume_remote"
+assert_eq "$(jq -r '.state' "$resume_batch")" integrated
+[[ -s "$resume_state/integrated/resume-01.json" ]] || fail "resume omitted integrated receipt"
+assert_eq "$(jq -r '.remote_head_observed' "$resume_state/integrated/resume-01.json")" "$resume_remote_head"
+assert_eq "$(git --git-dir="$resume_state/staging.git" rev-parse refs/heads/staging)" "$resume_remote_head"
+[[ ! -e "$gh_called" ]] || fail "push recovery invoked GHA"
+
+# Receipt publication itself is restartable. Simulate a crash after receipt
+# 1/N, then after all N receipts but before the batch flips to integrated.
+multi_remote=$(make_remote multi-receipt)
+multi_seed="$fixture/multi-receipt-seed"
+multi_inbox="$fixture/multi-receipt-inbox"
+multi_state="$fixture/multi-receipt-state"
+mkdir -p "$multi_inbox/done" "$multi_inbox/rejected" "$multi_state"
+add_job "$multi_seed" "$multi_inbox" multi-01 first-in-batch
+add_new_file_job "$multi_seed" "$multi_inbox" multi-02 extra.txt second-in-batch
+MERGER_BATCH_SIZE=2 PATH="$fake_bin:$PATH" run_push "$multi_inbox" "$multi_state" "$multi_remote"
+multi_batch=$(find "$multi_state/batches" -name batch.json -print -quit)
+assert_eq "$(jq -r '.job_ids | length' "$multi_batch")" 2
+first_receipt="$multi_state/integrated/multi-01.json"
+second_receipt="$multi_state/integrated/multi-02.json"
+first_receipt_sha=$(shasum -a 256 "$first_receipt" | awk '{print $1}')
+rm "$second_receipt"
+mark_push_pending "$multi_batch"
+MERGER_BATCH_SIZE=2 PATH="$fake_bin:$PATH" run_push "$multi_inbox" "$multi_state" "$multi_remote"
+assert_eq "$(shasum -a 256 "$first_receipt" | awk '{print $1}')" "$first_receipt_sha"
+[[ -s "$second_receipt" ]] || fail "resume after receipt 1/N omitted remaining receipt"
+assert_eq "$(jq -r '.state' "$multi_batch")" integrated
+first_receipt_sha=$(shasum -a 256 "$first_receipt" | awk '{print $1}')
+second_receipt_sha=$(shasum -a 256 "$second_receipt" | awk '{print $1}')
+mark_push_pending "$multi_batch"
+MERGER_BATCH_SIZE=2 PATH="$fake_bin:$PATH" run_push "$multi_inbox" "$multi_state" "$multi_remote"
+assert_eq "$(shasum -a 256 "$first_receipt" | awk '{print $1}')" "$first_receipt_sha"
+assert_eq "$(shasum -a 256 "$second_receipt" | awk '{print $1}')" "$second_receipt_sha"
+assert_eq "$(jq -r '.state' "$multi_batch")" integrated
+assert_eq "$(find "$multi_inbox/kentbeck-queue" \( -path '*/pending/*' -o -path '*/done/*' \) -name '*.json' -type f 2>/dev/null | wc -l | tr -d ' ')" 2
+
+# A remote branch that is neither the base nor a descendant of the tested tip
+# is a hard stop. The merger must not overwrite it or forge integration.
+div_remote=$(make_remote divergence)
+div_seed="$fixture/divergence-seed"
+div_inbox="$fixture/divergence-inbox"
+div_state="$fixture/divergence-state"
+mkdir -p "$div_inbox/done" "$div_inbox/rejected" "$div_state"
+add_job "$div_seed" "$div_inbox" divergence-01 intended
+MERGER_INBOX="$div_inbox" MERGER_STATE_DIR="$div_state" MERGER_REPO_URL="$div_remote" \
+  MERGER_COMPILE_COMMAND=true MERGER_TEST_COMMAND=true "$controller" once
+div_batch=$(find "$div_state/batches" -name batch.json -print -quit)
+mark_push_pending "$div_batch"
+printf 'other\n' >"$div_seed/app.txt"
+git -C "$div_seed" add app.txt
+git -C "$div_seed" commit -qm divergent
+git -C "$div_seed" push -q origin staging
+set +e
+PATH="$fake_bin:$PATH" run_push "$div_inbox" "$div_state" "$div_remote" >/dev/null 2>&1
+div_rc=$?
+set -e
+[[ "$div_rc" -ne 0 ]] || fail "divergent remote was accepted"
+[[ ! -e "$div_state/integrated/divergence-01.json" ]] || fail "divergence forged integration"
+
+# The tested pre-push receipt binds the exact controller-owned job and patch
+# bytes. A post-gate rewrite cannot be blessed by hashing the replacement at
+# integration time, even when the replacement job and patch agree with each
+# other.
+mut_remote=$(make_remote ingest-mutation)
+mut_seed="$fixture/ingest-mutation-seed"
+mut_inbox="$fixture/ingest-mutation-inbox"
+mut_state="$fixture/ingest-mutation-state"
+mkdir -p "$mut_inbox/done" "$mut_inbox/rejected" "$mut_state"
+add_job "$mut_seed" "$mut_inbox" ingest-mutation-01 intended
+MERGER_INBOX="$mut_inbox" MERGER_STATE_DIR="$mut_state" MERGER_REPO_URL="$mut_remote" \
+  MERGER_COMPILE_COMMAND=true MERGER_TEST_COMMAND=true "$controller" once
+mut_batch=$(find "$mut_state/batches" -name batch.json -print -quit)
+mark_push_pending "$mut_batch"
+mut_dir=${mut_batch%/batch.json}
+mut_job="$mut_dir/ingest/ingest-mutation-01/ingest-mutation-01.job"
+mut_patch="$mut_dir/ingest/ingest-mutation-01/ingest-mutation-01.patch"
+chmod 0644 "$mut_job" "$mut_patch"
+printf '\n# post-gate rewrite\n' >>"$mut_patch"
+mut_sha=$(shasum -a 256 "$mut_patch" | awk '{print $1}')
+sed -i.bak "s/^patch_sha256:.*/patch_sha256: $mut_sha/" "$mut_job"
+rm "$mut_job.bak"
+set +e
+PATH="$fake_bin:$PATH" run_push "$mut_inbox" "$mut_state" "$mut_remote" >/dev/null 2>&1
+mut_rc=$?
+set -e
+[[ "$mut_rc" -ne 0 ]] || fail "post-gate ingest rewrite was integrated"
+[[ ! -e "$mut_state/integrated/ingest-mutation-01.json" ]] || fail "mutated ingest forged integration"
+
+# A shared-path symlink cannot redirect the authorized refresh into an
+# attacker-controlled Git repository.
+mirror_remote=$(make_remote mirror-poison)
+mirror_seed="$fixture/mirror-poison-seed"
+mirror_inbox="$fixture/mirror-poison-inbox"
+mirror_state="$fixture/mirror-poison-state"
+attacker_remote=$(make_remote attacker)
+attacker_before=$(git --git-dir="$attacker_remote" rev-parse refs/heads/staging)
+mkdir -p "$mirror_inbox/done" "$mirror_inbox/rejected" "$mirror_state"
+ln -s "$attacker_remote" "$mirror_state/staging.git"
+add_job "$mirror_seed" "$mirror_inbox" mirror-poison-01 mirror
+set +e
+PATH="$fake_bin:$PATH" run_push "$mirror_inbox" "$mirror_state" "$mirror_remote" >/dev/null 2>&1
+mirror_rc=$?
+set -e
+[[ "$mirror_rc" -ne 0 ]] || fail "symlink staging mirror was accepted"
+assert_eq "$(git --git-dir="$attacker_remote" rev-parse refs/heads/staging)" "$attacker_before"
+[[ ! -e "$mirror_state/integrated/mirror-poison-01.json" ]] || fail "mirror poison forged integration"
+
+# Malformed durable batch state is never interpreted as an idle controller.
+bad_state="$fixture/bad-state"
+bad_inbox="$fixture/bad-inbox"
+mkdir -p "$bad_state/batches/bad" "$bad_inbox/done" "$bad_inbox/rejected"
+printf '{not-json\n' >"$bad_state/batches/bad/batch.json"
+set +e
+MERGER_INBOX="$bad_inbox" MERGER_STATE_DIR="$bad_state" "$controller" once >/dev/null 2>&1
+bad_rc=$?
+set -e
+[[ "$bad_rc" -ne 0 && "$bad_rc" -ne 10 ]] || fail "malformed batch receipt appeared idle"
+
+echo "PASS async deploy: two pushes without GHA; receipts validated; crash resumes; divergence and corruption fail closed"

@@ -1,0 +1,1377 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+canonical_script="$(python3 - "$0" <<'PY'
+import pathlib, sys
+try:
+    print(pathlib.Path(sys.argv[1]).resolve(strict=True))
+except OSError as error:
+    print(f"hill-climb-score-one: cannot resolve executable: {error}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+)"
+script_dir="$(dirname -- "$canonical_script")"
+receipt_checker="$script_dir/hill-climb-score-receipt-check"
+source_repo="${FLEET_SOURCE_REPO:-$HOME/src/curtaincall-cfp}"
+eval_kit="${FLEET_EVAL_KIT:-$HOME/killmysaas-evals-coding-agent}"
+fleet_root="${FLEET_STATE_ROOT:-$HOME/fleet-runs}"
+state_root="${SCORE_ONE_STATE_ROOT:-$HOME/.local/state/hill-climb-score}"
+event_log="${SCORE_ONE_EVENT_LOG:-$state_root/events.jsonl}"
+lock_file="${SCORE_ONE_LOCK_FILE:-$state_root/score-one.lock}"
+heartbeat_seconds="${SCORE_ONE_HEARTBEAT_SECONDS:-30}"
+stale_seconds="${SCORE_ONE_STALE_SECONDS:-1200}"
+worker_model="${SCORE_ONE_WORKER_MODEL:-gpt-5.6-sol}"
+judge_model="${SCORE_ONE_JUDGE_MODEL:-gpt-5.3-codex-spark}"
+worker_effort="${SCORE_ONE_WORKER_REASONING_EFFORT:-high}"
+judge_effort="${SCORE_ONE_JUDGE_REASONING_EFFORT:-high}"
+judge_samples="${SCORE_ONE_JUDGE_SAMPLE_COUNT:-5}"
+max_turns=240
+slots=6
+attempt_id="${SCORE_ONE_ATTEMPT_ID:-}"
+fixture_sha=""
+eval_kit_sha=""
+eval_kit_archive_sha=""
+eval_config_sha=""
+deployment_proof_sha=""
+deployment_receipt_dir=/tmp/merge-inbox/done
+deployment_receipt_owner=merger
+
+fail() {
+  printf 'hill-climb-score-one: %s\n' "$*" >&2
+  exit 1
+}
+
+verify_receipt_checker_trust() {
+  python3 - "$receipt_checker" <<'PY'
+import os, pathlib, stat, sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    metadata = path.lstat()
+    parent = path.parent.lstat()
+except OSError as error:
+    print(f"hill-climb-score-one: cannot inspect receipt checker: {error}", file=sys.stderr)
+    raise SystemExit(1)
+trusted_uids = {0, os.geteuid()}
+if (not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode) or
+        metadata.st_uid not in trusted_uids or metadata.st_mode & 0o022 or
+        not os.access(path, os.X_OK)):
+    print("hill-climb-score-one: receipt checker is not a trusted executable", file=sys.stderr)
+    raise SystemExit(1)
+if (not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode) or
+        parent.st_uid not in trusted_uids or parent.st_mode & 0o022):
+    print("hill-climb-score-one: receipt checker directory is not trusted", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+verify_receipt_checker_trust
+
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  hill-climb-score-one run FULL_STAGING_SHA DEPLOYMENT_RUN_URL
+  hill-climb-score-one status
+  hill-climb-score-one validate /absolute/fleet-run
+  hill-climb-score-one recover /absolute/failed-at-judge-fleet-run APPROVED_STATE_SHA256
+EOF
+  exit 64
+}
+
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+sha256_stream() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    shasum -a 256 | awk '{print $1}'
+  fi
+}
+
+emit_event() {
+  local event=$1 sha=$2 run=${3:-} detail=${4:-} captured=${5:-0} judges=${6:-0}
+  mkdir -p "$state_root"
+  jq -nc --arg timestamp "$(now)" --arg event "$event" --arg sha "$sha" \
+    --arg run "$run" --arg detail "$detail" --arg attempt_id "$attempt_id" \
+    --arg fixture_sha256 "$fixture_sha" --arg eval_kit_sha "$eval_kit_sha" \
+    --arg eval_kit_archive_sha256 "$eval_kit_archive_sha" \
+    --arg eval_config_sha256 "$eval_config_sha" \
+    --arg deployment_proof_sha256 "$deployment_proof_sha" \
+    --arg worker_model "$worker_model" \
+    --arg judge_model "$judge_model" --arg worker_effort "$worker_effort" \
+    --arg judge_effort "$judge_effort" --argjson judge_samples "$judge_samples" \
+    --argjson max_turns "$max_turns" \
+    --argjson slots "$slots" --argjson captured "$captured" --argjson judges "$judges" \
+    '{schema:"hill-climb-score-event.v1",timestamp:$timestamp,event:$event,
+      attempt_id:$attempt_id,sha:$sha,
+      run:$run,detail:$detail,captured:$captured,judges:$judges,
+      fixture_sha256:$fixture_sha256,eval_kit_sha:$eval_kit_sha,
+      eval_kit_archive_sha256:$eval_kit_archive_sha256,
+      eval_config_sha256:$eval_config_sha256,
+      deployment_proof_sha256:$deployment_proof_sha256,
+      instrument:{worker_executor:"codex",worker_model:$worker_model,
+        worker_reasoning_effort:$worker_effort,judge_executor:"codex",
+        judge_model:$judge_model,judge_reasoning_effort:$judge_effort,
+        judge_sample_count:$judge_samples,
+        max_turns_per_scenario:$max_turns,sut_count:$slots,evidence_only:false}}' \
+    >>"$event_log"
+}
+
+current_run() {
+  python3 - "$fleet_root/current" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+try:
+    print(path.resolve(strict=True))
+except OSError:
+    pass
+PY
+}
+
+progress_counts() {
+  local run=$1 captured=0 judges=0
+  if [[ -n "$run" && -d "$run" ]]; then
+    captured=$(grep -c ' CAPTURED ' "$run/events.log" 2>/dev/null || true)
+    judges=$(find "$run/consolidated-kit/runs/fleet-consolidated/judgements" \
+      -maxdepth 1 -name '*.json' -type f 2>/dev/null | wc -l | tr -d ' ')
+  fi
+  printf '%s\t%s\n' "$captured" "$judges"
+}
+
+local_deployment_proof() {
+  local root=$1 owner=$2 sha=$3 run_url=$4
+  python3 - "$root" "$owner" "$sha" "$run_url" <<'PY'
+import hashlib, json, os, pathlib, pwd, stat, sys
+
+root = pathlib.Path(sys.argv[1])
+owner = sys.argv[2]
+sha = sys.argv[3]
+run_url = sys.argv[4]
+if not root.exists():
+    raise SystemExit(10)
+try:
+    expected_uid = pwd.getpwnam(owner).pw_uid
+except KeyError:
+    print(f"unknown deployment receipt owner: {owner}", file=sys.stderr)
+    raise SystemExit(1)
+root_stat = root.lstat()
+if (not stat.S_ISDIR(root_stat.st_mode) or stat.S_ISLNK(root_stat.st_mode)
+        or root_stat.st_uid != expected_uid or root_stat.st_mode & 0o022):
+    print(f"untrusted deployment receipt directory: {root}", file=sys.stderr)
+    raise SystemExit(1)
+
+matches = []
+for path in sorted(root.glob("*.job")):
+    path_stat = path.lstat()
+    if not stat.S_ISREG(path_stat.st_mode) or stat.S_ISLNK(path_stat.st_mode):
+        continue
+    raw = path.read_bytes()
+    fields = {key: [] for key in ("pushed-sha", "deploy-run", "deploy-result")}
+    for line in raw.decode("utf-8", errors="strict").splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key in fields:
+            fields[key].append(value.strip())
+    # The done ledger contains legacy jobs that predate deployment receipts.
+    # Ignore unrelated rows. Once either target identity is mentioned, require
+    # the complete, unique receipt tuple and fail closed.
+    candidate = sha in fields["pushed-sha"] or run_url in fields["deploy-run"]
+    if not candidate:
+        continue
+    if any(len(values) != 1 for values in fields.values()):
+        print(f"malformed deployment receipt: {path}", file=sys.stderr)
+        raise SystemExit(1)
+    if fields["pushed-sha"][0] != sha or fields["deploy-run"][0] != run_url:
+        print(f"contradictory target deployment receipt: {path}", file=sys.stderr)
+        raise SystemExit(1)
+    if path_stat.st_uid != expected_uid or path_stat.st_mode & 0o022:
+        print(f"untrusted deployment receipt: {path}", file=sys.stderr)
+        raise SystemExit(1)
+    if fields["deploy-result"][0] != "success":
+        print(f"deployment receipt is not successful: {path}", file=sys.stderr)
+        raise SystemExit(1)
+    matches.append((path, hashlib.sha256(raw).hexdigest()))
+if not matches:
+    raise SystemExit(10)
+path, digest = matches[0]
+print(json.dumps({
+    "schema": "hill-climb-deployment-proof.v1",
+    "head_sha": sha,
+    "status": "completed",
+    "conclusion": "success",
+    "url": run_url,
+    "workflow": ".github/workflows/build-and-deploy.yml",
+    "source": "merger-done-receipt",
+    "receipt_path": str(path.resolve()),
+    "receipt_sha256": digest,
+}, sort_keys=True, separators=(",", ":")))
+PY
+}
+
+deployment_proof() {
+  local sha=$1 run_url=$2 run_id proof local_proof local_rc token
+  [[ "$run_url" =~ ^https://github\.com/realgenekim/curtaincall-cfp/actions/runs/([0-9]+)$ ]] ||
+    fail "deployment URL is not a Curtain Call GitHub Actions run"
+  run_id=${BASH_REMATCH[1]}
+  if local_proof=$(local_deployment_proof \
+      "$deployment_receipt_dir" "$deployment_receipt_owner" "$sha" "$run_url"); then
+    printf '%s\n' "$local_proof"
+    return 0
+  else
+    local_rc=$?
+    [[ "$local_rc" -eq 10 ]] || fail "local merger deployment receipt failed validation"
+  fi
+  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    proof=$(gh api "repos/realgenekim/curtaincall-cfp/actions/runs/$run_id") ||
+      fail "could not read authenticated GitHub deployment receipt"
+  else
+    token=${GH_TOKEN:-${GITHUB_TOKEN:-}}
+    if [[ -n "$token" ]]; then
+      proof=$(printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/vnd.github+json"\n' \
+        "$token" | curl -fsSL --retry 3 --config - \
+          "https://api.github.com/repos/realgenekim/curtaincall-cfp/actions/runs/$run_id") ||
+        fail "could not read authenticated GitHub deployment receipt"
+    else
+      proof=$(curl -fsSL --retry 3 \
+        "https://api.github.com/repos/realgenekim/curtaincall-cfp/actions/runs/$run_id") ||
+        fail "no trusted local receipt and GitHub deployment receipt is not publicly readable"
+    fi
+  fi
+  jq -ce --arg sha "$sha" --arg url "$run_url" '
+    . as $run
+    | select((.head_sha // .headSha) == $sha and .status == "completed" and
+             .conclusion == "success" and (.html_url // .url) == $url and
+             ((.path // .workflow // "") | endswith("build-and-deploy.yml")))
+    | {schema:"hill-climb-deployment-proof.v1",head_sha:$sha,status:"completed",
+       conclusion:"success",url:$url,workflow:($run.path // $run.workflow)}' <<<"$proof" ||
+    fail "deployment receipt does not prove successful build-and-deploy for $sha"
+}
+
+eval_kit_identity() {
+  git -C "$eval_kit" rev-parse --git-dir >/dev/null 2>&1 || fail "eval kit must be a Git checkout: $eval_kit"
+  eval_kit_sha=$(git -C "$eval_kit" rev-parse HEAD)
+  eval_kit_archive_sha=$(git -C "$eval_kit" archive "$eval_kit_sha" | sha256_stream)
+}
+
+materialize_eval_kit() {
+  local destination=$1 archive_file observed_sha observed_archive
+  archive_file="${destination}.archive.$$"
+  umask 077
+  [[ ! -e "$archive_file" ]] || fail "temporary evaluator archive path already exists"
+  git -C "$eval_kit" archive "$eval_kit_sha" >"$archive_file" \
+    || fail "could not materialize pinned evaluator archive"
+  observed_archive=$(sha256_stream <"$archive_file")
+  if [[ "$observed_archive" != "$eval_kit_archive_sha" ]]; then
+    rm -f "$archive_file"
+    fail "materialized evaluator archive differs from pinned identity"
+  fi
+  git clone --quiet --no-checkout "$eval_kit" "$destination" \
+    || fail "could not create isolated evaluator repository"
+  git -C "$destination" update-ref --no-deref HEAD "$eval_kit_sha" \
+    || fail "could not pin isolated evaluator repository"
+  tar -xf "$archive_file" -C "$destination" \
+    || fail "could not extract pinned evaluator archive"
+  rm -f "$archive_file"
+  observed_sha=$(git -C "$destination" rev-parse HEAD)
+  observed_archive=$(git -C "$destination" archive "$observed_sha" | sha256_stream)
+  [[ "$observed_sha" == "$eval_kit_sha" && "$observed_archive" == "$eval_kit_archive_sha" ]] \
+    || fail "isolated evaluator repository differs from pinned archive"
+  [[ -d "$eval_kit/node_modules" ]] || fail "eval kit node_modules are unavailable"
+  ln -s "$eval_kit/node_modules" "$destination/node_modules"
+}
+
+pin_eval_config() {
+  local destination=$1 source
+  source="$eval_kit/evalconfig.json"
+  if ! eval_config_sha=$(python3 - "$source" "$destination" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+
+source, destination = sys.argv[1:]
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+fd = os.open(source, flags)
+try:
+    metadata = os.fstat(fd)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("source is not a regular file")
+    chunks = []
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+finally:
+    os.close(fd)
+raw = b"".join(chunks)
+payload = json.loads(raw.decode("utf-8"))
+if not isinstance(payload, dict):
+    raise ValueError("eval config must be a JSON object")
+temporary = destination + f".tmp.{os.getpid()}"
+output = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+try:
+    os.write(output, raw)
+    os.fsync(output)
+finally:
+    os.close(output)
+os.replace(temporary, destination)
+os.chmod(destination, 0o400)
+print(hashlib.sha256(raw).hexdigest())
+PY
+  ); then
+    fail "could not atomically pin evalconfig.json"
+  fi
+}
+
+verify_inherited_lock() {
+  python3 - "${SCORE_ONE_LOCK_FD:-}" "$lock_file" <<'PY'
+import fcntl, os, stat, sys
+try:
+    fd = int(sys.argv[1])
+    held = os.fstat(fd)
+    path = os.lstat(sys.argv[2])
+    if stat.S_ISLNK(path.st_mode) or not stat.S_ISREG(path.st_mode):
+        raise ValueError("lock path is not a regular file")
+    if (held.st_dev, held.st_ino) != (path.st_dev, path.st_ino):
+        raise ValueError("inherited lock does not match lock path")
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except (BlockingIOError, OSError, ValueError) as error:
+    print(f"invalid inherited kernel lock: {error}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+pin_new_run() {
+  local before=$1 sha=$2 supervisor=$3 deadline candidate observed_pid observed_sha
+  deadline=$((SECONDS + 60))
+  while [[ "$SECONDS" -lt "$deadline" ]]; do
+    candidate=$(current_run)
+    if [[ -n "$candidate" && "$candidate" != "$before" && -s "$candidate/manifest.json" ]]; then
+      case "$candidate" in "$fleet_root"/*) ;; *) fail "new run escaped fleet root: $candidate" ;; esac
+      observed_sha=$(jq -r '.code_sha // ""' "$candidate/manifest.json")
+      observed_pid=$(tr -cd '0-9' <"$candidate/supervisor.pid" 2>/dev/null || true)
+      [[ "$observed_sha" == "$sha" ]] || fail "new run SHA mismatch: $observed_sha"
+      [[ "$observed_pid" == "$supervisor" ]] || fail "new run supervisor mismatch: $observed_pid != $supervisor"
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    sleep 0.1
+  done
+  fail "fleet did not publish one new pinned run within 60 seconds"
+}
+
+current_is_pinned() {
+  [[ "$(current_run)" == "$1" ]]
+}
+
+lock_and_reexec() {
+  local sha=$1 run_url=$2
+  mkdir -p "$state_root"
+  exec python3 - "$lock_file" "$0" "$sha" "$run_url" <<'PY'
+import fcntl, os, sys
+lock_path, script, sha, run_url = sys.argv[1:]
+flags = os.O_RDWR | os.O_CREAT
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+fd = os.open(lock_path, flags, 0o600)
+lock = os.fdopen(fd, "a+", encoding="utf-8")
+try:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print("hill-climb-score-one: another score is running", file=sys.stderr)
+    raise SystemExit(75)
+os.set_inheritable(lock.fileno(), True)
+path = os.lstat(lock_path)
+held = os.fstat(lock.fileno())
+if (path.st_dev, path.st_ino) != (held.st_dev, held.st_ino) or path.st_nlink != 1:
+    print("hill-climb-score-one: lock path changed during acquisition", file=sys.stderr)
+    raise SystemExit(75)
+environment = os.environ.copy()
+environment["SCORE_ONE_LOCK_FD"] = str(lock.fileno())
+os.execve(script, [script, "_run", sha, run_url], environment)
+PY
+}
+
+lock_recover_and_reexec() {
+  local run=$1 approved_state_sha=$2
+  mkdir -p "$state_root"
+  exec python3 - "$lock_file" "$0" "$run" "$approved_state_sha" <<'PY'
+import fcntl, os, sys
+lock_path, script, run, approved_state_sha = sys.argv[1:]
+flags = os.O_RDWR | os.O_CREAT
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+fd = os.open(lock_path, flags, 0o600)
+lock = os.fdopen(fd, "a+", encoding="utf-8")
+try:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print("hill-climb-score-one: another score is running", file=sys.stderr)
+    raise SystemExit(75)
+os.set_inheritable(lock.fileno(), True)
+path = os.lstat(lock_path)
+held = os.fstat(lock.fileno())
+if (path.st_dev, path.st_ino) != (held.st_dev, held.st_ino) or path.st_nlink != 1:
+    print("hill-climb-score-one: lock path changed during acquisition", file=sys.stderr)
+    raise SystemExit(75)
+environment = os.environ.copy()
+environment["SCORE_ONE_LOCK_FD"] = str(lock.fileno())
+os.execve(script, [script, "_recover", run, approved_state_sha], environment)
+PY
+}
+
+validate_run() {
+  local run=$1 expected_sha=${2:-} expected_fixture=${3:-} deployment_json=${4:-}
+  local expected_eval_sha=${5:-} expected_eval_archive=${6:-} expected_eval_config=${7:-}
+  local validation_mode=${8:-ordinary}
+  local approved_state_sha=${9:-}
+  local verify_root recomputed_report score_log rc
+  verify_root=$(mktemp -d)
+  recomputed_report="$verify_root/report.json"
+  score_log="$verify_root/score.log"
+  # Build the verifier from the declared Git archive, never from the run's
+  # possibly dirty evaluator copy. Copy evidence bytes (no hard links) so a
+  # faulty scorer cannot mutate the immutable run while proving itself.
+  [[ "$(git -C "$eval_kit" archive "$expected_eval_sha" | sha256_stream)" == \
+      "$expected_eval_archive" ]] || fail "eval-kit archive identity changed"
+  [[ -f "$run/inputs/evalconfig.json" && ! -L "$run/inputs/evalconfig.json" ]] \
+    || fail "run lacks a regular pinned eval config artifact"
+  mkdir -p "$verify_root/kit/runs"
+  git -C "$eval_kit" archive "$expected_eval_sha" | tar -xf - -C "$verify_root/kit"
+  install -m 0600 "$run/inputs/evalconfig.json" "$verify_root/kit/evalconfig.json"
+  cp -a "$run/consolidated-kit/runs/fleet-consolidated" \
+    "$verify_root/kit/runs/fleet-consolidated"
+  rm -f "$verify_root/kit/runs/fleet-consolidated/report.json" \
+    "$verify_root/kit/runs/fleet-consolidated/report.html"
+  set +e
+  (cd "$verify_root/kit" &&
+    npx --yes pnpm@9 install --frozen-lockfile &&
+    npx --yes pnpm@9 run --silent sbek -- score --run runs/fleet-consolidated) \
+    >"$score_log" 2>&1
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 || ! -s "$verify_root/kit/runs/fleet-consolidated/report.json" ]]; then
+    rm -rf "$verify_root"
+    fail "independent score recomputation failed"
+  fi
+  cp "$verify_root/kit/runs/fleet-consolidated/report.json" "$recomputed_report"
+  set +e
+  python3 - "$run" "$expected_sha" "$worker_model" "$judge_model" \
+    "$worker_effort" "$judge_effort" "$judge_samples" "$max_turns" "$slots" "$expected_fixture" \
+    "$deployment_json" "$expected_eval_sha" "$expected_eval_archive" "$expected_eval_config" \
+    "$validation_mode" "$approved_state_sha" \
+    "$recomputed_report" <<'PY'
+import hashlib, json, math, pathlib, re, sys
+
+run = pathlib.Path(sys.argv[1]).resolve()
+expected_sha, worker_model, judge_model, worker_effort, judge_effort = sys.argv[2:7]
+judge_samples, max_turns, slots = map(int, sys.argv[7:10])
+expected_fixture, deployment_json, expected_eval_sha, expected_eval_archive, expected_eval_config = sys.argv[10:15]
+validation_mode = sys.argv[15]
+approved_state_sha = sys.argv[16]
+recomputed_report_path = pathlib.Path(sys.argv[17])
+deployment = json.loads(deployment_json) if deployment_json else None
+expected_scenarios = {
+    "CFP-S1", "CFP-S2", "CFP-S3", "CFP-S4",
+    "ABS-S1", "ABS-S2", "ABS-S3",
+    "SPK-S1", "SPK-S2", "SPK-S3",
+    "CNT-S1", "CNT-S2", "CNT-S3",
+    "AIA-S1", "AIA-S2", "EMB-S1", "EMB-S2", "EMB-S3",
+}
+
+expected_areas = {
+    "call-for-papers", "abstract-management", "speaker-management",
+    "content-management", "ai-agenda", "public-widgets",
+}
+allowed_outcomes = {"completed", "blocked", "feature_not_found", "agent_error"}
+allowed_verdicts = {"pass", "partial", "fail", "not_found", "cannot_judge"}
+allowed_confidence = {"high", "medium", "low"}
+
+def load(name):
+    with (run / name).open(encoding="utf-8") as stream:
+        return json.load(stream)
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def finite_percentage(value):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and 0 <= value <= 100)
+
+manifest = load("manifest.json")
+readiness = load("readiness.json")
+summary = load("summary.json")
+state = load("state.json")
+report = load("report.json")
+recomputed_report = json.loads(recomputed_report_path.read_text(encoding="utf-8"))
+sha = manifest.get("code_sha")
+if expected_sha and sha != expected_sha:
+    raise SystemExit(f"run SHA {sha!r} != expected {expected_sha!r}")
+fixture = manifest.get("golden_fixture_sha256")
+run_url = manifest.get("deployment_run_url")
+eval_config_path = run / "inputs/evalconfig.json"
+if (not eval_config_path.is_file() or eval_config_path.is_symlink() or
+        (eval_config_path.stat().st_mode & 0o777) != 0o400 or
+        digest(eval_config_path) != expected_eval_config):
+    raise SystemExit("run eval config artifact does not match the pinned input")
+checks = [
+    manifest.get("schema") == "hill-climb-fleet-manifest.v1",
+    manifest.get("harness_sha") == sha,
+    manifest.get("dirty") is False,
+    manifest.get("evidence_only") is False,
+    manifest.get("worker_executor") == "codex",
+    manifest.get("worker_model") == worker_model,
+    manifest.get("worker_reasoning_effort") == worker_effort,
+    manifest.get("judge_executor") == "codex",
+    manifest.get("judge_model") == judge_model,
+    manifest.get("judge_reasoning_effort") == judge_effort,
+    manifest.get("judge_sample_count") == judge_samples,
+    manifest.get("max_turns_per_scenario") == max_turns,
+    manifest.get("slots") == slots,
+    len(manifest.get("scenarios", [])) == len(expected_scenarios),
+    set(manifest.get("scenarios", [])) == expected_scenarios,
+    fixture == expected_fixture,
+    manifest.get("eval_kit_sha") == expected_eval_sha,
+    manifest.get("eval_kit_archive_sha256") == expected_eval_archive,
+    manifest.get("eval_config_sha256") == expected_eval_config,
+    deployment is not None and deployment.get("head_sha") == sha,
+    deployment is not None and deployment.get("url") == run_url,
+    deployment is not None and deployment.get("status") == "completed",
+    deployment is not None and deployment.get("conclusion") == "success",
+    readiness.get("status") == "ready",
+    readiness.get("code_sha") == sha,
+    len(readiness.get("slots", [])) == slots,
+    {item.get("slot") for item in readiness.get("slots", [])} == set(range(slots)),
+    len({item.get("port") for item in readiness.get("slots", [])}) == slots,
+    len({item.get("lane") for item in readiness.get("slots", [])}) == slots,
+    sum(len(item.get("scenarios", [])) for item in readiness.get("slots", [])) == len(expected_scenarios),
+    set().union(*(set(item.get("scenarios", [])) for item in readiness.get("slots", []))) == expected_scenarios,
+    all(item.get("schema") == "hill-climb-slot-ready.v1" and item.get("code_sha") == sha and
+        item.get("golden_sha256") == fixture and isinstance(item.get("submissions"), int) and
+        item.get("submissions") >= 500 and sorted(item.get("personas", [])) ==
+        ["organizer", "reviewer", "speaker"] for item in readiness.get("slots", [])),
+    summary.get("status") == "complete",
+    summary.get("expected") == 18,
+    summary.get("captured") == 18,
+    summary.get("complete") == 18,
+    summary.get("failed_or_missing") == 0,
+    report.get("scoreWithheld") is False,
+    finite_percentage(report.get("overallPct")),
+    finite_percentage(report.get("overallCoveragePct")),
+]
+recovery = None
+if validation_mode == "ordinary":
+    checks.append(state.get("status") == "complete")
+elif validation_mode == "judge-only-recovery":
+    allowed_failure_details = {
+        "scenario evidence complete; consolidated judging failed",
+        "scenario evidence complete; judge session quota exhausted; score is resumable",
+    }
+    checks.extend([
+        state.get("schema") == "hill-climb-fleet-state.v1",
+        state.get("status") == "failed",
+        state.get("detail") in allowed_failure_details,
+        re.fullmatch(r"[0-9a-f]{64}", approved_state_sha) is not None,
+        digest(run / "state.json") == approved_state_sha,
+    ])
+    recovery = {
+        "mode": "judge-only",
+        "from_state": "failed",
+        "failure_detail": state.get("detail"),
+        "original_state_sha256": digest(run / "state.json"),
+        "approval": {"kind": "explicit-recovery-v1", "run": str(run),
+                     "sha": sha, "state_sha256": approved_state_sha},
+    }
+else:
+    raise SystemExit("unknown score validation mode")
+if not all(checks):
+    raise SystemExit("fleet run failed the self-proving score contract")
+
+def stable_report(payload):
+    ignored = {"startedAt", "finishedAt"}
+    return {key: value for key, value in payload.items() if key not in ignored}
+
+if stable_report(report) != stable_report(recomputed_report):
+    raise SystemExit("report does not match an independent score recomputation")
+
+consolidated = run / "consolidated-kit/runs/fleet-consolidated"
+scenario_dirs = {path.name for path in consolidated.iterdir() if path.is_dir() and "-S" in path.name}
+if scenario_dirs != expected_scenarios:
+    raise SystemExit("consolidated evidence does not contain the exact 18-scenario set")
+artifact_hashes = {}
+declared_screenshot_refs = set()
+actual_screenshot_refs = set()
+allowed_symbolic_refs = set()
+for scenario in sorted(expected_scenarios):
+    evidence_path = consolidated / scenario / "evidence.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    if (not isinstance(evidence, dict) or evidence.get("scenarioId") != scenario or
+            evidence.get("outcome") not in allowed_outcomes):
+        raise SystemExit(f"invalid evidence for {scenario}")
+    observations = evidence.get("observations", [])
+    transcript = evidence.get("transcript", [])
+    screenshots = evidence.get("screenshots", [])
+    if (not isinstance(observations, list) or
+            not all(isinstance(observation, str) and observation for observation in observations)):
+        raise SystemExit(f"invalid observation inventory for {scenario}")
+    if not isinstance(transcript, list):
+        raise SystemExit(f"invalid turn inventory for {scenario}")
+    if not isinstance(screenshots, list):
+        raise SystemExit(f"invalid screenshot inventory for {scenario}")
+    allowed_symbolic_refs.update(f"obs: {observation}" for observation in observations)
+    for entry in transcript:
+        if (not isinstance(entry, dict) or
+                not isinstance(entry.get("turn"), int) or isinstance(entry.get("turn"), bool) or
+                entry["turn"] < 1):
+            raise SystemExit(f"invalid turn inventory for {scenario}")
+        allowed_symbolic_refs.add(f"turn {entry['turn']}")
+    scenario_screenshot_refs = []
+    for entry in screenshots:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            raise SystemExit(f"invalid screenshot inventory for {scenario}")
+        screenshot_path = entry["path"]
+        segments = screenshot_path.split("/")
+        if (not screenshot_path.startswith("screenshots/") or "\\" in screenshot_path or
+                any(segment in {"", ".", ".."} for segment in segments)):
+            raise SystemExit(f"invalid screenshot inventory for {scenario}")
+        scenario_screenshot_refs.append(f"{scenario}/{screenshot_path}")
+    if len(scenario_screenshot_refs) != len(set(scenario_screenshot_refs)):
+        raise SystemExit(f"duplicate screenshot inventory for {scenario}")
+    declared_screenshot_refs.update(scenario_screenshot_refs)
+    scenario_root = consolidated / scenario
+    for artifact in sorted(scenario_root.rglob("*")):
+        if artifact.is_symlink():
+            raise SystemExit(f"symlink in evidence tree for {scenario}")
+        if artifact.is_file():
+            relative = artifact.relative_to(scenario_root).as_posix()
+            artifact_hashes[f"evidence/{scenario}/{relative}"] = digest(artifact)
+            if relative.startswith("screenshots/"):
+                actual_screenshot_refs.add(f"{scenario}/{relative}")
+
+if not declared_screenshot_refs.issubset(actual_screenshot_refs):
+    raise SystemExit("declared screenshot inventory contains missing artifacts")
+screenshot_refs = frozenset(declared_screenshot_refs)
+symbolic_refs = frozenset(allowed_symbolic_refs)
+
+judgement_dir = consolidated / "judgements"
+judgement_files = {path.stem: path for path in judgement_dir.glob("*.json")}
+if set(judgement_files) != expected_areas:
+    raise SystemExit("consolidated judgements do not contain the exact six-area set")
+fold_dir = run / "judgement-folds"
+fold_files = {path.stem: path for path in fold_dir.glob("*.json")}
+if set(fold_files) != expected_areas:
+    raise SystemExit("judgement folds do not contain the exact six-area receipt set")
+predicate_evidence_refs = set()
+for area in sorted(expected_areas):
+    fold_path = fold_files[area]
+    fold = json.loads(fold_path.read_text(encoding="utf-8"))
+    rows = fold.get("candidate_receipts")
+    if (fold.get("schema") != "hill-climb-judgement-fold.v1" or
+            fold.get("area") != area or fold.get("fold_status") != "complete" or
+            fold.get("fold") != "median-candidate-by-area-score" or
+            fold.get("requested_n") != judge_samples or
+            fold.get("enrolled_n") != judge_samples or
+            fold.get("valid_score_n") != judge_samples or
+            fold.get("coverage_gate_failures") != [] or
+            not isinstance(rows, list) or len(rows) != judge_samples or
+            sorted(row.get("sample") for row in rows if isinstance(row, dict)) !=
+            list(range(1, judge_samples + 1)) or
+            fold.get("output_sha256") != digest(judgement_files[area])):
+        raise SystemExit(f"invalid immutable judgement fold for {area}")
+    invocation = fold.get("invocation_tuple")
+    if (not isinstance(invocation, dict) or
+            invocation.get("executor") != "codex" or
+            invocation.get("model") != judge_model or
+            invocation.get("reasoning_effort") != judge_effort or
+            invocation.get("eval_kit_archive_sha256") != expected_eval_archive or
+            invocation.get("eval_config_sha256") != expected_eval_config or
+            not all(re.fullmatch(r"[0-9a-f]{64}", invocation.get(key, ""))
+                    for key in ("prompt_sha256", "input_sha256", "rubric_sha256"))):
+        raise SystemExit(f"fold invocation provenance is invalid for {area}")
+    candidates = {}
+    area_candidate_root = run / "judgement-candidates" / area
+    for candidate_path in area_candidate_root.glob("attempt-*/candidate.json"):
+        candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+        sample = candidate.get("sample")
+        if (candidate.get("schema") != "hill-climb-judgement-candidate.v1" or
+                candidate.get("status") != "enrolled" or candidate.get("area") != area or
+                not isinstance(sample, int) or isinstance(sample, bool) or sample in candidates):
+            raise SystemExit(f"invalid enrolled candidate for {area}")
+        candidates[sample] = (candidate_path, candidate)
+    if set(candidates) != set(range(1, judge_samples + 1)):
+        raise SystemExit(f"candidate sample set is incomplete for {area}")
+    scored_candidates = []
+    for row in rows:
+        sample = row["sample"]
+        candidate_path, candidate = candidates[sample]
+        receipts = candidate.get("receipts")
+        if (row.get("candidate_sha256") != digest(candidate_path) or
+                not isinstance(receipts, dict) or
+                row.get("invocation_sha256") != receipts.get("invocation_sha256") or
+                row.get("judgement_sha256") != receipts.get("judgement_sha256") or
+                row.get("score_sha256") != receipts.get("score_sha256")):
+            raise SystemExit(f"fold candidate binding is invalid for {area} sample {sample}")
+        for filename, key in (("invocation.json", "invocation_sha256"),
+                              ("judgement-receipt.json", "judgement_sha256"),
+                              ("score-receipt.json", "score_sha256")):
+            if digest(candidate_path.parent / filename) != receipts.get(key):
+                raise SystemExit(f"candidate component receipt changed for {area} sample {sample}")
+        invocation_receipt = json.loads((candidate_path.parent / "invocation.json").read_text())
+        judgement_receipt = json.loads((candidate_path.parent / "judgement-receipt.json").read_text())
+        score_receipt = json.loads((candidate_path.parent / "score-receipt.json").read_text())
+        candidate_judgement = candidate_path.parent / "judgement.json"
+        candidate_report = candidate_path.parent / "candidate-report.json"
+        if (invocation_receipt.get("schema") != "hill-climb-judge-invocation.v1" or
+                invocation_receipt.get("area") != area or invocation_receipt.get("sample") != sample or
+                any(invocation_receipt.get(key) != invocation.get(key) for key in invocation) or
+                judgement_receipt.get("schema") != "hill-climb-judge-output.v1" or
+                judgement_receipt.get("area") != area or judgement_receipt.get("sample") != sample or
+                judgement_receipt.get("path") != "judgement.json" or
+                judgement_receipt.get("sha256") != digest(candidate_judgement) or
+                score_receipt.get("schema") != "hill-climb-candidate-score.v1" or
+                score_receipt.get("area") != area or score_receipt.get("sample") != sample or
+                score_receipt.get("judgement_sha256") != judgement_receipt.get("sha256") or
+                score_receipt.get("report_sha256") != digest(candidate_report) or
+                score_receipt.get("score_code_sha256") != expected_eval_archive or
+                score_receipt.get("eval_config_sha256") != expected_eval_config or
+                not finite_percentage(score_receipt.get("computed_score_pct")) or
+                not finite_percentage(score_receipt.get("score_pct")) or
+                score_receipt.get("score_pct") != score_receipt.get("computed_score_pct") or
+                not finite_percentage(score_receipt.get("coverage_pct"))):
+            raise SystemExit(f"candidate authority receipts are invalid for {area} sample {sample}")
+        scored_candidates.append((sample, score_receipt["score_pct"],
+                                  score_receipt["coverage_pct"], judgement_receipt["sha256"]))
+    ordered_candidates = sorted(scored_candidates)
+    ranked_candidates = sorted(scored_candidates, key=lambda row: (row[1], row[3]))
+    selected = ranked_candidates[len(ranked_candidates) // 2]
+    if (fold.get("scores_pct") != [row[1] for row in ordered_candidates] or
+            fold.get("computed_scores_pct") != [row[1] for row in ordered_candidates] or
+            fold.get("coverage_pct") != [row[2] for row in ordered_candidates] or
+            fold.get("selected_sample") != selected[0] or
+            fold.get("selected_judgement_sha256") != selected[3]):
+        raise SystemExit(f"fold is not the deterministic median candidate for {area}")
+    for row in fold.get("predicate_results", []):
+        rubric_id = row.get("rubric_id") if isinstance(row, dict) else None
+        if not isinstance(rubric_id, str) or not rubric_id:
+            raise SystemExit(f"invalid predicate fold row for {area}")
+        if row.get("status") == "unverified" and row.get("reason") == "receipt-missing":
+            predicate_evidence_refs.add(f"predicate:{rubric_id}:missing")
+        else:
+            receipt_sha = row.get("receipt_sha256")
+            predicate_path = run / "predicate-results" / area / f"{rubric_id}.json"
+            if (not isinstance(receipt_sha, str) or digest(predicate_path) != receipt_sha):
+                raise SystemExit(f"predicate receipt binding is invalid for {rubric_id}")
+            predicate = json.loads(predicate_path.read_text(encoding="utf-8"))
+            fact_receipts = predicate.get("fact_receipts")
+            test_receipt = predicate.get("test")
+            if (predicate.get("schema") != "hill-climb-predicate-verdict.v1" or
+                    predicate.get("rubric_id") != rubric_id or
+                    predicate.get("rubric_clause_id") != row.get("rubric_clause_id") or
+                    predicate.get("rubric_spec_sha256") != invocation.get("rubric_sha256") or
+                    predicate.get("outcome") != row.get("status") or
+                    not isinstance(predicate.get("reason_code"), str) or
+                    not isinstance(fact_receipts, list) or
+                    len(fact_receipts) != row.get("fact_receipt_count") or
+                    any(not isinstance(fact, dict) or
+                        re.fullmatch(r"[0-9a-f]{64}", fact.get("sha256", "")) is None or
+                        not isinstance(fact.get("byte_count"), int) or
+                        isinstance(fact.get("byte_count"), bool) or fact["byte_count"] < 0 or
+                        not isinstance(fact.get("locator"), str) or not fact["locator"]
+                        for fact in fact_receipts) or
+                    not isinstance(test_receipt, dict) or
+                    re.fullmatch(r"[0-9a-f]{64}", test_receipt.get("predicate_code_sha256", "")) is None or
+                    re.fullmatch(r"[0-9a-f]{64}", test_receipt.get("test_sha256", "")) is None or
+                    not isinstance(test_receipt.get("case"), str) or not test_receipt["case"]):
+                raise SystemExit(f"predicate authority receipt is invalid for {rubric_id}")
+            predicate_evidence_refs.add(f"predicate-receipt:sha256:{receipt_sha}")
+    artifact_hashes[f"judgement-fold/{area}"] = digest(fold_path)
+for root_name in ("judgement-candidates", "judgement-inputs", "predicate-results"):
+    root = run / root_name
+    if not root.exists():
+        continue
+    for artifact in sorted(root.rglob("*")):
+        if artifact.is_symlink():
+            raise SystemExit(f"symlink in {root_name} receipt tree")
+        if artifact.is_file():
+            artifact_hashes[f"{root_name}/{artifact.relative_to(root).as_posix()}"] = digest(artifact)
+for area, judgement_path in sorted(judgement_files.items()):
+    judgement = json.loads(judgement_path.read_text(encoding="utf-8"))
+    items = judgement.get("items")
+    defects = judgement.get("defects")
+    if not isinstance(items, list) or not items or not isinstance(defects, list) or not isinstance(judgement.get("area_notes"), str):
+        raise SystemExit(f"invalid judgement envelope for {area}")
+    ids = []
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"]:
+            raise SystemExit(f"invalid judgement item for {area}")
+        if item.get("verdict") not in allowed_verdicts or item.get("confidence") not in allowed_confidence:
+            raise SystemExit(f"invalid judgement verdict for {area}")
+        references = item.get("evidence_refs")
+        if (not isinstance(item.get("reasoning"), str) or
+                not isinstance(references, list) or not references):
+            raise SystemExit(f"invalid judgement evidence for {area}")
+        for reference in references:
+            if not isinstance(reference, str) or not reference:
+                raise SystemExit(f"invalid evidence reference for {area}")
+            if reference.startswith("obs:") or reference.startswith("turn "):
+                if reference not in symbolic_refs:
+                    raise SystemExit(f"missing referenced evidence for {area}: {reference}")
+                continue
+            if reference.startswith("predicate:") or reference.startswith("predicate-receipt:"):
+                if reference not in predicate_evidence_refs:
+                    raise SystemExit(f"unbound predicate evidence for {area}: {reference}")
+                continue
+            segments = reference.split("/")
+            if (reference.startswith("/") or "\\" in reference or
+                    any(segment in {"", ".", ".."} for segment in segments) or
+                    reference not in screenshot_refs):
+                raise SystemExit(f"missing referenced evidence for {area}: {reference}")
+        ids.append(item["id"])
+    if len(ids) != len(set(ids)):
+        raise SystemExit(f"duplicate judgement IDs for {area}")
+    artifact_hashes[f"judgement/{area}"] = digest(judgement_path)
+
+report_areas = report.get("areas")
+if not isinstance(report_areas, list) or len(report_areas) != len(expected_areas):
+    raise SystemExit("score report lacks the exact six rubric areas")
+report_by_area = {area.get("area"): area for area in report_areas if isinstance(area, dict)}
+if set(report_by_area) != expected_areas:
+    raise SystemExit("score report rubric areas do not match the six judgements")
+for area in expected_areas:
+    judgement = json.loads(judgement_files[area].read_text(encoding="utf-8"))
+    scored = report_by_area[area]
+    if (scored.get("items") != judgement.get("items") or
+            scored.get("defects") != judgement.get("defects") or
+            scored.get("notes") != judgement.get("area_notes")):
+        raise SystemExit(f"score report is not structurally linked to judgement {area}")
+
+for name in ("manifest.json", "readiness.json", "summary.json", "state.json", "report.json",
+             "inputs/evalconfig.json"):
+    artifact_hashes[name] = digest(run / name)
+artifact_set_sha = hashlib.sha256(
+    json.dumps(artifact_hashes, sort_keys=True, separators=(",", ":")).encode()
+).hexdigest()
+payload = {
+    "schema": "hill-climb-score-receipt.v1",
+    "status": "complete",
+    "run": str(run),
+    "sha": sha,
+    "fixture_sha256": fixture,
+    "deployment": deployment,
+    "deployment_proof_sha256": hashlib.sha256(
+        json.dumps(deployment, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest(),
+    "instrument": {
+        "worker_executor": "codex", "worker_model": worker_model,
+        "worker_reasoning_effort": worker_effort,
+        "judge_executor": "codex", "judge_model": judge_model,
+        "judge_reasoning_effort": judge_effort,
+        "judge_sample_count": judge_samples,
+        "max_turns_per_scenario": max_turns, "sut_count": slots,
+        "evidence_only": False,
+    },
+    "eval_kit": {"sha": expected_eval_sha, "archive_sha256": expected_eval_archive,
+                 "eval_config_sha256": expected_eval_config},
+    "score": report["overallPct"],
+    "coverage": report["overallCoveragePct"],
+    "captured": 18,
+    "judges": 6,
+    "artifacts": artifact_hashes,
+    "artifact_set_sha256": artifact_set_sha,
+}
+if recovery is not None:
+    payload["recovery"] = recovery
+print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+PY
+  rc=$?
+  set -e
+  rm -rf "$verify_root"
+  return "$rc"
+}
+
+validate_existing() {
+  [[ $# -eq 1 ]] || usage
+  local run=$1 sha run_url deployment_json expected_fixture expected_eval_config
+  [[ "$run" = /* && -d "$run" ]] || fail "validate requires an absolute fleet-run directory"
+  sha=$(jq -er '.code_sha | select(type == "string")' "$run/manifest.json") ||
+    fail "run manifest has no code SHA"
+  run_url=$(jq -er '.deployment_run_url | select(type == "string")' "$run/manifest.json") ||
+    fail "run manifest has no deployment URL"
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || fail "run manifest SHA is invalid"
+  git -C "$source_repo" fetch --quiet origin staging
+  git -C "$source_repo" cat-file -e "$sha^{commit}" || fail "run SHA is unavailable"
+  deployment_json=$(deployment_proof "$sha" "$run_url")
+  expected_fixture=$(git -C "$source_repo" show \
+    "$sha:resources/judge-sandbox/events.jsonl" | sha256_stream)
+  eval_kit_identity
+  if [ ! -f "$run/inputs/evalconfig.json" ] || [ -L "$run/inputs/evalconfig.json" ]; then
+    fail "run lacks a pinned eval config artifact"
+  fi
+  expected_eval_config=$(sha256_stream <"$run/inputs/evalconfig.json")
+  validate_run "$run" "$sha" "$expected_fixture" "$deployment_json" \
+    "$eval_kit_sha" "$eval_kit_archive_sha" "$expected_eval_config"
+}
+
+recovery_event_state() {
+  local recovery_attempt=$1 receipt_sha=$2 sha=$3 run=$4 receipt_file=$5
+  python3 - "$event_log" "$recovery_attempt" "$receipt_sha" "$sha" "$run" \
+    "$receipt_file" <<'PY'
+import json, pathlib, re, sys
+
+event_path, attempt_id, receipt_sha, sha, run, receipt_path = sys.argv[1:]
+path = pathlib.Path(event_path)
+if not path.exists():
+    raise SystemExit(10)
+try:
+    receipt = json.loads(pathlib.Path(receipt_path).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    print(f"cannot read deterministic recovery receipt: {error}", file=sys.stderr)
+    raise SystemExit(1)
+matches = []
+for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError as error:
+        print(f"malformed score event line {number}: {error}", file=sys.stderr)
+        raise SystemExit(1)
+    if not isinstance(event, dict) or event.get("schema") != "hill-climb-score-event.v1":
+        print(f"invalid score event schema on line {number}", file=sys.stderr)
+        raise SystemExit(1)
+    if event.get("attempt_id") == attempt_id:
+        matches.append(event)
+if not matches:
+    raise SystemExit(10)
+if len(matches) != 1:
+    print("recovery attempt has multiple terminal events", file=sys.stderr)
+    raise SystemExit(1)
+event = matches[0]
+declared = re.search(r"(?:^| )receipt_sha256=([0-9a-f]{64})(?: |$)", event.get("detail", ""))
+if (event.get("event") != "complete" or event.get("sha") != sha or
+        event.get("run") != run or not declared or declared.group(1) != receipt_sha or
+        event.get("instrument") != receipt.get("instrument") or
+        event.get("fixture_sha256") != receipt.get("fixture_sha256") or
+        event.get("eval_kit_sha") != receipt.get("eval_kit", {}).get("sha") or
+        event.get("eval_kit_archive_sha256") != receipt.get("eval_kit", {}).get("archive_sha256") or
+        event.get("eval_config_sha256") != receipt.get("eval_kit", {}).get("eval_config_sha256") or
+        event.get("deployment_proof_sha256") != receipt.get("deployment_proof_sha256") or
+        event.get("captured") != 18 or event.get("judges") != 6):
+    print("recovery event conflicts with the deterministic receipt", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+recover_locked() {
+  [[ $# -eq 2 ]] || usage
+  local run=$1 approved_state_sha=$2 sha run_url deployment_json expected_fixture expected_eval_config
+  local declared_eval_sha declared_eval_archive
+  local receipt artifact_set receipt_file receipt_tmp receipt_sha event_rc supervisor
+  verify_inherited_lock || fail "kernel lock was not inherited and verified"
+  [[ -z "${OPENAI_API_KEY:-}" && -z "${CODEX_API_KEY:-}" ]] ||
+    fail "metered API keys must be unset; ChatGPT subscription auth only"
+  [[ "$run" = /* && -d "$run" ]] || fail "recover requires an absolute fleet-run directory"
+  fleet_root=$(CDPATH='' cd -P -- "$fleet_root" && pwd)
+  run=$(CDPATH='' cd -P -- "$run" && pwd)
+  case "$run" in "$fleet_root"/*) ;; *) fail "recovery run escaped fleet root: $run" ;; esac
+  current_is_pinned "$run" || fail "recovery run is not the pinned current fleet run"
+  [[ "$approved_state_sha" =~ ^[0-9a-f]{64}$ ]] ||
+    fail "recovery requires an explicit 64-hex failed-state approval"
+  [[ -f "$run/supervisor.pid" && ! -L "$run/supervisor.pid" ]] ||
+    fail "recovery run lacks regular supervisor PID evidence"
+  supervisor=$(<"$run/supervisor.pid")
+  [[ "$supervisor" =~ ^[1-9][0-9]*$ ]] || fail "recovery supervisor PID is malformed"
+  if kill -0 "$supervisor" 2>/dev/null || kill -0 -- "-$supervisor" 2>/dev/null; then
+    fail "recovery run still has a live supervisor: $supervisor"
+  fi
+  sha=$(jq -er '.code_sha | select(type == "string")' "$run/manifest.json") ||
+    fail "run manifest has no code SHA"
+  run_url=$(jq -er '.deployment_run_url | select(type == "string")' "$run/manifest.json") ||
+    fail "run manifest has no deployment URL"
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || fail "run manifest SHA is invalid"
+  git -C "$source_repo" fetch --quiet origin staging
+  git -C "$source_repo" cat-file -e "$sha^{commit}" || fail "run SHA is unavailable"
+  deployment_json=$(deployment_proof "$sha" "$run_url")
+  deployment_proof_sha=$(printf '%s' "$deployment_json" | sha256_stream)
+  fixture_sha=$(git -C "$source_repo" show \
+    "$sha:resources/judge-sandbox/events.jsonl" | sha256_stream)
+  declared_eval_sha=$(jq -er '.eval_kit_sha | select(type == "string")' \
+    "$run/manifest.json") || fail "run manifest has no eval-kit SHA"
+  declared_eval_archive=$(jq -er '.eval_kit_archive_sha256 | select(type == "string")' \
+    "$run/manifest.json") || fail "run manifest has no eval-kit archive SHA"
+  [[ "$declared_eval_sha" =~ ^[0-9a-f]{40}$ && "$declared_eval_archive" =~ ^[0-9a-f]{64}$ ]] ||
+    fail "run manifest evaluator identity is invalid"
+  git -C "$eval_kit" cat-file -e "$declared_eval_sha^{commit}" ||
+    fail "run evaluator commit is unavailable"
+  eval_kit_sha=$declared_eval_sha
+  eval_kit_archive_sha=$(git -C "$eval_kit" archive "$eval_kit_sha" | sha256_stream)
+  [[ "$eval_kit_archive_sha" == "$declared_eval_archive" ]] ||
+    fail "run evaluator archive does not match its declared commit"
+  [[ -f "$run/inputs/evalconfig.json" && ! -L "$run/inputs/evalconfig.json" ]] ||
+    fail "run lacks a pinned eval config artifact"
+  expected_eval_config=$(sha256_stream <"$run/inputs/evalconfig.json")
+  eval_config_sha=$expected_eval_config
+  receipt=$(validate_run "$run" "$sha" "$fixture_sha" "$deployment_json" \
+    "$eval_kit_sha" "$eval_kit_archive_sha" "$expected_eval_config" \
+    judge-only-recovery "$approved_state_sha") || fail "judge-only recovery validation failed"
+  current_is_pinned "$run" || fail "fleet current link changed during recovery validation"
+  artifact_set=$(jq -er '.artifact_set_sha256 | select(type == "string" and length == 64)' \
+    <<<"$receipt") || fail "recovery receipt lacks an artifact-set identity"
+  attempt_id="recover-${sha:0:12}-${artifact_set:0:16}"
+  mkdir -p "$state_root/receipts"
+  receipt_file="$state_root/receipts/$attempt_id.json"
+  if [[ -e "$receipt_file" ]]; then
+    [[ -f "$receipt_file" && ! -L "$receipt_file" ]] ||
+      fail "recovery receipt path is not a regular file"
+    [[ "$(<"$receipt_file")" == "$receipt" ]] ||
+      fail "deterministic recovery receipt already exists with different bytes"
+    "$receipt_checker" "$run" "$receipt_file" >/dev/null ||
+      fail "existing recovery receipt failed the shared verifier"
+  else
+    receipt_tmp="$receipt_file.tmp.$$"
+    printf '%s\n' "$receipt" >"$receipt_tmp"
+    chmod 0600 "$receipt_tmp"
+    if ! "$receipt_checker" "$run" "$receipt_tmp" >/dev/null; then
+      rm -f "$receipt_tmp"
+      fail "new recovery receipt failed the shared verifier"
+    fi
+    current_is_pinned "$run" || fail "fleet current link changed before recovery receipt publication"
+    mv "$receipt_tmp" "$receipt_file"
+  fi
+  receipt_sha=$(sha256_stream <"$receipt_file")
+  deployment_proof_sha=$(jq -er '.deployment_proof_sha256' <<<"$receipt") ||
+    fail "recovery receipt lacks deployment proof identity"
+  set +e
+  recovery_event_state "$attempt_id" "$receipt_sha" "$sha" "$run" "$receipt_file"
+  event_rc=$?
+  set -e
+  case "$event_rc" in
+    0) ;;
+    10)
+      current_is_pinned "$run" || fail "fleet current link changed before recovery event publication"
+      emit_event complete "$sha" "$run" \
+        "receipt_sha256=$receipt_sha score=$(jq -r .score <<<"$receipt") recovery=judge-only" 18 6
+      ;;
+    *) fail "recovery event journal is malformed or contradictory" ;;
+  esac
+  current_is_pinned "$run" || fail "fleet current link changed before recovery completion"
+  "$receipt_checker" "$run" "$receipt_file" >/dev/null ||
+    fail "recovery receipt failed final shared verification"
+  recovery_event_state "$attempt_id" "$receipt_sha" "$sha" "$run" "$receipt_file" ||
+    fail "recovery event failed final shared verification"
+  current_is_pinned "$run" || fail "fleet current link changed after recovery verification"
+  printf '%s\n' "$receipt"
+}
+
+run_locked() {
+  [[ $# -eq 2 ]] || usage
+  local sha=$1 run_url=$2 harness harness_tmp run before_run fleet_pid='' rc captured=0 judges=0 receipt receipt_sha
+  local deployment_json attempt_dir eval_runtime terminal_event=false receipt_file receipt_tmp
+  local -a fleet_env
+  verify_inherited_lock || fail "kernel lock was not inherited and verified"
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || fail "SHA must be 40 lowercase hexadecimal characters"
+  [[ -z "${OPENAI_API_KEY:-}" && -z "${CODEX_API_KEY:-}" ]] ||
+    fail "metered API keys must be unset; ChatGPT subscription auth only"
+  [[ "$heartbeat_seconds" =~ ^[1-9][0-9]*$ ]] || fail "heartbeat interval must be positive"
+  [[ "$judge_samples" =~ ^[1-9][0-9]*$ ]] && (( judge_samples >= 3 && judge_samples % 2 == 1 )) \
+    || fail "judge sample count must be odd and at least 3"
+  mkdir -p "$fleet_root"
+  fleet_root=$(CDPATH='' cd -P -- "$fleet_root" && pwd)
+  git -C "$source_repo" rev-parse --git-dir >/dev/null 2>&1 || fail "source repo is missing: $source_repo"
+  git -C "$source_repo" fetch --quiet origin staging
+  git -C "$source_repo" cat-file -e "$sha^{commit}" || fail "SHA is unavailable: $sha"
+  git -C "$source_repo" merge-base --is-ancestor "$sha" origin/staging ||
+    fail "SHA is not on origin/staging"
+  deployment_json=$(deployment_proof "$sha" "$run_url")
+  fixture_sha=$(git -C "$source_repo" show "$sha:resources/judge-sandbox/events.jsonl" | sha256_stream)
+  eval_kit_identity
+  attempt_id="$(date -u +%Y%m%dT%H%M%SZ)-${sha:0:12}-$$"
+  attempt_dir="$state_root/attempts/$attempt_id"
+  mkdir -p "$attempt_dir" "$state_root/harness" "$state_root/receipts"
+  pin_eval_config "$attempt_dir/evalconfig.json"
+  eval_runtime="$attempt_dir/eval-kit"
+  materialize_eval_kit "$eval_runtime"
+  printf '%s\n' "$deployment_json" >"$attempt_dir/deployment.json"
+  chmod 0444 "$attempt_dir/deployment.json"
+  deployment_proof_sha=$(sha256_stream <"$attempt_dir/deployment.json")
+
+  before_run=$(current_run)
+  if [[ -n "$before_run" && -s "$before_run/state.json" ]]; then
+    case "$(jq -r '.status // "unknown"' "$before_run/state.json")" in
+      preparing|running|consolidating) fail "fleet is already active: $before_run" ;;
+    esac
+  fi
+
+  harness="$state_root/harness/hill-climb-fleet-$sha"
+  harness_tmp="$harness.tmp.$$"
+  git -C "$source_repo" show "$sha:bin/hill-climb-fleet" >"$harness_tmp"
+  chmod 0755 "$harness_tmp"
+  mv "$harness_tmp" "$harness"
+  emit_event start "$sha" "" "deployment=$run_url"
+
+  fleet_env=(env -u OPENAI_API_KEY -u CODEX_API_KEY
+    FLEET_SOURCE_REPO="$source_repo" FLEET_EVAL_KIT="$eval_runtime" FLEET_STATE_ROOT="$fleet_root"
+    FLEET_EVAL_CONFIG="$attempt_dir/evalconfig.json" FLEET_EVAL_CONFIG_SHA256="$eval_config_sha"
+    FLEET_SHA="$sha" FLEET_HARNESS_SHA="$sha" FLEET_DEPLOYMENT_RUN_URL="$run_url"
+    FLEET_SLOTS="$slots" FLEET_EXECUTOR=codex FLEET_WORKER_EXECUTOR=codex
+    FLEET_WORKER_MODEL="$worker_model" FLEET_WORKER_REASONING_EFFORT="$worker_effort"
+    FLEET_JUDGE_EXECUTOR=codex FLEET_JUDGE_MODEL="$judge_model"
+    FLEET_JUDGE_REASONING_EFFORT="$judge_effort" FLEET_JUDGE_SAMPLE_COUNT="$judge_samples"
+    FLEET_MAX_TURNS_PER_SCENARIO="$max_turns"
+    FLEET_CONSOLIDATE_EVIDENCE_ONLY=false)
+  "${fleet_env[@]}" python3 - "$harness" >"$attempt_dir/fleet.log" 2>&1 <<'PY' &
+import os, sys
+os.setsid()
+os.execv(sys.argv[1], [sys.argv[1], "start"])
+PY
+  fleet_pid=$!
+  cleanup_score() {
+    local exit_rc=$? cleanup_run cleanup_captured=0 cleanup_judges=0
+    trap - EXIT HUP INT TERM
+    if [[ -n "$fleet_pid" ]] && kill -0 -- "-$fleet_pid" 2>/dev/null; then
+      kill -TERM -- "-$fleet_pid" 2>/dev/null || true
+      wait "$fleet_pid" 2>/dev/null || true
+    fi
+    if [[ "$terminal_event" != true ]]; then
+      cleanup_run=${run:-}
+      IFS=$'\t' read -r cleanup_captured cleanup_judges <<<"$(progress_counts "$cleanup_run")"
+      emit_event fail "$sha" "$cleanup_run" "score-one exited rc=$exit_rc" "$cleanup_captured" "$cleanup_judges"
+    fi
+    exit "$exit_rc"
+  }
+  trap cleanup_score EXIT
+  trap 'exit 143' HUP INT TERM
+  run=$(pin_new_run "$before_run" "$sha" "$fleet_pid")
+  emit_event pinned "$sha" "$run" "supervisor_pid=$fleet_pid"
+  while kill -0 "$fleet_pid" 2>/dev/null; do
+    sleep "$heartbeat_seconds" & wait $! || true
+    current_is_pinned "$run" || fail "fleet current link changed away from pinned run"
+    IFS=$'\t' read -r captured judges <<<"$(progress_counts "$run")"
+    emit_event heartbeat "$sha" "$run" "supervisor_pid=$fleet_pid" "$captured" "$judges"
+  done
+  set +e
+  wait "$fleet_pid"
+  rc=$?
+  set -e
+  current_is_pinned "$run" || fail "fleet current link changed before terminal validation"
+  IFS=$'\t' read -r captured judges <<<"$(progress_counts "$run")"
+  if [[ "$rc" -ne 0 ]]; then
+    fail "fleet failed rc=$rc; see $attempt_dir/fleet.log"
+  fi
+  [[ "$(sha256_stream <"$attempt_dir/evalconfig.json")" == "$eval_config_sha" ]] \
+    || fail "pinned attempt eval config changed before terminal validation"
+  receipt=$(validate_run "$run" "$sha" "$fixture_sha" "$deployment_json" \
+    "$eval_kit_sha" "$eval_kit_archive_sha" "$eval_config_sha") \
+    || fail "terminal receipt validation failed"
+  current_is_pinned "$run" || fail "fleet current link changed during terminal validation"
+  receipt_file="$state_root/receipts/$attempt_id.json"
+  receipt_tmp="$receipt_file.tmp.$$"
+  printf '%s\n' "$receipt" >"$receipt_tmp"
+  chmod 0600 "$receipt_tmp"
+  if ! "$receipt_checker" "$run" "$receipt_tmp" >/dev/null; then
+    rm -f "$receipt_tmp"
+    fail "new ordinary receipt failed the shared verifier"
+  fi
+  current_is_pinned "$run" || fail "fleet current link changed before ordinary receipt publication"
+  mv "$receipt_tmp" "$receipt_file"
+  receipt_sha=$(sha256_stream <"$receipt_file")
+  deployment_proof_sha=$(jq -er '.deployment_proof_sha256' <<<"$receipt") ||
+    fail "terminal receipt lacks deployment proof identity"
+  emit_event complete "$sha" "$run" \
+    "receipt_sha256=$receipt_sha score=$(jq -r .score <<<"$receipt")" 18 6
+  current_is_pinned "$run" || fail "fleet current link changed before ordinary completion"
+  "$receipt_checker" "$run" "$receipt_file" >/dev/null ||
+    fail "ordinary receipt failed final shared verification"
+  current_is_pinned "$run" || fail "fleet current link changed after ordinary verification"
+  terminal_event=true
+  trap - EXIT HUP INT TERM
+  printf '%s\n' "$receipt"
+}
+
+status() {
+  mkdir -p "$state_root"
+  python3 - "$lock_file" "$event_log" "$fleet_root/current" "$fleet_root" \
+    "$state_root/receipts" "$stale_seconds" "$receipt_checker" <<'PY'
+import datetime, fcntl, hashlib, json, os, pathlib, pwd, re, stat, subprocess, sys
+lock_path, event_path, current_path, fleet_root_path, receipts_path, stale_seconds, receipt_checker = sys.argv[1:]
+errors = []
+try:
+    stale_seconds = int(stale_seconds)
+    if stale_seconds < 1:
+        raise ValueError("must be positive")
+except ValueError as error:
+    errors.append(f"invalid stale threshold: {error}")
+    stale_seconds = 0
+lock_held = False
+try:
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    lock_fd = os.open(lock_path, flags, 0o600)
+    lock = os.fdopen(lock_fd, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    except BlockingIOError:
+        lock_held = True
+except OSError as error:
+    errors.append(f"invalid lock path: {error}")
+events = []
+try:
+    event_file = pathlib.Path(event_path)
+    event_metadata = event_file.lstat()
+    event_parent = event_file.parent.lstat()
+    if (not stat.S_ISREG(event_metadata.st_mode) or stat.S_ISLNK(event_metadata.st_mode) or
+            event_metadata.st_uid != os.getuid() or event_metadata.st_mode & 0o022):
+        raise ValueError("event journal is not a trusted regular file")
+    if (not stat.S_ISDIR(event_parent.st_mode) or stat.S_ISLNK(event_parent.st_mode) or
+            event_parent.st_uid not in {0, os.getuid()} or event_parent.st_mode & 0o022):
+        raise ValueError("event journal parent is not trusted")
+    for number, line in enumerate(event_file.read_text(encoding="utf-8").splitlines(), 1):
+        try:
+            event = json.loads(line)
+            if not isinstance(event, dict) or event.get("schema") != "hill-climb-score-event.v1":
+                raise ValueError("wrong event schema")
+            events.append(event)
+        except (ValueError, json.JSONDecodeError) as error:
+            errors.append(f"malformed event line {number}: {error}")
+except FileNotFoundError:
+    pass
+run = None
+try:
+    run = pathlib.Path(current_path).resolve(strict=True)
+    fleet_root = pathlib.Path(fleet_root_path).resolve(strict=True)
+    if run == fleet_root or fleet_root not in run.parents:
+        errors.append("current run escapes fleet root")
+except OSError:
+    pass
+def load(name):
+    try:
+        return json.loads((run / name).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, TypeError) as error:
+        errors.append(f"invalid {name}: {error}")
+        return {}
+manifest, state, report = load("manifest.json"), load("state.json"), load("report.json")
+captured = 0
+judges = 0
+pid_alive = False
+pid_identity = False
+pid = None
+if run:
+    try:
+        captured = sum(" CAPTURED " in line for line in (run / "events.log").read_text(encoding="utf-8").splitlines())
+    except OSError:
+        pass
+    judges = len(list((run / "consolidated-kit/runs/fleet-consolidated/judgements").glob("*.json")))
+    try:
+        pid = int((run / "supervisor.pid").read_text().strip())
+        os.kill(pid, 0)
+        pid_alive = True
+        command = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "user=,command="], text=True
+        ).strip()
+        owner = pwd.getpwuid(os.getuid()).pw_name
+        pid_identity = command.startswith(owner + " ") and "hill-climb-fleet-" in command and " start" in command
+    except (OSError, ValueError):
+        pass
+    except subprocess.SubprocessError:
+        pass
+sha = manifest.get("code_sha", "")
+matching = [event for event in events if event.get("run") == (str(run) if run else "") and event.get("sha") == sha]
+latest = matching[-1] if matching else {}
+age = None
+if latest.get("timestamp"):
+    try:
+        seen = datetime.datetime.fromisoformat(latest["timestamp"].replace("Z", "+00:00"))
+        if seen.tzinfo is None:
+            raise ValueError("timestamp has no timezone")
+        age = int((datetime.datetime.now(datetime.timezone.utc) - seen).total_seconds())
+    except (TypeError, ValueError) as error:
+        errors.append(f"invalid run heartbeat timestamp: {error}")
+active_state = state.get("status") in {"preparing", "running", "consolidating"}
+fresh_run_event = latest.get("event") in {"pinned", "heartbeat"} and age is not None and 0 <= age <= stale_seconds
+coherent_active = active_state and lock_held and pid_alive and pid_identity and fresh_run_event
+qualified_complete = False
+receipt = {}
+recovery = None
+if state.get("status") == "complete" or latest.get("event") == "complete":
+    if latest.get("event") != "complete" or not latest.get("attempt_id"):
+        errors.append("completed run has no matching complete score event")
+    else:
+        receipt_file = pathlib.Path(receipts_path) / f"{latest['attempt_id']}.json"
+        try:
+            receipt_metadata = receipt_file.lstat()
+            receipt_parent = receipt_file.parent.lstat()
+            if (not stat.S_ISREG(receipt_metadata.st_mode) or stat.S_ISLNK(receipt_metadata.st_mode) or
+                    receipt_metadata.st_uid != os.getuid() or receipt_metadata.st_mode & 0o022):
+                raise ValueError("terminal receipt is not a trusted regular file")
+            if (not stat.S_ISDIR(receipt_parent.st_mode) or stat.S_ISLNK(receipt_parent.st_mode) or
+                    receipt_parent.st_uid not in {0, os.getuid()} or receipt_parent.st_mode & 0o022):
+                raise ValueError("terminal receipt parent is not trusted")
+            receipt_bytes = receipt_file.read_bytes()
+            receipt = json.loads(receipt_bytes)
+            declared = re.search(r"(?:^| )receipt_sha256=([0-9a-f]{64})(?: |$)", latest.get("detail", ""))
+            if not declared or hashlib.sha256(receipt_bytes).hexdigest() != declared.group(1):
+                raise ValueError("receipt hash does not match complete event")
+            verified = subprocess.run(
+                [receipt_checker, str(run), str(receipt_file)],
+                text=True, capture_output=True, timeout=30, check=False,
+            )
+            if verified.returncode != 0:
+                raise ValueError(f"shared receipt verifier refused: {verified.stderr.strip()}")
+            artifact_hashes = receipt.get("artifacts")
+            recovery = receipt.get("recovery")
+            event_instrument = latest.get("instrument")
+            if (event_instrument != receipt.get("instrument") or
+                    latest.get("fixture_sha256") != receipt.get("fixture_sha256") or
+                    latest.get("eval_kit_sha") != receipt.get("eval_kit", {}).get("sha") or
+                    latest.get("eval_kit_archive_sha256") != receipt.get("eval_kit", {}).get("archive_sha256") or
+                    latest.get("eval_config_sha256") != receipt.get("eval_kit", {}).get("eval_config_sha256") or
+                    latest.get("deployment_proof_sha256") != receipt.get("deployment_proof_sha256") or
+                    latest.get("captured") != 18 or latest.get("judges") != 6):
+                raise ValueError("complete event provenance does not match terminal receipt")
+            qualified_complete = True
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, subprocess.SubprocessError) as error:
+            errors.append(f"invalid terminal score receipt: {error}")
+stale = bool(errors or (active_state and not coherent_active) or
+             (lock_held and not active_state) or
+             ((state.get("status") == "complete" or latest.get("event") == "complete") and
+              not qualified_complete))
+payload = {
+    "schema": "hill-climb-score-status.v1",
+    "lock_held": lock_held,
+    "stale": stale,
+    "run": str(run) if run else "",
+    "sha": sha,
+    "fleet_state": state.get("status", "none"),
+    "supervisor_pid_alive": pid_alive,
+    "supervisor_pid_identity": pid_identity,
+    "supervisor_pid": pid,
+    "heartbeat_age_seconds": age,
+    "captured": captured,
+    "judges": judges,
+    "report_state": "complete" if report else "none",
+    "score": report.get("overallPct") if qualified_complete else None,
+    "coverage": report.get("overallCoveragePct") if qualified_complete else None,
+    "attempt_id": latest.get("attempt_id", ""),
+    "qualified_complete": qualified_complete,
+    "recovery": recovery,
+    "last_event": latest,
+    "errors": errors,
+}
+print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+raise SystemExit(2 if stale else 0)
+PY
+}
+
+case "${1:-}" in
+  run) [[ $# -eq 3 ]] || usage; lock_and_reexec "$2" "$3" ;;
+  _run) shift; run_locked "$@" ;;
+  recover) [[ $# -eq 3 ]] || usage; lock_recover_and_reexec "$2" "$3" ;;
+  _recover) shift; recover_locked "$@" ;;
+  _test-local-deployment-proof) [[ $# -eq 5 ]] || usage; local_deployment_proof "$2" "$3" "$4" "$5" ;;
+  status) [[ $# -eq 1 ]] || usage; status ;;
+  validate) [[ $# -eq 2 ]] || usage; validate_existing "$2" ;;
+  *) usage ;;
+esac

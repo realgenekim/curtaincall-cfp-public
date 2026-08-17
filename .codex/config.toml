@@ -1,0 +1,14 @@
+[features]
+hooks = true
+
+# BEGIN clj-surgeon workspace tools
+[mcp_servers.clj-surgeon]
+url = "http://127.0.0.1:7888/mcp"
+required = true
+enabled_tools = ["inspect_clojure", "apply_clojure_changes"]
+
+[mcp_servers.cclsp]
+url = "http://127.0.0.1:7890/mcp"
+required = true
+enabled_tools = ["resolve_var_surface", "find_references", "get_incoming_calls", "get_outgoing_calls"]
+# END clj-surgeon workspace tools

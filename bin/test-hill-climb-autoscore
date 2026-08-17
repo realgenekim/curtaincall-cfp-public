@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# Fast behavioral checks for the self-driving score controller.
+set -euo pipefail
+
+repo_root="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+autoscore="$repo_root/bin/hill-climb-autoscore"
+control="$repo_root/bin/reset-anvil-fleet"
+test_root="$(mktemp -d "${TMPDIR:-/tmp}/autoscore-test.XXXXXX")"
+trap 'rm -rf "$test_root"' EXIT
+
+export AUTOSCORE_REPO_ROOT="$repo_root"
+export AUTOSCORE_STATE_DIR="$test_root/state"
+export AUTOSCORE_JUDGE_SAMPLE_COUNT=3
+# shellcheck source=bin/hill-climb-autoscore
+source "$autoscore"
+
+sha="0123456789abcdef0123456789abcdef01234567"
+harness_sha="89abcdef0123456789abcdef0123456789abcdef"
+install_operation="$(printf 'a%.0s' {1..64})"
+run="/home/tester/fleet-runs/test-autoscore-run"
+receipts="$test_root/receipts"
+mkdir -p "$receipts"
+
+jq -n --arg sha "$sha" --arg harness "$harness_sha" --arg operation "$install_operation" --arg app "$run/app" '
+  {schema:"hill-climb-fleet-manifest.v1",code_sha:$sha,harness_sha:$harness,
+   install_receipt:{schema:"eval-harness-install.v5",operation_sha256:$operation,harness_sha:$harness,installer_sha:$sha},
+   deployment_run_url:"https://example.test/actions/runs/7",
+   received_pin:{code_sha:$sha,harness_sha:$harness,deployment_run_url:"https://example.test/actions/runs/7",
+     deployment_run_id:"7",pin_source:"explicit-pin"},
+   dirty:false,evidence_only:false,
+   worker_executor:"codex",worker_model:"gpt-5.3-codex-spark",worker_reasoning_effort:"high",
+   judge_executor:"codex",judge_model:"gpt-5.3-codex-spark",judge_reasoning_effort:"high",judge_sample_count:3,
+   max_turns_per_scenario:240,
+   slots:6,scenarios:[range(0;18)|"S-\(.)"],app_dir:$app}' > "$receipts/manifest.json"
+jq -n --arg sha "$sha" '
+  {schema:"hill-climb-fleet-readiness.v1",status:"ready",code_sha:$sha,
+   slots:[range(0;6)|{golden_sha256:"golden",personas:["organizer","reviewer","speaker"],submissions:500}]}' \
+  > "$receipts/readiness.json"
+jq -n '
+  {schema:"hill-climb-fleet-summary.v1",status:"complete",expected:18,captured:18,complete:18,terminal:18,named_zero:0,failed_or_missing:0}' \
+  > "$receipts/summary.json"
+jq -n '
+  def item($id;$verdict;$reasoning): {id:$id,verdict:$verdict,reasoning:$reasoning};
+  {overallPct:71.2,overallCoveragePct:98.5,scoreWithheld:false,
+   areas:[
+    {area:"call-for-papers",pct:90,optional:false,items:[item("CFP-01";"pass";"ok")]},
+    {area:"abstract-management",pct:80,optional:false,items:[item("ABS-01";"pass";"ok")]},
+    {area:"speaker-management",pct:70,optional:false,items:[item("SPK-01";"pass";"ok")]},
+    {area:"content-management",pct:60,optional:false,items:[item("CNT-01";"pass";"ok")]},
+    {area:"ai-agenda",pct:100,optional:false,items:[item("AIA-01";"pass";"ok")]},
+    {area:"public-widgets",pct:20,optional:false,
+     items:[item("EMB-02";"partial";"partial problem"),item("EMB-01";"fail";"largest problem")]}
+   ]}' > "$receipts/report.json"
+mkdir "$receipts/judgement-folds"
+for area in call-for-papers abstract-management speaker-management content-management ai-agenda public-widgets; do
+  jq -n --arg area "$area" \
+    '{schema:"hill-climb-judgement-fold.v1",area:$area,fold_status:"complete",
+      requested_n:3,enrolled_n:3,valid_score_n:3,coverage_gate_failures:[],
+      dispersion:{status:"descriptive-only",median_pct:71.2,mad_pct:1.5,
+        scaled_mad_pct:2.2239,iqr_pct:4.4,min_pct:68,max_pct:75},
+      noise_calibration:{status:"insufficient",delta_render:"variance-uncalibrated"}}' \
+    >"$receipts/judgement-folds/$area.json"
+done
+
+validate_receipts "$receipts" "$sha"
+
+cp "$receipts/manifest.json" "$receipts/manifest.bad.json"
+jq '.worker_executor="claude"' "$receipts/manifest.bad.json" > "$receipts/manifest.json"
+if (validate_receipts "$receipts" "$sha" >/dev/null 2>&1); then
+  echo "FAIL: non-Codex manifest passed autoscore validation" >&2
+  exit 1
+fi
+mv "$receipts/manifest.bad.json" "$receipts/manifest.json"
+
+cp "$receipts/manifest.json" "$receipts/manifest.bad.json"
+jq '.install_receipt.harness_sha="0000000000000000000000000000000000000000"' \
+  "$receipts/manifest.bad.json" > "$receipts/manifest.json"
+if (validate_receipts "$receipts" "$sha" >/dev/null 2>&1); then
+  echo "FAIL: manifest harness passed without its verified install receipt" >&2
+  exit 1
+fi
+mv "$receipts/manifest.bad.json" "$receipts/manifest.json"
+
+cp "$receipts/manifest.json" "$receipts/manifest.bad.json"
+jq '.judge_reasoning_effort="medium"' "$receipts/manifest.bad.json" > "$receipts/manifest.json"
+if (validate_receipts "$receipts" "$sha" >/dev/null 2>&1); then
+  echo "FAIL: uncalibrated judge reasoning passed autoscore validation" >&2
+  exit 1
+fi
+mv "$receipts/manifest.bad.json" "$receipts/manifest.json"
+
+history_file="$test_root/history.tsv"
+append_history "$receipts/report.json" "$sha" "$run" "run=$run; sha=$sha; shipped=test"
+append_history "$receipts/report.json" "$sha" "$run" "run=$run; sha=$sha; shipped=test"
+[ "$(wc -l < "$history_file" | tr -d ' ')" -eq 2 ] \
+  || { echo "FAIL: one run was appended to history more than once" >&2; exit 1; }
+awk -F '\t' 'NR == 1 {header=($5 == "variance" && $6 == "calibration" && $7 == "note")}
+  NR == 2 {row=($5 ~ /"mad_pct":1.5/ && $6 == "insufficient")}
+  END {exit !(header && row)}' "$history_file" \
+  || { echo "FAIL: altimeter history lacks bound variance/calibration columns" >&2; exit 1; }
+
+target="$test_root/next-targets.md"
+render_target "$receipts/report.json" "$run" "$sha" "$target"
+grep -q 'Lowest required area: \*\*public-widgets\*\* — 20%' "$target" \
+  || { echo "FAIL: lowest required area was not emitted" >&2; exit 1; }
+first_ranked="$(sed -n 's/^1\. \*\*\([^*]*\)\*\*.*/\1/p' "$target")"
+[ "$first_ranked" = EMB-01 ] \
+  || { echo "FAIL: target items were not ranked by failure severity" >&2; exit 1; }
+
+export AUTOSCORE_FORCE=false
+if deployment_needs_score "$sha" "$sha"; then
+  echo "FAIL: an already scored SHA was not idempotent" >&2
+  exit 1
+fi
+export AUTOSCORE_FORCE=true
+deployment_needs_score "$sha" "$sha" \
+  || { echo "FAIL: explicit forced re-score was not honored" >&2; exit 1; }
+export AUTOSCORE_FORCE=false
+
+printf '%s\n' 'docs/README.md' 'test/example_test.clj' | path_list_is_score_relevant \
+  && { echo "FAIL: docs/tests-only paths were treated as score relevant" >&2; exit 1; }
+printf '%s\n' 'docs/README.md' 'src/cfp_scheduler_killer/server.clj' | path_list_is_score_relevant \
+  || { echo "FAIL: runtime source was not treated as score relevant" >&2; exit 1; }
+
+lock_state="$test_root/lock-state"
+lock_ready="$test_root/lock-ready"
+AUTOSCORE_STATE_DIR="$lock_state" AUTOSCORE_REPO_ROOT="$repo_root" \
+  bash -c 'source "$1"; acquire_lock; trap cleanup_lock EXIT; touch "$2"; sleep 10' \
+  autoscore-lock "$autoscore" "$lock_ready" &
+lock_pid=$!
+for _ in 1 2 3 4 5; do
+  [ -e "$lock_ready" ] && break
+  sleep 1
+done
+[ -e "$lock_ready" ] || { echo "FAIL: lock holder did not start" >&2; exit 1; }
+if AUTOSCORE_STATE_DIR="$lock_state" AUTOSCORE_REPO_ROOT="$repo_root" \
+    bash -c 'source "$1"; acquire_lock' autoscore-lock "$autoscore" >/dev/null 2>&1; then
+  echo "FAIL: overlapping autoscore controller acquired the live lock" >&2
+  exit 1
+fi
+kill "$lock_pid"
+wait "$lock_pid" 2>/dev/null || true
+
+fake_bin="$test_root/fake-bin"
+mkdir -p "$fake_bin"
+printf '%s\n' '#!/bin/sh' "printf '%s\\t%s\\t%s\\n' '$sha' 'https://example.test/actions/runs/1' '2026-08-13T00:00:00Z'" \
+  > "$fake_bin/gh"
+chmod +x "$fake_bin/gh"
+export PATH="$fake_bin:$PATH"
+export AUTOSCORE_DEBOUNCE_SECONDS=60 AUTOSCORE_POLL_SECONDS=60
+debounce_seconds=60
+poll_seconds=60
+write_state_json "$(jq -n '{schema:"hill-climb-autoscore-state.v2",status:"complete",last_observed_sha:"1111111111111111111111111111111111111111",last_completed_sha:"1111111111111111111111111111111111111111",last_completed_run:"fixture",failed_sha:"",failed_run:"",active_sha:"",active_run:"",updated_at:"",detail:"daemon debounce-stop test"}')"
+start_daemon >/dev/null
+sleep 1
+daemon_pid="$(cat "$daemon_pid_file")"
+kill -0 "$daemon_pid" 2>/dev/null \
+  || { echo "FAIL: detached autoscore daemon did not remain live" >&2; exit 1; }
+stop_daemon >/dev/null
+[ ! -e "$daemon_pid_file" ] \
+  || { echo "FAIL: detached autoscore daemon left a live pid receipt" >&2; exit 1; }
+
+# This is a literal contract, not an expansion.
+# shellcheck disable=SC2016
+deployment_override_contract='deployment_sha_override="${FLEET_SHA:-}"'
+grep -Fq "$deployment_override_contract" "$control" \
+  || { echo "FAIL: control plane cannot pin the successful deploy chosen by autoscore" >&2; exit 1; }
+grep -q 'FLEET_SHA and FLEET_DEPLOYMENT_RUN_URL must be provided together' "$control" \
+  || { echo "FAIL: partial deployment overrides do not fail closed" >&2; exit 1; }
+
+# The pin autoscore chose must reach the remote start, and the remote manifest
+# must be able to name which mode produced it.
+explicit_pin="$(FLEET_SHA="$sha" FLEET_DEPLOYMENT_RUN_URL='https://example.test/actions/runs/7' \
+  "$control" _test-resolve-deployment)"
+[ "$explicit_pin" = "$(printf '%s\thttps://example.test/actions/runs/7\texplicit-pin' "$sha")" ] \
+  || { echo "FAIL: an explicitly passed pin did not take precedence with its mode" >&2; exit 1; }
+grep -q "FLEET_PIN_SOURCE='\$pin_source'" "$control" \
+  || { echo "FAIL: the pin source is not forwarded to the remote fleet" >&2; exit 1; }
+
+# A branch tip that advances after selection cannot retarget the deployment,
+# harness verification, or final receipt validation.
+moving_pin="$(git -C "$repo_root" rev-parse HEAD)"
+moving_tip="$(git -C "$repo_root" rev-parse HEAD^)"
+eval_sha_override="$moving_pin"
+printf '%s\n' '#!/bin/sh' \
+  'count=$(cat "$AUTOSCORE_FAKE_GH_COUNT" 2>/dev/null || printf 0)' \
+  'count=$((count + 1))' \
+  'printf "%s\n" "$count" > "$AUTOSCORE_FAKE_GH_COUNT"' \
+  'if [ "$count" -eq 1 ]; then' \
+  "  printf '%s\\t%s\\t%s\\n' '$moving_pin' 'https://example.test/actions/runs/7' '2026-08-17T00:00:00Z'" \
+  'else' \
+  "  printf '%s\\t%s\\t%s\\n' '$moving_tip' 'https://example.test/actions/runs/8' '2026-08-17T00:01:00Z'" \
+  'fi' > "$fake_bin/gh"
+moving_count="$test_root/moving-gh-count"
+export AUTOSCORE_FAKE_GH_COUNT="$moving_count"
+selected="$(selected_deployment)"
+"$fake_bin/gh" >/dev/null
+[ "${selected%%$'\t'*}" = "$moving_pin" ] && [ "$(cat "$moving_count")" -eq 2 ] \
+  || { echo "FAIL: a moving staging tip retargeted the frozen eval pin" >&2; exit 1; }
+selected_harness="$(FLEET_HARNESS_SHA="$moving_pin" "$control" _test-select-harness "$moving_pin")"
+[ "$selected_harness" = "$moving_pin" ] \
+  || { echo "FAIL: harness verification was not bound to the frozen eval pin" >&2; exit 1; }
+if FLEET_HARNESS_SHA="$moving_tip" "$control" _test-select-harness "$moving_pin" >/dev/null 2>&1; then
+  echo "FAIL: a moving-tip harness override was accepted for the frozen pin" >&2
+  exit 1
+fi
+eval_sha_override=""
+unset AUTOSCORE_FAKE_GH_COUNT
+printf '%s\n' '#!/bin/sh' "printf '%s\\t%s\\t%s\\n' '$sha' 'https://example.test/actions/runs/1' '2026-08-13T00:00:00Z'" \
+  > "$fake_bin/gh"
+
+# A readiness gate that cannot tell "not yet" from "wrong run" burns its whole
+# window.  Each fact set below cost a real 900s cycle on 2026-08-17.
+verdict_case() {
+  local expected="$1" description="$2"
+  shift 2
+  local observed
+  observed="$("$control" _test-readiness-verdict "$@" | cut -f1)"
+  [ "$observed" = "$expected" ] \
+    || { echo "FAIL: readiness verdict for $description was '$observed', wanted '$expected'" >&2; exit 1; }
+}
+verdict_case wait "the previous run still owning current" \
+  "$sha" prior-run prior-run "$sha" running ''
+verdict_case wait "a new run before its manifest exists" \
+  "$sha" prior-run new-run '' preparing ''
+verdict_case pin-drift "a new run built from a different commit" \
+  "$sha" prior-run new-run 1111111111111111111111111111111111111111 running ''
+verdict_case ready "a slot refused while four lanes meet quorum" \
+  "$sha" prior-run new-run "$sha" running \
+  'DISPOSITION slot=0 scenario=CFP-S1 status=failed reason=capture-lineage-refused' 4
+verdict_case wait "fewer than four healthy lanes" \
+  "$sha" prior-run new-run "$sha" running '' 3
+verdict_case ready "a new run on the pinned commit" \
+  "$sha" prior-run new-run "$sha" running ''
+verdict_case failed "a run that reported failure" \
+  "$sha" prior-run new-run "$sha" failed ''
+quarantine_reason="$("$control" _test-readiness-verdict "$sha" prior-run new-run "$sha" running \
+  'DISPOSITION slot=0 scenario=CFP-S1 status=failed reason=capture-lineage-refused' 4 | cut -f2)"
+case "$quarantine_reason" in
+  *slot=0*CFP-S1*capture-lineage-refused*) ;;
+  *) echo "FAIL: the named-zero readiness reason does not name the slot and reason" >&2; exit 1 ;;
+esac
+
+echo "PASS autoscore: Codex-only receipts, isolated SUTs, ranked targets, idempotency, locking, and daemon lifecycle"

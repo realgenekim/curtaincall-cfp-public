@@ -1,0 +1,60 @@
+{:source {:url "https://curtaincallcfp.com/events/enterprise-ai-summit-charlotte-2026/details"
+          :captured-on "2026-08-12"
+          :note "A deliberately adjusted Judge Sandbox copy. Real public event facts and announced speakers are preserved; all review submissions and submitters are synthetic."}
+
+ :event {:name "Enterprise AI Summit"
+         :slug "enterprise-ai-summit-charlotte-2026"
+         :starts-on "2026-10-07"
+         :ends-on "2026-10-08"
+         :tz "America/New_York"
+         :location "Charlotte, NC"
+         :website-url "https://events.itrevolution.com/2026-charlotte/"
+         :support-email "annp@itrevolution.net"
+         :hero-image-url "/images/eais-charlotte-hero.jpg"
+         :cfp-intro "This conference assembles the most switched-on people using AI and vibe coding to advance enterprise goals. This is a community of people who are on the frontier of exploring ways of working that may seem radical and potentially risky, the payoff is so obviously high, staying still is simply not an option.\n\nWe have an amazing program planned for you! We have just a few open slots, so if you have an amazing story to share, submit a proposal!\n\n(And this was all made possible by [@Swyx](https://twitter.com/swyx)'s amazing \"Kill My SaaS In One Weekend\" project – the goal was to write a CFP and agenda publishing tool in a weekend. Read more about the process of doing this [here](https://gist.github.com/realgenekim/863f20b8ea515ed8858a298f8e470e9d)!)"}
+
+ ;; swyx and Maya are the two demo doors. The other three people are the real
+ ;; Enterprise AI Summit committee as of the capture above. The production
+ ;; event uses a shared committee table, so "All tracks" is the honest scope.
+ :committee [{:name "swyx"
+              :email "swyx@ai.engineer"
+              :role "chair"
+              :tracks ["All tracks"]
+              :profile {:tagline "Founder, AI Engineer"
+                        :headshot-url "/images/judge-sandbox/swyx.png"}}
+             {:name "Gene Kim"
+              :email "genek@itrevolution.net"
+              :role "chair"
+              :tracks ["All tracks"]
+              :profile {:tagline "WSJ-bestselling author of The Phoenix Project, The DevOps Handbook & Vibe Coding"
+                        :headshot-url "https://events.itrevolution.com/images/speakers/gene-kim.jpg"}}
+             {:name "Ann Perry"
+              :email "annp@itrevolution.net"
+              :role "reviewer"
+              :tracks ["All tracks"]}
+             {:name "Alex Brodrick-Forster"
+              :email "alex@itrevolution.net"
+              :role "reviewer"
+              :tracks ["All tracks"]}
+             {:name "Maya Lindholm"
+              :email "maya.lindholm@example.com"
+              :role "reviewer"
+              :tracks ["Leadership & Organizational Change"
+                       "Developer Practices"
+                       "Architecture"]}]
+
+ :announced-speakers
+ [{:name "Jondavid \"JD\" Black" :org "Northrop Grumman" :title "CIDO Chief Engineer" :headshot-url "https://events.itrevolution.com/images/speakers/jondavid-jd-black.jpg"}
+  {:name "Fernando Cornago" :org "adidas" :title "Global SVP Digital&Ecom Tech" :headshot-url "https://events.itrevolution.com/images/speakers/fernando-cornago.jpg"}
+  {:name "Jeremy Eder" :org "Red Hat" :title "Distinguished Engineer" :headshot-url "https://events.itrevolution.com/images/speakers/jeremy-eder.jpg"}
+  {:name "Elisabeth Hendrickson" :org "Curious Duck Digital Laboratory" :title "CEO/Founder" :headshot-url "https://events.itrevolution.com/images/speakers/elisabeth-hendrickson.jpg"}
+  {:name "Mik Kersten" :org "Planview" :title "CTO · Author of \"Project to Product\"" :headshot-url "https://events.itrevolution.com/images/speakers/mik-kersten.jpg"}
+  {:name "Matt Klosterman" :org "Hilton" :title "Sr. Director, Mobile Software Engineering" :headshot-url "https://events.itrevolution.com/images/speakers/matt-klosterman.jpg"}
+  {:name "Justin McCarthy" :org "Diffusion AI" :title "Founder and CEO" :headshot-url "https://events.itrevolution.com/images/speakers/justin-mccarthy.jpg"}
+  {:name "Nirav Mehta" :org "Mastercard" :title "Executive Vice President, Chief Technology Officer, Services" :headshot-url "https://events.itrevolution.com/images/speakers/nirav-mehta.jpg"}
+  {:name "Tapabrata \"Topo\" Pal" :org "M&T Bank" :title "SVP - Head of Developer Platforms" :headshot-url "https://events.itrevolution.com/images/speakers/tapabrata-topo-pal.jpg"}
+  {:name "Owen Parker" :org "Arkana Laboratories" :title "CTO" :headshot-url "https://events.itrevolution.com/images/speakers/owen-parker.jpg"}
+  {:name "Nicky Pike" :org "Coder" :title "Field CTO; Host of the [Dev]olution podcast" :headshot-url "https://events.itrevolution.com/images/speakers/nicky-pike.jpg"}
+  {:name "Art Smalley" :org "Art of Lean" :title "President · Author" :headshot-url "https://events.itrevolution.com/images/speakers/art-smalley.jpg"}
+  {:name "Dustin Warner" :org "NRC Health" :title "Director of Software Engineering" :headshot-url "https://events.itrevolution.com/images/speakers/dustin-warner.jpg"}
+  {:name "Steve Yegge" :org "" :title "Co-author of \"Vibe Coding\"" :headshot-url "https://events.itrevolution.com/images/speakers/steve-yegge.jpg"}]}

@@ -1,0 +1,589 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "$0")/.." && pwd)
+controller="$repo_root/bin/merger-batch-controller"
+fixture=$(mktemp -d)
+trap 'rm -rf "$fixture"' EXIT
+
+fail() {
+  echo "FAIL: $*" >&2
+  exit 1
+}
+
+assert_eq() {
+  [[ "$1" == "$2" ]] || fail "expected <$2>, got <$1>"
+}
+
+make_remote() {
+  local name=$1 bare seed
+  bare="$fixture/$name.git"
+  seed="$fixture/$name-seed"
+  git init -q --bare "$bare"
+  git init -q "$seed"
+  git -C "$seed" config user.name Test
+  git -C "$seed" config user.email test@example.com
+  printf 'base\n' >"$seed/app.txt"
+  git -C "$seed" add app.txt
+  git -C "$seed" commit -qm base
+  git -C "$seed" branch -M staging
+  git -C "$seed" remote add origin "$bare"
+  git -C "$seed" push -q -u origin staging
+  git -C "$bare" symbolic-ref HEAD refs/heads/staging
+  printf '%s\n' "$bare"
+}
+
+add_job() {
+  local seed=$1 inbox=$2 id=$3 content=$4 priority=${5:-P1} model=${6:-gpt-5.6-sol} effort=${7:-high} patch_sha
+  printf '%s\n' "$content" >"$seed/app.txt"
+  git -C "$seed" diff --binary >"$inbox/$id.patch"
+  git -C "$seed" restore app.txt
+  patch_sha=$(shasum -a 256 "$inbox/$id.patch" | awk '{print $1}')
+  printf 'job: %s — fixture\npriority: %s\nverify: fixture\nproducer_model: %s\nproducer_reasoning_effort: %s\npatch_sha256: %s\n' \
+    "$id" "$priority" "$model" "$effort" "$patch_sha" >"$inbox/$id.job"
+}
+
+add_path_job() {
+  local seed=$1 inbox=$2 id=$3 path=$4 content=$5 model=${6:-gpt-5.3-codex-spark} effort=${7:-high} patch_sha
+  mkdir -p "$seed/$(dirname "$path")"
+  printf '%s\n' "$content" >"$seed/$path"
+  git -C "$seed" add -- "$path"
+  git -C "$seed" diff --cached --binary -- "$path" >"$inbox/$id.patch"
+  git -C "$seed" reset -q -- "$path"
+  rm -f "$seed/$path"
+  patch_sha=$(shasum -a 256 "$inbox/$id.patch" | awk '{print $1}')
+  printf 'job: %s — fixture\npriority: P0\nverify: fixture\nproducer_model: %s\nproducer_reasoning_effort: %s\npatch_sha256: %s\n' \
+    "$id" "$model" "$effort" "$patch_sha" >"$inbox/$id.job"
+}
+
+add_dev_lane_path_job() {
+  local seed=$1 inbox=$2 id=$3 path=$4 content=$5 model=${6:-gpt-5.6-sol} effort=${7:-high} base
+  add_path_job "$seed" "$inbox" "$id" "$path" "$content" "$model" "$effort"
+  base=$(git -C "$seed" rev-parse HEAD)
+  {
+    printf 'job_schema: dev-lane-job.v1\n'
+    printf 'base_sha: %s\n' "$base"
+    printf 'changed_path: %s\n' "$path"
+  } >>"$inbox/$id.job"
+}
+
+# Empty polling is pure shell and never calls the reasoner.
+empty_inbox="$fixture/empty-inbox"
+empty_state="$fixture/empty-state"
+mkdir -p "$empty_inbox/done" "$empty_inbox/rejected" "$empty_state"
+reason_count="$fixture/reason-count"
+reasoner="$fixture/reasoner"
+printf '#!/usr/bin/env bash\nprintf x >>"%s"\n' "$reason_count" >"$reasoner"
+chmod +x "$reasoner"
+empty_status=$(MERGER_INBOX="$empty_inbox" MERGER_STATE_DIR="$empty_state" MERGER_REASONER="$reasoner" "$controller" status)
+assert_eq "$(jq -r '.ready_count' <<<"$empty_status")" 0
+set +e
+MERGER_INBOX="$empty_inbox" MERGER_STATE_DIR="$empty_state" MERGER_REASONER="$reasoner" "$controller" once
+empty_rc=$?
+set -e
+assert_eq "$empty_rc" 10
+[[ ! -f "$reason_count" ]] || fail "idle queue called the model"
+
+# A green batch compiles once, runs the full suite once, and never calls a model.
+green_remote=$(make_remote green)
+green_seed="$fixture/green-seed"
+green_inbox="$fixture/green-inbox"
+green_state="$fixture/green-state"
+counter_dir="$fixture/counters"
+mkdir -p "$green_inbox/done" "$green_inbox/rejected" "$green_state" "$counter_dir"
+add_job "$green_seed" "$green_inbox" green-01 changed P0
+export CONTROLLER_TEST_COUNTERS="$counter_dir"
+# Expansion belongs to the controller's child shell.
+# shellcheck disable=SC2016
+MERGER_INBOX="$green_inbox" MERGER_STATE_DIR="$green_state" MERGER_REPO_URL="$green_remote" \
+  MERGER_REASONER="$reasoner" \
+  MERGER_COMPILE_COMMAND='printf x >>"$CONTROLLER_TEST_COUNTERS/compile"' \
+  MERGER_TEST_COMMAND='printf x >>"$CONTROLLER_TEST_COUNTERS/test"' \
+  "$controller" once
+assert_eq "$(wc -c <"$counter_dir/compile" | tr -d ' ')" 1
+assert_eq "$(wc -c <"$counter_dir/test" | tr -d ' ')" 1
+[[ ! -f "$reason_count" ]] || fail "green batch called the model"
+green_batch=$(find "$green_state/batches" -name batch.json -print -quit)
+assert_eq "$(jq -r '.state' "$green_batch")" validated
+assert_eq "$(jq -r '.job_ids[0]' "$green_batch")" green-01
+green_batch_dir=${green_batch%/batch.json}
+[[ -s "$green_batch_dir/ingest/green-01/green-01.job" &&
+   -s "$green_batch_dir/ingest/green-01/green-01.patch" ]] ||
+  fail "green job was not snapshotted into controller-owned batch ingest"
+assert_eq "$(shasum -a 256 "$green_batch_dir/ingest/green-01/green-01.patch" | awk '{print $1}')" \
+  "$(awk -F': ' '$1 == "patch_sha256" {print $2}' "$green_batch_dir/ingest/green-01/green-01.job")"
+[[ ! -f "$green_inbox/done/green-01.job" ]] || fail "push-disabled batch wrote shipped receipt"
+
+# Producer-owned bytes are never execution authority. A patch whose copied
+# bytes do not match its declared digest is quarantined before apply or tests,
+# even when it is an otherwise additive leaf patch.
+digest_remote=$(make_remote digest)
+digest_seed="$fixture/digest-seed"
+digest_inbox="$fixture/digest-inbox"
+digest_state="$fixture/digest-state"
+digest_counters="$fixture/digest-counters"
+mkdir -p "$digest_inbox/done" "$digest_inbox/rejected" "$digest_inbox/poison" \
+  "$digest_state" "$digest_counters"
+add_path_job "$digest_seed" "$digest_inbox" digest-mismatch-01 leaf/allowed.txt allowed gpt-5.6-sol high
+mkdir -p "$digest_seed/leaf"
+printf 'outside\n' >"$digest_seed/leaf/outside.txt"
+git -C "$digest_seed" add leaf/outside.txt
+git -C "$digest_seed" diff --cached --binary -- leaf/outside.txt >"$digest_inbox/digest-mismatch-01.patch"
+git -C "$digest_seed" reset -q -- leaf/outside.txt
+rm -f "$digest_seed/leaf/outside.txt"
+set +e
+CONTROLLER_TEST_COUNTERS="$digest_counters" \
+  MERGER_INBOX="$digest_inbox" MERGER_STATE_DIR="$digest_state" MERGER_REPO_URL="$digest_remote" \
+  MERGER_COMPILE_COMMAND='printf x >>"$CONTROLLER_TEST_COUNTERS/compile"' \
+  MERGER_TEST_COMMAND='printf x >>"$CONTROLLER_TEST_COUNTERS/test"' \
+  "$controller" once
+digest_rc=$?
+set -e
+assert_eq "$digest_rc" 20
+assert_eq "$(jq -r '.reason' "$digest_inbox/poison/digest-mismatch-01/quarantine.json")" artifact-digest-mismatch
+[[ ! -e "$digest_counters/compile" && ! -e "$digest_counters/test" ]] ||
+  fail "digest-mismatched patch reached compile/test"
+[[ -z "$(MERGER_INBOX="$digest_inbox" MERGER_STATE_DIR="$digest_state" "$controller" scan)" ]] ||
+  fail "digest-mismatched patch remained eligible"
+
+# A dev-lane job binds the approved path set as well as the patch digest. A
+# coherent patch+digest rewrite cannot smuggle a second path into the batch.
+lane_remote=$(make_remote lane)
+lane_seed="$fixture/lane-seed"
+lane_inbox="$fixture/lane-inbox"
+lane_state="$fixture/lane-state"
+lane_counters="$fixture/lane-counters"
+mkdir -p "$lane_inbox/done" "$lane_inbox/rejected" "$lane_inbox/poison" \
+  "$lane_state" "$lane_counters"
+add_dev_lane_path_job "$lane_seed" "$lane_inbox" lane-good-01 leaf/allowed.txt allowed
+CONTROLLER_TEST_COUNTERS="$lane_counters" \
+  MERGER_INBOX="$lane_inbox" MERGER_STATE_DIR="$lane_state" MERGER_REPO_URL="$lane_remote" \
+  MERGER_COMPILE_COMMAND='printf x >>"$CONTROLLER_TEST_COUNTERS/compile"' \
+  MERGER_TEST_COMMAND='printf x >>"$CONTROLLER_TEST_COUNTERS/test"' \
+  "$controller" once
+lane_good_batch=$(find "$lane_state/batches" -name batch.json -print -quit)
+assert_eq "$(jq -r '.job_ids[0]' "$lane_good_batch")" lane-good-01
+
+lane_bad_inbox="$fixture/lane-bad-inbox"
+lane_bad_state="$fixture/lane-bad-state"
+lane_bad_counters="$fixture/lane-bad-counters"
+mkdir -p "$lane_bad_inbox/done" "$lane_bad_inbox/rejected" "$lane_bad_inbox/poison" \
+  "$lane_bad_state" "$lane_bad_counters"
+add_dev_lane_path_job "$lane_seed" "$lane_bad_inbox" lane-path-mismatch-01 leaf/allowed.txt allowed
+mkdir -p "$lane_seed/leaf"
+printf 'allowed\n' >"$lane_seed/leaf/allowed.txt"
+printf 'outside\n' >"$lane_seed/leaf/outside.txt"
+git -C "$lane_seed" add leaf/allowed.txt leaf/outside.txt
+git -C "$lane_seed" diff --cached --binary -- leaf/allowed.txt leaf/outside.txt \
+  >"$lane_bad_inbox/lane-path-mismatch-01.patch"
+git -C "$lane_seed" reset -q -- leaf/allowed.txt leaf/outside.txt
+rm -f "$lane_seed/leaf/allowed.txt" "$lane_seed/leaf/outside.txt"
+lane_bad_sha=$(shasum -a 256 "$lane_bad_inbox/lane-path-mismatch-01.patch" | awk '{print $1}')
+awk -F': ' -v sha="$lane_bad_sha" \
+  '$1 == "patch_sha256" {$2=sha} {print $1 ": " $2}' \
+  "$lane_bad_inbox/lane-path-mismatch-01.job" >"$lane_bad_inbox/lane-path-mismatch-01.job.tmp"
+mv "$lane_bad_inbox/lane-path-mismatch-01.job.tmp" "$lane_bad_inbox/lane-path-mismatch-01.job"
+set +e
+CONTROLLER_TEST_COUNTERS="$lane_bad_counters" \
+  MERGER_INBOX="$lane_bad_inbox" MERGER_STATE_DIR="$lane_bad_state" MERGER_REPO_URL="$lane_remote" \
+  MERGER_COMPILE_COMMAND='printf x >>"$CONTROLLER_TEST_COUNTERS/compile"' \
+  MERGER_TEST_COMMAND='printf x >>"$CONTROLLER_TEST_COUNTERS/test"' \
+  "$controller" once
+lane_bad_rc=$?
+set -e
+assert_eq "$lane_bad_rc" 20
+assert_eq "$(jq -r '.reason' "$lane_bad_inbox/poison/lane-path-mismatch-01/quarantine.json")" lane-path-mismatch
+[[ ! -e "$lane_bad_counters/compile" && ! -e "$lane_bad_counters/test" ]] ||
+  fail "lane path mismatch reached compile/test"
+
+add_dev_lane_path_job "$lane_seed" "$lane_bad_inbox" unknown-schema-01 leaf/schema.txt schema
+sed 's/job_schema: dev-lane-job.v1/job_schema: dev-lane-job.v2/' \
+  "$lane_bad_inbox/unknown-schema-01.job" >"$lane_bad_inbox/unknown-schema-01.job.tmp"
+mv "$lane_bad_inbox/unknown-schema-01.job.tmp" "$lane_bad_inbox/unknown-schema-01.job"
+set +e
+MERGER_INBOX="$lane_bad_inbox" MERGER_STATE_DIR="$lane_bad_state" MERGER_REPO_URL="$lane_remote" \
+  MERGER_COMPILE_COMMAND=true MERGER_TEST_COMMAND=true "$controller" once
+unknown_schema_rc=$?
+set -e
+assert_eq "$unknown_schema_rc" 20
+assert_eq "$(jq -r '.reason' "$lane_bad_inbox/poison/unknown-schema-01/quarantine.json")" unsupported-job-schema
+
+add_dev_lane_path_job "$lane_seed" "$lane_bad_inbox" missing-schema-01 leaf/missing.txt missing
+sed '/^job_schema:/d' "$lane_bad_inbox/missing-schema-01.job" >"$lane_bad_inbox/missing-schema-01.job.tmp"
+mv "$lane_bad_inbox/missing-schema-01.job.tmp" "$lane_bad_inbox/missing-schema-01.job"
+set +e
+MERGER_INBOX="$lane_bad_inbox" MERGER_STATE_DIR="$lane_bad_state" MERGER_REPO_URL="$lane_remote" \
+  MERGER_COMPILE_COMMAND=true MERGER_TEST_COMMAND=true "$controller" once
+missing_schema_rc=$?
+set -e
+assert_eq "$missing_schema_rc" 20
+assert_eq "$(jq -r '.reason' "$lane_bad_inbox/poison/missing-schema-01/quarantine.json")" missing-job-schema
+
+# A poison job cannot jam a compatible good job in the same batch. The poison
+# becomes terminal and the good job still reaches the single compile/test gate.
+mixed_remote=$(make_remote mixed)
+mixed_seed="$fixture/mixed-seed"
+mixed_inbox="$fixture/mixed-inbox"
+mixed_state="$fixture/mixed-state"
+mixed_counters="$fixture/mixed-counters"
+mkdir -p "$mixed_inbox/done" "$mixed_inbox/rejected" "$mixed_inbox/poison" \
+  "$mixed_state" "$mixed_counters"
+add_job "$mixed_seed" "$mixed_inbox" poison-empty already-applied P0
+git -C "$mixed_seed" apply "$mixed_inbox/poison-empty.patch"
+git -C "$mixed_seed" add app.txt
+git -C "$mixed_seed" commit -qm already-applied
+git -C "$mixed_seed" push -q origin staging
+add_job "$mixed_seed" "$mixed_inbox" mixed-good final-good P1
+CONTROLLER_TEST_COUNTERS="$mixed_counters" \
+  MERGER_INBOX="$mixed_inbox" MERGER_STATE_DIR="$mixed_state" MERGER_REPO_URL="$mixed_remote" \
+  MERGER_COMPILE_COMMAND='printf x >>"$CONTROLLER_TEST_COUNTERS/compile"' \
+  MERGER_TEST_COMMAND='printf x >>"$CONTROLLER_TEST_COUNTERS/test"' \
+  "$controller" once
+mixed_batch=$(find "$mixed_state/batches" -name batch.json -print -quit)
+assert_eq "$(jq -r '.job_ids[0]' "$mixed_batch")" mixed-good
+assert_eq "$(jq -r '.reason' "$mixed_inbox/poison/poison-empty/quarantine.json")" empty-after-apply
+assert_eq "$(wc -c <"$mixed_counters/compile" | tr -d ' ')" 1
+assert_eq "$(wc -c <"$mixed_counters/test" | tr -d ' ')" 1
+[[ -z "$(MERGER_INBOX="$mixed_inbox" MERGER_STATE_DIR="$mixed_state" "$controller" scan | rg poison-empty || true)" ]] \
+  || fail "quarantined poison job remained ready"
+
+# Unexpected infrastructure failures produce a machine-readable step receipt
+# with the command, return code, and captured stderr tail.
+failure_inbox="$fixture/failure-inbox"
+failure_state="$fixture/failure-state"
+mkdir -p "$failure_inbox/done" "$failure_inbox/rejected" "$failure_state"
+add_job "$mixed_seed" "$failure_inbox" clone-failure changed P0
+set +e
+MERGER_INBOX="$failure_inbox" MERGER_STATE_DIR="$failure_state" \
+  MERGER_REPO_URL="$fixture/does-not-exist.git" "$controller" once >/dev/null 2>&1
+failure_rc=$?
+set -e
+[[ "$failure_rc" -ne 0 ]] || fail "invalid clone unexpectedly succeeded"
+failure_receipt=$(find "$failure_state/batches" -name failure.json -print -quit)
+[[ -f "$failure_receipt" ]] || fail "unexpected controller failure emitted no receipt"
+assert_eq "$(jq -r '.step' "$failure_receipt")" clone
+[[ "$(jq -r '.command' "$failure_receipt")" == *"git clone"* ]] || fail "failure receipt omitted failing command"
+[[ -n "$(jq -r '.stderr_tail' "$failure_receipt")" ]] || fail "failure receipt omitted stderr"
+
+# A Spark patch touching load-bearing core is atomically held before apply or tests.
+hold_remote=$(make_remote hold)
+hold_seed="$fixture/hold-seed"
+hold_inbox="$fixture/hold-inbox"
+hold_state="$fixture/hold-state"
+hold_counters="$fixture/hold-counters"
+mkdir -p "$hold_inbox/done" "$hold_inbox/rejected" "$hold_state" "$hold_counters"
+add_path_job "$hold_seed" "$hold_inbox" spark-core-01 src/cfp_scheduler_killer/store.clj '(ns fixture.store)'
+set +e
+# Expansion belongs to the controller's child shell.
+# shellcheck disable=SC2016
+CONTROLLER_TEST_COUNTERS="$hold_counters" \
+  MERGER_INBOX="$hold_inbox" MERGER_STATE_DIR="$hold_state" MERGER_REPO_URL="$hold_remote" \
+  MERGER_COMPILE_COMMAND='printf x >>"$CONTROLLER_TEST_COUNTERS/compile"' \
+  MERGER_TEST_COMMAND='printf x >>"$CONTROLLER_TEST_COUNTERS/test"' \
+  "$controller" once
+hold_rc=$?
+set -e
+assert_eq "$hold_rc" 20
+hold_dir="$hold_inbox/held/spark-core/spark-core-01"
+[[ -f "$hold_dir/spark-core-01.job" && -f "$hold_dir/spark-core-01.patch" && -f "$hold_dir/hold.json" ]] \
+  || fail "Spark core job was not atomically held"
+[[ -e "$hold_inbox/spark-core-01.job" && -e "$hold_inbox/spark-core-01.patch" ]] \
+  || fail "sticky-inbox hold did not preserve producer-owned source artifacts"
+[[ -z "$(MERGER_INBOX="$hold_inbox" MERGER_STATE_DIR="$hold_state" "$controller" scan)" ]] \
+  || fail "held Spark core artifacts still appeared ready"
+[[ ! -e "$hold_counters/compile" && ! -e "$hold_counters/test" ]] \
+  || fail "held Spark core patch reached compile/test"
+assert_eq "$(jq -r '.decision' "$hold_dir/hold.json")" hold
+assert_eq "$(jq -r '.producer_model' "$hold_dir/hold.json")" gpt-5.3-codex-spark
+assert_eq "$(jq -r '.blocked_paths[0]' "$hold_dir/hold.json")" src/cfp_scheduler_killer/store.clj
+assert_eq "$(jq -r '.required_review_tier' "$hold_dir/hold.json")" gpt-5.6-sol-high-or-Gene
+assert_eq "$(jq -r '.patch_sha256' "$hold_dir/hold.json")" "$(shasum -a 256 "$hold_dir/spark-core-01.patch" | awk '{print $1}')"
+
+# Missing provenance is untrusted and receives the same fail-closed core hold.
+add_path_job "$hold_seed" "$hold_inbox" untrusted-core-01 src/cfp_scheduler_killer/sse.clj '(ns fixture.sse)'
+awk '!/^producer_model:|^producer_reasoning_effort:/' \
+  "$hold_inbox/untrusted-core-01.job" >"$hold_inbox/untrusted-core-01.job.tmp"
+mv "$hold_inbox/untrusted-core-01.job.tmp" "$hold_inbox/untrusted-core-01.job"
+set +e
+MERGER_INBOX="$hold_inbox" MERGER_STATE_DIR="$hold_state" MERGER_REPO_URL="$hold_remote" \
+  MERGER_COMPILE_COMMAND=true MERGER_TEST_COMMAND=true "$controller" once
+untrusted_rc=$?
+set -e
+assert_eq "$untrusted_rc" 20
+untrusted_hold="$hold_inbox/held/spark-core/untrusted-core-01/hold.json"
+assert_eq "$(jq -r '.producer_model' "$untrusted_hold")" unknown
+assert_eq "$(jq -r '.blocked_paths[0]' "$untrusted_hold")" src/cfp_scheduler_killer/sse.clj
+assert_eq "$(jq -r '.blocked_rules | index("missing-producer-model") != null' "$untrusted_hold")" true
+
+# Exact Sol-high provenance permits the same core path through the ordinary gate.
+sol_remote=$(make_remote sol-core)
+sol_seed="$fixture/sol-core-seed"
+sol_inbox="$fixture/sol-core-inbox"
+sol_state="$fixture/sol-core-state"
+sol_counters="$fixture/sol-core-counters"
+mkdir -p "$sol_inbox/done" "$sol_inbox/rejected" "$sol_state" "$sol_counters"
+add_path_job "$sol_seed" "$sol_inbox" sol-core-01 src/cfp_scheduler_killer/store.clj '(ns fixture.store)' gpt-5.6-sol high
+# Expansion belongs to the controller's child shell.
+# shellcheck disable=SC2016
+CONTROLLER_TEST_COUNTERS="$sol_counters" \
+  MERGER_INBOX="$sol_inbox" MERGER_STATE_DIR="$sol_state" MERGER_REPO_URL="$sol_remote" \
+  MERGER_COMPILE_COMMAND='printf x >>"$CONTROLLER_TEST_COUNTERS/compile"' \
+  MERGER_TEST_COMMAND='printf x >>"$CONTROLLER_TEST_COUNTERS/test"' \
+  "$controller" once
+assert_eq "$(wc -c <"$sol_counters/compile" | tr -d ' ')" 1
+assert_eq "$(wc -c <"$sol_counters/test" | tr -d ' ')" 1
+[[ ! -d "$sol_inbox/held/spark-core/sol-core-01" ]] || fail "trusted Sol core patch was held"
+sol_batch=$(find "$sol_state/batches" -name batch.json -print -quit)
+assert_eq "$(jq -r '.state' "$sol_batch")" validated
+
+# A Spark core patch can proceed only with an exact-SHA Sol-high approval receipt.
+approval_remote=$(make_remote approval)
+approval_seed="$fixture/approval-seed"
+approval_inbox="$fixture/approval-inbox"
+approval_state="$fixture/approval-state"
+approval_counters="$fixture/approval-counters"
+mkdir -p "$approval_inbox/done" "$approval_inbox/rejected" "$approval_inbox/approvals" "$approval_state" "$approval_counters"
+add_path_job "$approval_seed" "$approval_inbox" approved-core-01 src/cfp_scheduler_killer/auth.clj '(ns fixture.auth)'
+approval_sha=$(shasum -a 256 "$approval_inbox/approved-core-01.patch" | awk '{print $1}')
+jq -n --arg sha "$approval_sha" \
+  '{schema:"merger-patch-approval.v1",decision:"approve",patch_sha256:$sha,reviewer_model:"gpt-5.6-sol",reviewer_reasoning_effort:"high"}' \
+  >"$approval_inbox/approvals/approved-core-01.json"
+# Expansion belongs to the controller's child shell.
+# shellcheck disable=SC2016
+CONTROLLER_TEST_COUNTERS="$approval_counters" \
+  MERGER_INBOX="$approval_inbox" MERGER_STATE_DIR="$approval_state" MERGER_REPO_URL="$approval_remote" \
+  MERGER_COMPILE_COMMAND='printf x >>"$CONTROLLER_TEST_COUNTERS/compile"' \
+  MERGER_TEST_COMMAND='printf x >>"$CONTROLLER_TEST_COUNTERS/test"' \
+  "$controller" once
+assert_eq "$(wc -c <"$approval_counters/compile" | tr -d ' ')" 1
+assert_eq "$(wc -c <"$approval_counters/test" | tr -d ' ')" 1
+[[ ! -d "$approval_inbox/held/spark-core/approved-core-01" ]] || fail "exact-SHA Sol-approved core patch was held"
+
+# A held patch is released only by an explicit exact-SHA approval transition.
+# Approval alone does not alter queue state, and the controller verifies the
+# held and ready bytes are identical before archiving the hold receipt.
+release_remote=$(make_remote release)
+release_seed="$fixture/release-seed"
+release_inbox="$fixture/release-inbox"
+release_state="$fixture/release-state"
+release_counters="$fixture/release-counters"
+mkdir -p "$release_inbox/done" "$release_inbox/rejected" "$release_inbox/approvals" \
+  "$release_state" "$release_counters"
+add_path_job "$release_seed" "$release_inbox" released-core-01 \
+  src/cfp_scheduler_killer/store.clj '(ns fixture.released)' \
+  gpt-5.3-codex-spark high
+set +e
+MERGER_INBOX="$release_inbox" MERGER_STATE_DIR="$release_state" MERGER_REPO_URL="$release_remote" \
+  MERGER_COMPILE_COMMAND=true MERGER_TEST_COMMAND=true "$controller" once
+release_hold_rc=$?
+set -e
+assert_eq "$release_hold_rc" 20
+release_sha=$(shasum -a 256 "$release_inbox/released-core-01.patch" | awk '{print $1}')
+release_hold="$release_inbox/held/spark-core/released-core-01/hold.json"
+cp "$release_hold" "$release_hold.good"
+printf '{}\n' >"$release_hold"
+set +e
+MERGER_INBOX="$release_inbox" MERGER_STATE_DIR="$release_state" \
+  "$controller" release-held released-core-01 >/dev/null 2>&1
+corrupt_hold_rc=$?
+set -e
+[[ "$corrupt_hold_rc" -ne 0 ]] || fail "corrupt hold receipt authorized release"
+mv "$release_hold.good" "$release_hold"
+jq -n \
+  '{schema:"merger-patch-approval.v1",decision:"approve",patch_sha256:"wrong",reviewer_model:"gpt-5.6-sol",reviewer_reasoning_effort:"high"}' \
+  >"$release_inbox/approvals/released-core-01.json"
+set +e
+MERGER_INBOX="$release_inbox" MERGER_STATE_DIR="$release_state" \
+  "$controller" release-held released-core-01 >/dev/null 2>&1
+wrong_approval_rc=$?
+set -e
+[[ "$wrong_approval_rc" -ne 0 ]] || fail "wrong patch SHA authorized release"
+jq -n --arg sha "$release_sha" \
+  '{schema:"merger-patch-approval.v1",decision:"approve",patch_sha256:$sha,reviewer_model:"gpt-5.6-sol",reviewer_reasoning_effort:"high"}' \
+  >"$release_inbox/approvals/released-core-01.json"
+[[ -z "$(MERGER_INBOX="$release_inbox" MERGER_STATE_DIR="$release_state" "$controller" scan)" ]] \
+  || fail "approval alone silently released a held patch"
+MERGER_INBOX="$release_inbox" MERGER_STATE_DIR="$release_state" \
+  "$controller" release-held released-core-01
+released_dir="$release_inbox/held/released/released-core-01"
+[[ -f "$released_dir/hold.json" && -f "$released_dir/release.json" ]] \
+  || fail "released hold did not preserve both transition receipts"
+[[ ! -e "$release_inbox/held/spark-core/released-core-01" ]] \
+  || fail "released job remained under the active hold authority"
+assert_eq "$(jq -r '.state' "$released_dir/release.json")" released
+assert_eq "$(jq -r '.patch_sha256' "$released_dir/release.json")" "$release_sha"
+[[ -f "$released_dir/approval.json" ]] || fail "release did not archive approval bytes"
+# Release is serialized with run_once and returns the controller-busy code.
+mkdir "$release_state/controller.lock"
+set +e
+MERGER_INBOX="$release_inbox" MERGER_STATE_DIR="$release_state" \
+  "$controller" release-held released-core-01 >/dev/null 2>&1
+busy_release_rc=$?
+set -e
+assert_eq "$busy_release_rc" 75
+rmdir "$release_state/controller.lock"
+# Retrying after an uncertain remote result is idempotent.
+MERGER_INBOX="$release_inbox" MERGER_STATE_DIR="$release_state" \
+  "$controller" release-held released-core-01
+# Producer-owned originals are no longer execution authority after release.
+printf 'tampered job\n' >"$release_inbox/released-core-01.job"
+printf 'tampered patch\n' >"$release_inbox/released-core-01.patch"
+[[ "$(MERGER_INBOX="$release_inbox" MERGER_STATE_DIR="$release_state" "$controller" scan)" == *$'released-core-01\t'* ]] \
+  || fail "released job did not re-enter the ready queue"
+[[ "$(MERGER_INBOX="$release_inbox" MERGER_STATE_DIR="$release_state" "$controller" scan)" == *"$released_dir/released-core-01.job"* ]] \
+  || fail "released queue did not use controller-owned job snapshot"
+cp "$released_dir/approval.json" "$released_dir/approval.good.json"
+printf '{}\n' >"$released_dir/approval.json"
+set +e
+MERGER_INBOX="$release_inbox" MERGER_STATE_DIR="$release_state" \
+  "$controller" scan >/dev/null 2>&1
+corrupt_archive_rc=$?
+set -e
+[[ "$corrupt_archive_rc" -ne 0 ]] || fail "corrupt released archive appeared as an idle queue"
+mv "$released_dir/approval.good.json" "$released_dir/approval.json"
+# Expansion belongs to the controller's child shell.
+# shellcheck disable=SC2016
+CONTROLLER_TEST_COUNTERS="$release_counters" \
+  MERGER_INBOX="$release_inbox" MERGER_STATE_DIR="$release_state" MERGER_REPO_URL="$release_remote" \
+  MERGER_COMPILE_COMMAND='printf x >>"$CONTROLLER_TEST_COUNTERS/compile"' \
+  MERGER_TEST_COMMAND='printf x >>"$CONTROLLER_TEST_COUNTERS/test"' \
+  "$controller" once
+assert_eq "$(wc -c <"$release_counters/compile" | tr -d ' ')" 1
+assert_eq "$(wc -c <"$release_counters/test" | tr -d ' ')" 1
+
+# Integrating a controller-owned released archive makes its producer root copy
+# permanently non-authoritative. Even deliberately changed stale originals
+# cannot block later healthy work or redefine the terminal job identity.
+CONTROLLER_TEST_COUNTERS="$release_counters" \
+  MERGER_INBOX="$release_inbox" MERGER_STATE_DIR="$release_state" MERGER_REPO_URL="$release_remote" \
+  MERGER_STAGING_MIRROR="$release_state/staging.git" MERGER_PUSH_ENABLED=yes \
+  GENE_APPROVED_MERGER_CONTROLLER=yes \
+  MERGER_COMPILE_COMMAND='printf x >>"$CONTROLLER_TEST_COUNTERS/compile"' \
+  MERGER_TEST_COMMAND='printf x >>"$CONTROLLER_TEST_COUNTERS/test"' \
+  "$controller" once
+[[ -s "$release_state/integrated/released-core-01.json" ]] ||
+  fail "released archive did not produce an integration receipt"
+git -C "$release_seed" fetch -q origin staging
+git -C "$release_seed" reset -q --hard origin/staging
+add_path_job "$release_seed" "$release_inbox" after-release-01 leaf/after-release.txt healthy gpt-5.6-sol high
+[[ "$(MERGER_INBOX="$release_inbox" MERGER_STATE_DIR="$release_state" "$controller" scan)" == *$'after-release-01\t'* ]] ||
+  fail "stale producer originals blocked healthy work after released integration"
+
+# A red batch is bisected in shell and calls the bounded reasoner exactly once.
+red_remote=$(make_remote red)
+red_seed="$fixture/red-seed"
+red_inbox="$fixture/red-inbox"
+red_state="$fixture/red-state"
+mkdir -p "$red_inbox/done" "$red_inbox/rejected" "$red_state"
+add_job "$red_seed" "$red_inbox" red-01 broken P0
+set +e
+MERGER_INBOX="$red_inbox" MERGER_STATE_DIR="$red_state" MERGER_REPO_URL="$red_remote" \
+  MERGER_REASONER="$reasoner" \
+  MERGER_COMPILE_COMMAND='true' \
+  MERGER_TEST_COMMAND='! grep -q broken app.txt' \
+  "$controller" once
+red_rc=$?
+set -e
+assert_eq "$red_rc" 22
+assert_eq "$(wc -c <"$reason_count" | tr -d ' ')" 1
+red_bundle=$(find "$red_state/batches" -name red-batch.json -print -quit)
+assert_eq "$(jq -r '.reason' "$red_bundle")" red-batch
+assert_eq "$(jq -r '.bad_id' "$red_bundle")" red-01
+assert_eq "$(jq -r '.reason' "$red_inbox/poison/red-01/quarantine.json")" red-batch
+
+# Exact-SHA deploy wait is shell-owned and rejects a mismatched run.
+fake_bin="$fixture/fake-bin"
+mkdir -p "$fake_bin"
+real_jq=$(command -v jq)
+fake_gh="$fake_bin/gh"
+printf '#!/usr/bin/env bash\nprintf '\''[{"databaseId":7,"headSha":"abc123","status":"completed","conclusion":"success","url":"https://example.test/run/7"}]\n'\''\n' >"$fake_gh"
+chmod +x "$fake_gh"
+deploy=$(PATH="$fake_bin:$(dirname "$real_jq"):/usr/bin:/bin" MERGER_DEPLOY_TIMEOUT_SECONDS=2 "$controller" wait-deploy abc123)
+assert_eq "$(jq -r '.headSha' <<<"$deploy")" abc123
+assert_eq "$(jq -r '.conclusion' <<<"$deploy")" success
+
+# The ratchet trigger is after exact-head integration, never validation. GHA is
+# deliberately outside the merger's critical path.
+ship_remote=$(make_remote ratchet-ship)
+ship_seed="$fixture/ratchet-ship-seed"
+ship_inbox="$fixture/ratchet-ship-inbox"
+ship_state="$fixture/ratchet-ship-state"
+ship_queue="$fixture/ratchet-ship-queue"
+ship_fake_bin="$fixture/ratchet-ship-bin"
+mkdir -p "$ship_inbox/done" "$ship_inbox/rejected" "$ship_state" "$ship_fake_bin"
+add_job "$ship_seed" "$ship_inbox" ratchet-ship-01 protected P0
+printf 'ratchet: required\nratchet-invariant: AUTH-02 keeps cross-event access denied\n' \
+  >>"$ship_inbox/ratchet-ship-01.job"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'sha=' \
+  'while [[ "$#" -gt 0 ]]; do' \
+  '  if [[ "$1" == --commit ]]; then sha=$2; break; fi' \
+  '  shift' \
+  'done' \
+  'printf '\''[{"databaseId":8,"headSha":"%s","status":"completed","conclusion":"success","url":"https://example.test/run/8"}]\n'\'' "$sha"' \
+  >"$ship_fake_bin/gh"
+chmod +x "$ship_fake_bin/gh"
+PATH="$ship_fake_bin:$PATH" MERGER_INBOX="$ship_inbox" MERGER_STATE_DIR="$ship_state" \
+  MERGER_STAGING_MIRROR="$ship_state/staging.git" \
+  MERGER_KENTBECK_QUEUE="$ship_queue" MERGER_REPO_URL="$ship_remote" \
+  MERGER_COMPILE_COMMAND=true MERGER_TEST_COMMAND=true MERGER_PUSH_ENABLED=yes \
+  GENE_APPROVED_MERGER_CONTROLLER=yes MERGER_DEPLOY_POLL_SECONDS=0 \
+  "$controller" once
+ship_batch=$(find "$ship_state/batches" -name batch.json -print -quit)
+ship_tip=$(jq -r '.tip_sha' "$ship_batch")
+assert_eq "$(jq -r '.state' "$ship_batch")" integrated
+[[ -f "$ship_state/integrated/ratchet-ship-01.json" ]] || fail "integrated job receipt missing"
+[[ ! -f "$ship_inbox/done/ratchet-ship-01.job" ]] || fail "integrated job was mislabeled shipped"
+[[ -f "$ship_queue/pending/ratchet-ship-01--$ship_tip.json" ]] \
+  || fail "verified post-integration transition did not enqueue Ratchet request"
+
+# Explicit post-ship ratchet metadata creates one durable, idempotent request.
+ratchet_queue="$fixture/ratchet-queue"
+ratchet_inbox="$fixture/ratchet-inbox"
+ratchet_seed="$green_seed"
+mkdir -p "$ratchet_inbox"
+add_job "$ratchet_seed" "$ratchet_inbox" ratchet-source-01 pinned P0
+printf 'ratchet: required\nratchet-invariant: ABS-08 preserves organizer-visible rubric context\n' \
+  >>"$ratchet_inbox/ratchet-source-01.job"
+ratchet_tip=0123456789abcdef0123456789abcdef01234567
+MERGER_INBOX="$ratchet_inbox" MERGER_KENTBECK_QUEUE="$ratchet_queue" \
+  "$controller" kentbeck-enqueue "$ratchet_inbox/ratchet-source-01.job" \
+  ratchet-source-01 "$ratchet_tip" batch-01 "$ratchet_inbox/ratchet-source-01.patch"
+ratchet_request="$ratchet_queue/pending/ratchet-source-01--$ratchet_tip.json"
+[[ -f "$ratchet_request" ]] || fail "required ratchet request was not queued"
+assert_eq "$(jq -r '.schema' "$ratchet_request")" kentbeck-ratchet-request.v1
+assert_eq "$(jq -r '.required_model + ":" + .required_reasoning_effort' "$ratchet_request")" gpt-5.6-sol:high
+assert_eq "$(jq -r '.output_contract.product_code' "$ratchet_request")" false
+set +e
+MERGER_INBOX="$ratchet_inbox" MERGER_KENTBECK_QUEUE="$ratchet_queue" \
+  "$controller" kentbeck-enqueue "$ratchet_inbox/ratchet-source-01.job" \
+  ratchet-source-01 "$ratchet_tip" batch-01 "$ratchet_inbox/ratchet-source-01.patch"
+duplicate_rc=$?
+set -e
+assert_eq "$duplicate_rc" 10
+assert_eq "$(find "$ratchet_queue/pending" -name '*.json' | wc -l | tr -d ' ')" 1
+
+# Claiming establishes the one-pin-at-a-time fence; requeue is recoverable.
+claimed=$(MERGER_INBOX="$ratchet_inbox" MERGER_KENTBECK_QUEUE="$ratchet_queue" "$controller" kentbeck-claim)
+assert_eq "$(jq -r '.state' <<<"$claimed")" active
+set +e
+MERGER_INBOX="$ratchet_inbox" MERGER_KENTBECK_QUEUE="$ratchet_queue" "$controller" kentbeck-claim >/dev/null
+active_rc=$?
+set -e
+assert_eq "$active_rc" 20
+request_id=$(jq -r '.request_id' <<<"$claimed")
+MERGER_INBOX="$ratchet_inbox" MERGER_KENTBECK_QUEUE="$ratchet_queue" \
+  "$controller" kentbeck-requeue "$request_id"
+assert_eq "$(jq -r '.pending' <<<"$(MERGER_INBOX="$ratchet_inbox" MERGER_KENTBECK_QUEUE="$ratchet_queue" "$controller" kentbeck-status)")" 1
+
+# Covered work and missing metadata never cause shell to invent a pin.
+covered_job="$ratchet_inbox/covered.job"
+printf 'job: covered\nratchet: covered\nratchet-invariant: already pinned\n' >"$covered_job"
+set +e
+MERGER_INBOX="$ratchet_inbox" MERGER_KENTBECK_QUEUE="$ratchet_queue" \
+  "$controller" kentbeck-enqueue "$covered_job" covered "$ratchet_tip" batch-02 "$ratchet_inbox/ratchet-source-01.patch"
+covered_rc=$?
+set -e
+assert_eq "$covered_rc" 10
+
+echo "PASS merger batch controller: idle=0 model calls; green=one gate; Spark core=held pre-apply; exact-SHA release=explicit+eligible; Sol core=ordinary gate; red=bounded reasoner; integration=nonblocking; Ratchet=explicit+idempotent+one-at-a-time"

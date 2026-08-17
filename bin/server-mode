@@ -1,0 +1,89 @@
+#!/bin/sh
+set -eu
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  bin/server-mode status PORT
+  bin/server-mode preflight PORT REQUESTED_MODE
+EOF
+  exit 64
+}
+
+command_name=${1:-}
+port=${2:-}
+
+case "$port" in
+  ''|*[!0-9]*) usage ;;
+esac
+
+listener_pids() {
+  lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | sort -u
+}
+
+process_env_value() {
+  pid=$1
+  key=$2
+  ps eww -p "$pid" -o command= 2>/dev/null \
+    | tr ' ' '\n' \
+    | awk -F= -v wanted="$key" '$1 == wanted {sub(/^[^=]*=/, ""); value=$0} END {print value}'
+}
+
+describe_listener() {
+  pid=$1
+  backend=$(process_env_value "$pid" STORE_BACKEND)
+  store_path=$(process_env_value "$pid" STORE_PATH)
+  runtime_env=$(process_env_value "$pid" ENV)
+  command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+
+  [ -n "$backend" ] || backend=jsonl
+  if [ "$backend" = postgres ]; then
+    store_path=postgres-configured-productiondata
+  else
+    [ -n "$store_path" ] || store_path=data/store/events.jsonl
+  fi
+  if [ "$runtime_env" = dev ]; then
+    runtime=dev
+  else
+    runtime=production
+  fi
+  case "$command" in
+    *browser-reload*|*hawk*) reload=hotreload ;;
+    *) reload=static-or-unknown ;;
+  esac
+
+  printf 'pid=%s backend=%s store=%s runtime=%s reload=%s\n' \
+    "$pid" "$backend" "$store_path" "$runtime" "$reload"
+}
+
+case "$command_name" in
+  status)
+    pids=$(listener_pids || true)
+    if [ -z "$pids" ]; then
+      printf 'port=%s state=free\n' "$port"
+      exit 0
+    fi
+    printf 'port=%s state=listening\n' "$port"
+    for pid in $pids; do
+      describe_listener "$pid"
+    done
+    ;;
+  preflight)
+    requested_mode=${3:-}
+    [ -n "$requested_mode" ] || usage
+    pids=$(listener_pids || true)
+    if [ -z "$pids" ]; then
+      printf 'server-preflight port=%s state=free requested=%s\n' "$port" "$requested_mode"
+      exit 0
+    fi
+    printf 'ERROR server-preflight: port %s is already occupied; requested=%s\n' \
+      "$port" "$requested_mode" >&2
+    for pid in $pids; do
+      describe_listener "$pid" >&2
+    done
+    printf 'Stop or move that listener explicitly, then retry. Inspect with: make server-status PORT=%s\n' \
+      "$port" >&2
+    exit 73
+    ;;
+  *) usage ;;
+esac

@@ -1,0 +1,685 @@
+#!/usr/bin/env bash
+# Watch successful staging deploys and close the browse -> judge -> score loop.
+set -euo pipefail
+
+repo_root="${AUTOSCORE_REPO_ROOT:-$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)}"
+script_path="$repo_root/bin/hill-climb-autoscore"
+state_dir="${AUTOSCORE_STATE_DIR:-/tmp/fleet}"
+state_file="${AUTOSCORE_STATE_FILE:-$state_dir/autoscore-state.json}"
+event_log="${AUTOSCORE_EVENT_LOG:-$state_dir/autoscore-events.jsonl}"
+history_file="${AUTOSCORE_HISTORY_FILE:-$repo_root/docs/hill-climb/altimeter-history.tsv}"
+local_target_file="${AUTOSCORE_LOCAL_TARGET_FILE:-$state_dir/next-targets.md}"
+remote_target_file="${AUTOSCORE_REMOTE_TARGET_FILE:-/tmp/fleet/next-targets.md}"
+lock_dir="${AUTOSCORE_LOCK_DIR:-$state_dir/autoscore.lock.d}"
+daemon_pid_file="${AUTOSCORE_DAEMON_PID_FILE:-$state_dir/autoscore-daemon.pid}"
+cycle_pid_file="${AUTOSCORE_CYCLE_PID_FILE:-$state_dir/autoscore-cycle.pid}"
+daemon_log="${AUTOSCORE_DAEMON_LOG:-$state_dir/autoscore-daemon.log}"
+poll_seconds="${AUTOSCORE_POLL_SECONDS:-300}"
+debounce_seconds="${AUTOSCORE_DEBOUNCE_SECONDS:-300}"
+run_timeout="${AUTOSCORE_RUN_TIMEOUT_SECONDS:-14400}"
+# Six stateful area lanes is the production-proven Anvil topology.
+slots=6
+worker_model="${AUTOSCORE_WORKER_MODEL:-gpt-5.3-codex-spark}"
+judge_model="${AUTOSCORE_JUDGE_MODEL:-gpt-5.3-codex-spark}"
+worker_reasoning_effort="${AUTOSCORE_WORKER_REASONING_EFFORT:-high}"
+judge_reasoning_effort="${AUTOSCORE_JUDGE_REASONING_EFFORT:-high}"
+judge_sample_count="${AUTOSCORE_JUDGE_SAMPLE_COUNT:-5}"
+eval_sha_override="${EVAL_SHA:-}"
+anvil_host="${ANVIL_HOST:-root@ANVIL-TAILNET-HOST}"
+tester_home="${ANVIL_TESTER_HOME:-/home/tester}"
+gh_repo="${AUTOSCORE_GH_REPO:-realgenekim/curtaincall-cfp}"
+relevant_path_regex="${AUTOSCORE_RELEVANT_PATH_REGEX:-^(src/|resources/|deps\.edn$|Dockerfile$|Makefile$|bin/(hill-climb-fleet|hill-climb-judgement-fold|consolidate-hill-climb|reset-jsonl-server)$|docs/hill-climb/(mission-charter|sbek-worker-charter)\.md$)}"
+lock_owned=false
+child_wait_pid=""
+
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+die() {
+  printf 'ERROR hill-climb-autoscore: %s\n' "$*" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "required command is missing: $1"
+}
+
+log_event() {
+  local event="$1" message="$2" sha="${3:-}" run="${4:-}"
+  mkdir -p "$state_dir"
+  jq -nc --arg timestamp "$(now)" --arg event "$event" --arg message "$message" \
+    --arg sha "$sha" --arg run "$run" \
+    '{schema:"hill-climb-autoscore-event.v1",timestamp:$timestamp,event:$event,message:$message,sha:$sha,run:$run}' \
+    >> "$event_log"
+  printf '%s %-18s %s\n' "$(now)" "$event" "$message" >&2
+}
+
+cleanup_lock() {
+  if [ "$lock_owned" = true ] && [ -d "$lock_dir" ]; then
+    if [ "$(cat "$lock_dir/pid" 2>/dev/null || true)" = "$$" ]; then
+      rm -f "$lock_dir/pid" "$lock_dir/host"
+      rmdir "$lock_dir" 2>/dev/null || true
+    fi
+  fi
+  lock_owned=false
+}
+
+on_signal() {
+  if [ -n "$child_wait_pid" ] && kill -0 "$child_wait_pid" 2>/dev/null; then
+    kill "$child_wait_pid" 2>/dev/null || true
+    wait "$child_wait_pid" 2>/dev/null || true
+  fi
+  cleanup_lock
+  exit 143
+}
+
+interruptible_sleep() {
+  local seconds="$1"
+  sleep "$seconds" &
+  child_wait_pid=$!
+  wait "$child_wait_pid" 2>/dev/null || true
+  child_wait_pid=""
+}
+
+acquire_lock() {
+  local owner_pid owner_host this_host
+  mkdir -p "$state_dir"
+  this_host="$(hostname)"
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    owner_pid="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+    owner_host="$(cat "$lock_dir/host" 2>/dev/null || true)"
+    if [ "$owner_host" = "$this_host" ] && [ -n "$owner_pid" ] \
+        && kill -0 "$owner_pid" 2>/dev/null; then
+      die "another autoscore cycle is running (pid=$owner_pid host=$owner_host)"
+    fi
+    log_event stale-lock "Recovering stale autoscore lock owned by ${owner_host:-unknown}:${owner_pid:-unknown}"
+    rm -f "$lock_dir/pid" "$lock_dir/host"
+    rmdir "$lock_dir" 2>/dev/null \
+      || die "lock exists but is not a recognized stale autoscore lock: $lock_dir"
+    mkdir "$lock_dir" 2>/dev/null \
+      || die "another autoscore cycle acquired the lock during stale-lock recovery"
+  fi
+  printf '%s\n' "$$" > "$lock_dir/pid"
+  printf '%s\n' "$this_host" > "$lock_dir/host"
+  lock_owned=true
+}
+
+empty_state() {
+  jq -nc '{schema:"hill-climb-autoscore-state.v2",status:"idle",last_observed_sha:"",last_completed_sha:"",last_completed_run:"",failed_sha:"",failed_run:"",active_sha:"",active_run:"",updated_at:"",detail:""}'
+}
+
+load_state() {
+  if [ ! -s "$state_file" ] || ! jq -e . "$state_file" >/dev/null 2>&1; then
+    empty_state
+    return
+  fi
+  jq -c '
+    if .schema == "hill-climb-autoscore-state.v2" then .
+    elif .status == "running" then
+      {schema:"hill-climb-autoscore-state.v2",status:"running",
+       last_observed_sha:"",last_completed_sha:"",last_completed_run:"",failed_sha:"",failed_run:"",
+       active_sha:(.active_sha // .last_sha // ""),active_run:(.active_run // .last_run // ""),
+       updated_at:(.updated_at // ""),detail:"migrated v1 active cycle"}
+    else
+      {schema:"hill-climb-autoscore-state.v2",status:"idle",last_observed_sha:(.last_sha // ""),
+       last_completed_sha:(.last_completed_sha // .last_sha // ""),
+       last_completed_run:(.last_completed_run // .last_run // ""),failed_sha:"",failed_run:"",
+       active_sha:"",active_run:"",updated_at:(.updated_at // ""),detail:"migrated v1 state"}
+    end' "$state_file"
+}
+
+write_state_json() {
+  local payload="$1" temporary
+  mkdir -p "$(dirname "$state_file")"
+  temporary="$(mktemp "$state_dir/.autoscore-state.XXXXXX")"
+  printf '%s\n' "$payload" > "$temporary"
+  mv "$temporary" "$state_file"
+}
+
+set_active_state() {
+  local sha="$1" run="$2" detail="$3" current
+  current="$(load_state)"
+  write_state_json "$(jq -c --arg sha "$sha" --arg run "$run" --arg detail "$detail" --arg updated "$(now)" \
+    '.schema="hill-climb-autoscore-state.v2" | .status="running" | .active_sha=$sha | .active_run=$run | .detail=$detail | .updated_at=$updated' \
+    <<< "$current")"
+}
+
+set_failed_state() {
+  local detail="$1" current
+  current="$(load_state)"
+  write_state_json "$(jq -c --arg detail "$detail" --arg updated "$(now)" \
+    '.schema="hill-climb-autoscore-state.v2" | .status="failed" |
+     .failed_sha=.active_sha | .failed_run=.active_run | .active_sha="" | .active_run="" |
+     .detail=$detail | .updated_at=$updated' \
+    <<< "$current")"
+}
+
+set_complete_state() {
+  local sha="$1" run="$2" detail="$3" current
+  current="$(load_state)"
+  write_state_json "$(jq -c --arg sha "$sha" --arg run "$run" --arg detail "$detail" --arg updated "$(now)" \
+    '.schema="hill-climb-autoscore-state.v2" | .status="complete" |
+     .last_observed_sha=$sha | .last_completed_sha=$sha | .last_completed_run=$run | .failed_sha="" | .failed_run="" |
+     .active_sha="" | .active_run="" | .detail=$detail | .updated_at=$updated' \
+    <<< "$current")"
+}
+
+set_observed_state() {
+  local sha="$1" detail="$2" current
+  current="$(load_state)"
+  write_state_json "$(jq -c --arg sha "$sha" --arg detail "$detail" --arg updated "$(now)" \
+    '.schema="hill-climb-autoscore-state.v2" | .status="idle" | .last_observed_sha=$sha |
+     .active_sha="" | .active_run="" | .detail=$detail | .updated_at=$updated' \
+    <<< "$current")"
+}
+
+latest_deployment() {
+  gh run list --repo "$gh_repo" --workflow build-and-deploy.yml --branch staging --limit 50 \
+    --json conclusion,headSha,url,updatedAt \
+    --jq '[.[] | select(.conclusion == "success")][0] | [.headSha,.url,.updatedAt] | @tsv'
+}
+
+selected_deployment() {
+  local selected resolved
+  if [ -n "$eval_sha_override" ]; then
+    resolved="$(git -C "$repo_root" rev-parse --verify "$eval_sha_override^{commit}" 2>/dev/null)" \
+      || die "EVAL_SHA is not an available commit: $eval_sha_override"
+    selected="$(gh run list --repo "$gh_repo" --workflow build-and-deploy.yml --branch staging --limit 50 \
+      --json conclusion,headSha,url,updatedAt \
+      --jq "[.[] | select(.conclusion == \"success\" and .headSha == \"$resolved\")][0] | [.headSha,.url,.updatedAt] | @tsv")"
+    [ -n "$selected" ] && [ "${selected%%$'\t'*}" != null ] \
+      || die "EVAL_SHA is not a successful staging deployment: $resolved"
+    printf '%s\n' "$selected"
+    return
+  fi
+  selected="$(latest_deployment)"
+  [ -n "$selected" ] || die "no successful staging deployment found"
+  printf '%s\n' "$selected"
+}
+
+remote_current_snapshot() {
+  # tester_home is a validated client-side argument.
+  # shellcheck disable=SC2029
+  ssh "$anvil_host" "sudo -iu tester python3 - '$tester_home'" <<'PY'
+import json
+import pathlib
+import sys
+
+home = pathlib.Path(sys.argv[1])
+current = home / "fleet-runs" / "current"
+try:
+    run = current.resolve(strict=True)
+    manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    state = json.loads((run / "state.json").read_text(encoding="utf-8"))
+    print(json.dumps({"run": str(run), "sha": manifest.get("code_sha", ""), "status": state.get("status", "unknown")}, separators=(",", ":")))
+except Exception as error:
+    print(json.dumps({"run": "", "sha": "", "status": "unavailable", "error": str(error)}, separators=(",", ":")))
+PY
+}
+
+remote_run_status() {
+  local run="$1"
+  # run is an immutable path returned by Anvil.
+  # shellcheck disable=SC2029
+  ssh "$anvil_host" "sudo -iu tester jq -r .status '$run/state.json'" 2>/dev/null
+}
+
+wait_for_terminal() {
+  local run="$1" sha="$2" deadline status
+  deadline=$((SECONDS + run_timeout))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    status="$(remote_run_status "$run" || true)"
+    case "$status" in
+      complete)
+        log_event fleet-complete "Fleet reached complete" "$sha" "$run"
+        return 0
+        ;;
+      failed)
+        set_failed_state "fleet failed: $run"
+        die "fleet failed; immutable evidence preserved at $run"
+        ;;
+      preparing|running|consolidating)
+        log_event fleet-progress "Fleet status=$status" "$sha" "$run"
+        interruptible_sleep 30
+        ;;
+      *)
+        log_event fleet-unavailable "Fleet status unavailable; retrying" "$sha" "$run"
+        interruptible_sleep 15
+        ;;
+    esac
+  done
+  set_failed_state "timed out waiting for fleet: $run"
+  die "timed out after ${run_timeout}s waiting for $run"
+}
+
+copy_receipts() {
+  local run="$1" destination="$2"
+  mkdir -p "$destination"
+  scp -q "$anvil_host:$run/manifest.json" "$destination/manifest.json"
+  scp -q "$anvil_host:$run/readiness.json" "$destination/readiness.json"
+  scp -q "$anvil_host:$run/summary.json" "$destination/summary.json"
+  scp -q "$anvil_host:$run/report.json" "$destination/report.json"
+  mkdir -p "$destination/judgement-folds"
+  scp -q "$anvil_host:$run/judgement-folds/*.json" "$destination/judgement-folds/"
+}
+
+validate_receipts() {
+  local receipt_dir="$1" expected_sha="$2"
+  jq -e --arg sha "$expected_sha" --argjson judge_samples "$judge_sample_count" \
+    --arg worker_model "$worker_model" --arg judge_model "$judge_model" \
+    --arg worker_effort "$worker_reasoning_effort" --arg judge_effort "$judge_reasoning_effort" '
+    .schema == "hill-climb-fleet-manifest.v1" and
+    .code_sha == $sha and
+    (.install_receipt.schema == "eval-harness-install.v5") and
+    (.install_receipt.operation_sha256 | type == "string" and length == 64) and
+    (.install_receipt.installer_sha | type == "string" and length == 40) and
+    .harness_sha == .install_receipt.harness_sha and
+    .received_pin.code_sha == $sha and
+    .received_pin.harness_sha == .harness_sha and
+    .received_pin.deployment_run_url == .deployment_run_url and
+    (.received_pin.deployment_run_id | type == "string" and length > 0) and
+    .received_pin.pin_source == "explicit-pin" and
+    .dirty == false and .evidence_only == false and
+    .worker_executor == "codex" and .judge_executor == "codex" and
+    .worker_model == $worker_model and .judge_model == $judge_model and
+    .worker_reasoning_effort == $worker_effort and
+    .judge_reasoning_effort == $judge_effort and
+    .judge_sample_count == $judge_samples and
+    .max_turns_per_scenario == 240 and .slots == 6 and
+    (.scenarios | length) == 18 and
+    (.app_dir | startswith("/home/tester/fleet-runs/"))' \
+    "$receipt_dir/manifest.json" >/dev/null \
+    || die "manifest is not a fresh isolated 18-journey Codex/Codex 240-turn fleet"
+  jq -e --arg sha "$expected_sha" '
+    .schema == "hill-climb-fleet-readiness.v1" and .status == "ready" and
+    .code_sha == $sha and (.slots | length) >= 4 and (.slots | length) <= 6 and
+    ([.slots[].golden_sha256] | unique | length) == 1 and
+    all(.slots[]; (.personas | sort) == ["organizer","reviewer","speaker"] and .submissions >= 500)' \
+    "$receipt_dir/readiness.json" >/dev/null \
+    || die "readiness receipt does not prove six isolated, authenticated golden-fixture SUTs"
+  jq -e '
+    .schema == "hill-climb-fleet-summary.v1" and .status == "complete" and
+    .expected == 18 and .terminal == 18 and .status == "complete" and
+    (.named_zero // 0) == .failed_or_missing' \
+    "$receipt_dir/summary.json" >/dev/null \
+    || die "summary does not prove 18 terminal journey receipts with zero worker failures"
+  jq -e '
+    (.overallPct | type) == "number" and (.overallCoveragePct | type) == "number" and
+    .scoreWithheld == false and
+    ([.areas[] | select(.optional == false)] | length) == 6 and
+    all(.areas[]; (.items | type) == "array" and (.items | length) > 0) and
+    all(.areas[].items[];
+      .verdict == "pass" or .verdict == "partial" or .verdict == "fail" or
+      .verdict == "not_found" or .verdict == "cannot_judge")' \
+    "$receipt_dir/report.json" >/dev/null \
+    || die "report is withheld, incomplete, or outside the judgement contract"
+  [ "$(find "$receipt_dir/judgement-folds" -maxdepth 1 -type f -name '*.json' | wc -l | tr -d ' ')" = 6 ] \
+    || die "fold receipt set does not contain six areas"
+  jq -se --argjson judge_samples "$judge_sample_count" '
+    length == 6 and ([.[].area] | unique | length) == 6 and
+    all(.[]; .schema == "hill-climb-judgement-fold.v1" and
+      (.fold_status == "complete" or .fold_status == "coverage-withheld") and .requested_n == $judge_samples and
+      .enrolled_n == $judge_samples and (.valid_score_n + (.refused_sample_n // 0)) == $judge_samples and
+      .coverage_gate_failures == [] and
+      .dispersion.status == "descriptive-only" and
+      (.dispersion.median_pct | type) == "number" and
+      (.dispersion.mad_pct | type) == "number" and
+      (.dispersion.iqr_pct | type) == "number" and
+      .noise_calibration.status == "insufficient" and
+      .noise_calibration.delta_render == "variance-uncalibrated")' \
+    "$receipt_dir"/judgement-folds/*.json >/dev/null \
+    || die "fold receipts do not prove a complete uncalibrated N=$judge_sample_count median"
+}
+
+shipped_note() {
+  local previous_sha="$1" sha="$2" run="$3" count titles
+  git -C "$repo_root" fetch --quiet origin staging
+  if [ -n "$previous_sha" ] && git -C "$repo_root" cat-file -e "$previous_sha^{commit}" 2>/dev/null \
+      && git -C "$repo_root" merge-base --is-ancestor "$previous_sha" "$sha"; then
+    count="$(git -C "$repo_root" rev-list --count "$previous_sha..$sha")"
+    titles="$(git -C "$repo_root" log --format='%h %s' --max-count=8 "$previous_sha..$sha" | tr '\t\n' '  ' | sed 's/  */; /g; s/; $//; s/[[:space:]]*$//')"
+    printf 'run=%s; sha=%s; shipped=%s commit(s): %s' "$run" "$sha" "$count" "${titles:-none}"
+  else
+    titles="$(git -C "$repo_root" show -s --format='%h %s' "$sha" | tr '\t\n' ' ' | sed 's/[[:space:]]*$//')"
+    printf 'run=%s; sha=%s; baseline at %s' "$run" "$sha" "$titles"
+  fi
+}
+
+append_history() {
+  local report="$1" sha="$2" run="$3" note="$4" timestamp score coverage withheld variance calibration
+  timestamp="$(date -u +%Y-%m-%dT%H:%M)"
+  score="$(jq -r .overallPct "$report")"
+  coverage="$(jq -r .overallCoveragePct "$report")"
+  withheld="$(jq -r .scoreWithheld "$report")"
+  variance="$(jq -cs 'sort_by(.area) | map({area:.area,n:.requested_n,
+    median_pct:.dispersion.median_pct,mad_pct:.dispersion.mad_pct,
+    iqr_pct:.dispersion.iqr_pct,min_pct:.dispersion.min_pct,
+    max_pct:.dispersion.max_pct})' "$(dirname "$report")"/judgement-folds/*.json)"
+  calibration="$(jq -sr 'map(.noise_calibration.status) | unique | join(",")' \
+    "$(dirname "$report")"/judgement-folds/*.json)"
+  mkdir -p "$(dirname "$history_file")"
+  [ -f "$history_file" ] || printf 'timestamp\tscore\tcoverage\twithheld\tvariance\tcalibration\tnote\n' > "$history_file"
+  if ! awk -F '\t' -v run="$run" 'index($7, run) { found=1 } END { exit !found }' "$history_file"; then
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$timestamp" "$score" "$coverage" \
+      "$withheld" "$variance" "$calibration" "$note" >> "$history_file"
+  fi
+}
+
+emit_target() {
+  local report="$1" run="$2" sha="$3" remote_tmp
+  render_target "$report" "$run" "$sha" "$local_target_file"
+  remote_tmp="/tmp/fleet/.next-targets.md.$$"
+  scp -q "$local_target_file" "$anvil_host:$remote_tmp"
+  # Both paths are bounded to Anvil /tmp/fleet.
+  # shellcheck disable=SC2029
+  ssh "$anvil_host" "chmod 0644 '$remote_tmp' && mv '$remote_tmp' '$remote_target_file'"
+}
+
+render_target() {
+  local report="$1" run="$2" sha="$3" destination="$4" lowest
+  lowest="$(jq -r '[.areas[] | select(.optional == false)] | min_by(.pct) | .area' "$report")"
+  {
+    printf '# Next hill-climb target\n\n'
+    printf 'Generated: %s\n' "$(now)"
+    printf '%s%s%s\n' 'Run: `' "$run" '`'
+    printf '%s%s%s\n' 'Product SHA: `' "$sha" '`'
+    jq -r --arg area "$lowest" '.areas[] | select(.area == $area) | "Lowest required area: **\(.area)** — \(.pct)%"' "$report"
+    printf '\n## Ranked failing or unjudgeable rubric items\n\n'
+    jq -r --arg area "$lowest" '
+      [.areas[] | select(.area == $area) | .items[] | select(.verdict != "pass") |
+       . + {rank: ({fail:0, not_found:1, cannot_judge:2, partial:3}[.verdict] // 4)}]
+      | sort_by(.rank, .id)
+      | to_entries[]
+      | "\(.key + 1). **\(.value.id)** — `\(.value.verdict)`: \(.value.reasoning)"' "$report"
+    # Markdown backticks are literal.
+    # shellcheck disable=SC2016
+    printf '%s\n' '' 'Ranked by verdict severity (`fail`, `not_found`, `cannot_judge`, `partial`), then rubric ID.'
+  } > "$destination.tmp"
+  mv "$destination.tmp" "$destination"
+}
+
+deployment_needs_score() {
+  local candidate="$1" observed="$2"
+  [ "${AUTOSCORE_FORCE:-false}" = true ] || [ "$candidate" != "$observed" ]
+}
+
+path_list_is_score_relevant() {
+  grep -Eq "$relevant_path_regex"
+}
+
+deploy_is_score_relevant() {
+  local observed="$1" candidate="$2"
+  [ "${AUTOSCORE_FORCE:-false}" = true ] && return 0
+  [ -n "$observed" ] || return 0
+  git -C "$repo_root" cat-file -e "$observed^{commit}" 2>/dev/null || return 0
+  git -C "$repo_root" merge-base --is-ancestor "$observed" "$candidate" || return 0
+  git -C "$repo_root" diff --name-only "$observed..$candidate" | path_list_is_score_relevant
+}
+
+finalize_run() {
+  local run="$1" sha="$2" state previous_sha receipt_dir note score coverage
+  state="$(load_state)"
+  previous_sha="$(jq -r .last_completed_sha <<< "$state")"
+  receipt_dir="$state_dir/receipts/$(basename "$run")"
+  copy_receipts "$run" "$receipt_dir"
+  validate_receipts "$receipt_dir" "$sha"
+  note="$(shipped_note "$previous_sha" "$sha" "$run")"
+  append_history "$receipt_dir/report.json" "$sha" "$run" "$note"
+  emit_target "$receipt_dir/report.json" "$run" "$sha"
+  score="$(jq -r .overallPct "$receipt_dir/report.json")"
+  coverage="$(jq -r .overallCoveragePct "$receipt_dir/report.json")"
+  set_complete_state "$sha" "$run" "score=$score coverage=$coverage target=$remote_target_file"
+  log_event cycle-complete "Recorded score=$score coverage=$coverage and published next target" "$sha" "$run"
+  printf '{"schema":"hill-climb-autoscore-receipt.v1","status":"complete","sha":"%s","run":"%s","score":%s,"coverage":%s,"history":"%s","target":"%s"}\n' \
+    "$sha" "$run" "$score" "$coverage" "$history_file" "$remote_target_file"
+}
+
+recover_active_run() {
+  local state state_status active_sha active_run snapshot remote_sha remote_run remote_status
+  state="$(load_state)"
+  state_status="$(jq -r .status <<< "$state")"
+  [ "$state_status" = running ] || return 1
+  active_sha="$(jq -r .active_sha <<< "$state")"
+  active_run="$(jq -r .active_run <<< "$state")"
+  [ -n "$active_sha" ] || return 1
+  snapshot="$(remote_current_snapshot)"
+  remote_sha="$(jq -r .sha <<< "$snapshot")"
+  remote_run="$(jq -r .run <<< "$snapshot")"
+  remote_status="$(jq -r .status <<< "$snapshot")"
+  [ -n "$active_run" ] || active_run="$remote_run"
+  if [ "$remote_sha" != "$active_sha" ] || [ "$remote_run" != "$active_run" ]; then
+    set_failed_state "active state disagrees with immutable current run"
+    die "active state ($active_sha $active_run) disagrees with current fleet ($remote_sha $remote_run); refusing to start or overwrite anything"
+  fi
+  case "$remote_status" in preparing|running|consolidating|complete) ;; failed) die "active fleet failed: $active_run" ;; *) die "active fleet is unavailable: $active_run" ;; esac
+  log_event cycle-recovered "Reattached to active immutable fleet" "$active_sha" "$active_run"
+  set_active_state "$active_sha" "$active_run" "reattached after controller restart"
+  wait_for_terminal "$active_run" "$active_sha"
+  finalize_run "$active_run" "$active_sha"
+  return 0
+}
+
+start_or_wait() {
+  local sha="$1" run_url="$2" snapshot remote_status remote_sha run
+  snapshot="$(remote_current_snapshot)"
+  remote_status="$(jq -r .status <<< "$snapshot")"
+  remote_sha="$(jq -r .sha <<< "$snapshot")"
+  case "$remote_status" in
+    preparing|running|consolidating)
+      log_event occupied "Another fleet is active for SHA $remote_sha; this cycle will not stack or interrupt it" "$remote_sha" "$(jq -r .run <<< "$snapshot")"
+      return 75
+      ;;
+  esac
+  set_active_state "$sha" "" "starting exact successful staging deployment"
+  log_event cycle-start "Starting fresh six-SUT Codex/Codex fleet" "$sha"
+  if ! FLEET_SHA="$sha" FLEET_HARNESS_SHA="$sha" FLEET_DEPLOYMENT_RUN_URL="$run_url" FLEET_SLOTS="$slots" \
+      FLEET_EXECUTOR=codex FLEET_WORKER_EXECUTOR=codex FLEET_JUDGE_EXECUTOR=codex \
+      FLEET_WORKER_MODEL="$worker_model" FLEET_JUDGE_MODEL="$judge_model" \
+      FLEET_WORKER_REASONING_EFFORT="$worker_reasoning_effort" \
+      FLEET_JUDGE_REASONING_EFFORT="$judge_reasoning_effort" \
+      FLEET_JUDGE_SAMPLE_COUNT="$judge_sample_count" \
+      FLEET_MAX_TURNS_PER_SCENARIO=240 \
+      "$repo_root/bin/reset-anvil-fleet" start; then
+    set_failed_state "fleet start/readiness failed for $sha"
+    die "fleet start/readiness failed for $sha"
+  fi
+  snapshot="$(remote_current_snapshot)"
+  remote_sha="$(jq -r .sha <<< "$snapshot")"
+  run="$(jq -r .run <<< "$snapshot")"
+  if [ "$remote_sha" != "$sha" ] || [ -z "$run" ]; then
+    die "started fleet did not produce an immutable run for pinned SHA $sha"
+  fi
+  set_active_state "$sha" "$run" "fresh fleet passed readiness; awaiting terminal report"
+  wait_for_terminal "$run" "$sha"
+  finalize_run "$run" "$sha"
+}
+
+cycle() {
+  local state observed failed_sha deployment sha run_url _updated
+  if recover_active_run; then
+    return 0
+  fi
+  state="$(load_state)"
+  observed="$(jq -r '.last_observed_sha // .last_completed_sha // ""' <<< "$state")"
+  failed_sha="$(jq -r '.failed_sha // ""' <<< "$state")"
+  # Resolve exactly once. The selected deployment is the immutable subject of
+  # this cycle; subsequent staging pushes cannot retarget it.
+  deployment="$(selected_deployment)"
+  IFS=$'\t' read -r sha run_url _updated <<< "$deployment"
+  if [ -z "$sha" ] || [ -z "$run_url" ]; then
+    die "deployment receipt is incomplete"
+  fi
+  if ! deployment_needs_score "$sha" "$observed"; then
+    log_event no-change "Newest successful staging SHA is already scored" "$sha"
+    return 0
+  fi
+  if [ "${AUTOSCORE_FORCE:-false}" != true ] && [ "$sha" = "$failed_sha" ]; then
+    log_event failed-suppressed "This SHA already failed an autoscore cycle; waiting for a new deploy or AUTOSCORE_FORCE=true" "$sha"
+    return 0
+  fi
+  git -C "$repo_root" fetch --quiet origin staging
+  if [ -z "$eval_sha_override" ] && ! deploy_is_score_relevant "$observed" "$sha"; then
+    set_observed_state "$sha" "successful deploy changed no score-relevant paths"
+    log_event irrelevant "Successful staging deploy changed only non-runtime/non-harness paths" "$sha"
+    return 0
+  fi
+  start_or_wait "$sha" "$run_url"
+}
+
+validate_config() {
+  local name value
+  for name in poll_seconds debounce_seconds run_timeout; do
+    value="${!name}"
+    case "$value" in ''|*[!0-9]*) die "$name must be a non-negative integer" ;; esac
+  done
+  [ "$run_timeout" -ge 60 ] || die "run timeout must be at least 60 seconds"
+  [ -n "$worker_model" ] || die "worker model must not be empty"
+  [ -n "$judge_model" ] || die "judge model must not be empty"
+  case "$worker_reasoning_effort" in minimal|low|medium|high|xhigh) ;; *) die "worker reasoning effort is invalid" ;; esac
+  case "$judge_reasoning_effort" in minimal|low|medium|high|xhigh) ;; *) die "judge reasoning effort is invalid" ;; esac
+  case "$judge_sample_count" in ''|*[!0-9]*) die "judge sample count must be numeric" ;; esac
+  [ "$judge_sample_count" -ge 3 ] && [ $((judge_sample_count % 2)) -eq 1 ] \
+    || die "judge sample count must be odd and at least three"
+  case "$remote_target_file" in /tmp/fleet/*) ;; *) die "remote target must stay under /tmp/fleet" ;; esac
+}
+
+status() {
+  local daemon_pid daemon_running=false
+  daemon_pid="$(cat "$daemon_pid_file" 2>/dev/null || true)"
+  if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null; then
+    daemon_running=true
+  fi
+  jq -n --argjson local "$(load_state)" --argjson remote "$(remote_current_snapshot)" \
+    --arg daemon_pid "$daemon_pid" --argjson daemon_running "$daemon_running" \
+    --arg history "$history_file" --arg target "$remote_target_file" \
+    '{schema:"hill-climb-autoscore-status.v1",daemon:{running:$daemon_running,pid:$daemon_pid},local:$local,remote:$remote,history:$history,target:$target}'
+}
+
+daemon_cleanup() {
+  if [ "$(cat "$daemon_pid_file" 2>/dev/null || true)" = "$$" ]; then
+    rm -f "$daemon_pid_file"
+  fi
+  rm -f "$cycle_pid_file"
+}
+
+terminate_local_tree() {
+  local target="$1" child
+  while IFS= read -r child; do
+    [ -n "$child" ] && terminate_local_tree "$child"
+  done < <(pgrep -P "$target" 2>/dev/null || true)
+  kill "$target" 2>/dev/null || true
+}
+
+daemon_signal() {
+  local cycle_pid
+  cycle_pid="$(cat "$cycle_pid_file" 2>/dev/null || true)"
+  if [ -n "$cycle_pid" ] && kill -0 "$cycle_pid" 2>/dev/null; then
+    terminate_local_tree "$cycle_pid"
+    wait "$cycle_pid" 2>/dev/null || true
+  fi
+  daemon_cleanup
+  exit 143
+}
+
+start_daemon() {
+  local existing child
+  mkdir -p "$state_dir"
+  existing="$(cat "$daemon_pid_file" 2>/dev/null || true)"
+  if [ -n "$existing" ] && kill -0 "$existing" 2>/dev/null; then
+    die "autoscore daemon is already running (pid=$existing)"
+  fi
+  rm -f "$daemon_pid_file"
+  AUTOSCORE_DAEMON_CHILD=true nohup "$script_path" loop >> "$daemon_log" 2>&1 </dev/null &
+  child=$!
+  for _ in 1 2 3 4 5; do
+    [ "$(cat "$daemon_pid_file" 2>/dev/null || true)" = "$child" ] && break
+    sleep 1
+  done
+  if [ "$(cat "$daemon_pid_file" 2>/dev/null || true)" != "$child" ] \
+      || ! kill -0 "$child" 2>/dev/null; then
+    die "autoscore daemon failed to start; inspect $daemon_log"
+  fi
+  printf 'Started hill-climb autoscore daemon pid=%s log=%s\n' "$child" "$daemon_log"
+}
+
+stop_daemon() {
+  local daemon_pid command cycle_pid cycle_parent
+  daemon_pid="$(cat "$daemon_pid_file" 2>/dev/null || true)"
+  [ -n "$daemon_pid" ] || die "autoscore daemon pid file is absent: $daemon_pid_file"
+  if ! kill -0 "$daemon_pid" 2>/dev/null; then
+    rm -f "$daemon_pid_file" "$cycle_pid_file"
+    printf 'Autoscore daemon was already stopped; removed stale pid=%s\n' "$daemon_pid"
+    return
+  fi
+  command="$(ps -p "$daemon_pid" -o command= 2>/dev/null || true)"
+  case "$command" in *hill-climb-autoscore*) ;; *) die "pid $daemon_pid is not the autoscore daemon; refusing to signal it" ;; esac
+  cycle_pid="$(cat "$cycle_pid_file" 2>/dev/null || true)"
+  cycle_parent="$(ps -p "$cycle_pid" -o ppid= 2>/dev/null | tr -d ' ' || true)"
+  if [ -n "$cycle_pid" ] && [ "$cycle_parent" = "$daemon_pid" ] \
+      && kill -0 "$cycle_pid" 2>/dev/null; then
+    terminate_local_tree "$cycle_pid"
+  fi
+  kill "$daemon_pid"
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    kill -0 "$daemon_pid" 2>/dev/null || break
+    sleep 1
+  done
+  kill -0 "$daemon_pid" 2>/dev/null && die "autoscore daemon did not stop: pid=$daemon_pid"
+  rm -f "$daemon_pid_file"
+  printf 'Stopped hill-climb autoscore daemon pid=%s\n' "$daemon_pid"
+}
+
+main() {
+  local command="${1:-once}" result
+  need jq
+  validate_config
+  case "$command" in
+    once)
+      need gh; need git; need scp; need ssh
+      acquire_lock
+      trap cleanup_lock EXIT
+      trap on_signal INT TERM
+      cycle
+      ;;
+    loop)
+      need gh; need git; need scp; need ssh
+      if [ "${AUTOSCORE_DAEMON_CHILD:-false}" = true ]; then
+        mkdir -p "$state_dir"
+        printf '%s\n' "$$" > "$daemon_pid_file"
+        trap daemon_cleanup EXIT
+        trap daemon_signal INT TERM
+      fi
+      while :; do
+        "$0" once &
+        result=$!
+        printf '%s\n' "$result" > "$cycle_pid_file"
+        if wait "$result"; then
+          :
+        else
+          result=$?
+          log_event cycle-error "Autoscore cycle exited $result; immutable runs were preserved"
+        fi
+        rm -f "$cycle_pid_file"
+        sleep "$poll_seconds" &
+        result=$!
+        printf '%s\n' "$result" > "$cycle_pid_file"
+        wait "$result" 2>/dev/null || true
+        rm -f "$cycle_pid_file"
+      done
+      ;;
+    start)
+      start_daemon
+      ;;
+    stop)
+      stop_daemon
+      ;;
+    status)
+      need ssh
+      status
+      ;;
+    *) die "usage: hill-climb-autoscore [once|loop|start|stop|status] (set EVAL_SHA to pin a successful deployment)" ;;
+  esac
+}
+
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
